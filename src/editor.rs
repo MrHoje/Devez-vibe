@@ -26,9 +26,22 @@ pub struct Editor {
     collapsed_paste_lines: Option<usize>,
     collapsed_paste_start: Option<usize>,
     collapsed_paste_end: Option<usize>,
+    /// Where submitted prompts are also appended, with the project they belong to.
+    history_log: Option<(std::path::PathBuf, String)>,
 }
 
 impl Editor {
+    /// Follows a working-folder change; entries are logged and listed per folder.
+    pub fn set_history_cwd(&mut self, cwd: String) {
+        if let Some((_, current)) = &mut self.history_log {
+            *current = cwd;
+        }
+    }
+
+    pub fn set_history_log(&mut self, path: std::path::PathBuf, cwd: String) {
+        self.history_log = Some((path, cwd));
+    }
+
     pub fn snapshot(&self) -> Stash {
         Stash {
             buffer: self.buffer.clone(),
@@ -638,7 +651,7 @@ impl Editor {
             return None;
         }
 
-        self.push_history(text.clone());
+        self.record_history(text.clone());
         self.clear();
         Some(text)
     }
@@ -655,18 +668,49 @@ impl Editor {
         self.draft.clear();
     }
 
-    fn push_history(&mut self, text: String) {
+    /// Shell commands are recalled with their `!` prefix so the composer can
+    /// tell them from prompts.
+    pub fn push_shell_history(&mut self, command: &str) {
+        self.record_history(format!("!{command}"));
+    }
+
+    /// Prompts the log holds for this project, newest first.
+    pub fn logged_history(&self) -> Vec<String> {
+        match &self.history_log {
+            Some((path, cwd)) => crate::prompt_history::entries(path, cwd),
+            None => Vec::new(),
+        }
+    }
+
+    /// A submission joins the recall list and, when a log is set, the file that
+    /// carries history into the next run.
+    fn record_history(&mut self, text: String) {
+        if !self.push_history(text.clone()) {
+            return;
+        }
+        if let Some((path, cwd)) = &self.history_log {
+            crate::prompt_history::append(path, cwd, &text);
+        }
+    }
+
+    /// Swaps the shown text without leaving history navigation.
+    pub fn replace_recalled(&mut self, text: String) {
+        self.replace(text);
+    }
+
+    fn push_history(&mut self, text: String) -> bool {
         let is_slash_command = text.starts_with('/') && !text.contains('\n');
         if text.trim().is_empty()
             || is_slash_command
             || self.history.last().is_some_and(|last| last == &text)
         {
-            return;
+            return false;
         }
         self.history.push(text);
         if self.history.len() > 100 {
             self.history.remove(0);
         }
+        true
     }
 
     /// Where the recalled entry sits, newest first, as `(position, total)`.

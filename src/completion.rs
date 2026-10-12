@@ -355,7 +355,7 @@ fn category_rank(kind: CompletionKind) -> u8 {
     }
 }
 
-fn fuzzy_score(value: &str, query: &str) -> Option<(u8, usize)> {
+pub(crate) fn fuzzy_score(value: &str, query: &str) -> Option<(u8, usize)> {
     if query.is_empty() {
         return Some((0, 0));
     }

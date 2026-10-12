@@ -18,7 +18,7 @@ use crate::{
     agent::{self, AgentMode},
     completion::{
         CompletionCandidate, CompletionKind, CompletionMode, CompletionSource, CompletionTarget,
-        completion_target, completion_text, filter_candidates,
+        completion_target, completion_text, filter_candidates, fuzzy_score,
     },
     editor::{ATTACHMENT_PLACEHOLDER, Editor, Stash},
     integrations::{
@@ -43,9 +43,6 @@ use crate::{
 };
 
 const SPINNER: [&str; 8] = ["✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳"];
-/// 한 줄 간격과 세 줄 effort 트랙이 차지하는 높이. effort가 없는 모델도
-/// 같은 공간을 남겨 모델을 이동할 때 선택창이 위아래로 흔들리지 않게 한다.
-const MODEL_PICKER_EFFORT_ROWS: usize = 4;
 
 /// How long one shimmer sweep across the `Working` label takes.
 const SHIMMER_PERIOD: Duration = Duration::from_millis(1_100);
@@ -1182,6 +1179,7 @@ pub enum Action {
     /// 이미 보여 주는 경우, 알림은 같은 말을 한 번 더 하는 셈이다.
     CopyQuietly(String),
     ShowStatus,
+    ShowUsage,
     Submit(String),
     Steer(String),
     RunShell(String),
@@ -1320,6 +1318,8 @@ pub enum Action {
     PersistResponseDisplayMode(ResponseDisplayMode),
     PersistAutoKnowledge(bool),
     PersistLanguage(bool),
+    /// Save the model ids starred with Space in `/model`.
+    PersistModelFavorites(Vec<String>),
     /// Save the transcript's Shell display preference for future sessions.
     PersistShellDisplayMode(ShellDisplayMode),
     PersistDiffDisplayMode(DiffDisplayMode),
@@ -1659,7 +1659,7 @@ enum PendingInteraction {
         /// providers keep their compact numbered picker and therefore no input.
         query: Option<Editor>,
         /// ↑ past the top row hands ←→ to the search cursor; ↓ hands them back
-        /// to the effort track. Only ever true while `query` is `Some`.
+        /// to the Favorites/All tabs. Only ever true while `query` is `Some`.
         search_focused: bool,
     },
     /// `effort_index` one past the model's last tier is ultracode.
@@ -1733,6 +1733,7 @@ enum PendingInteraction {
         theme_index: usize,
     },
     SessionPicker(SessionPicker),
+    HistoryPicker(HistoryPicker),
     McpPicker(McpPicker),
     PluginPicker(PluginPicker),
     /// Reached from the plugin picker, so cancelling it returns there instead of
@@ -2184,6 +2185,16 @@ impl McpApproval {
                 None
             }
             KeyCode::Enter => self.response(),
+            KeyCode::Char(ch)
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                let index = (ch.to_digit(10)? as usize).checked_sub(1)?;
+                if index >= self.options.len() {
+                    return None;
+                }
+                self.selected = index;
+                self.response()
+            }
             _ => None,
         }
     }
@@ -3214,6 +3225,7 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
             | PendingInteraction::SkillsPicker { .. }
             | PendingInteraction::SubagentTranscript { .. }
             | PendingInteraction::SessionPicker(_)
+            | PendingInteraction::HistoryPicker(_)
             | PendingInteraction::ProviderPicker(_)
     )
 }
@@ -3451,6 +3463,135 @@ impl SessionPicker {
     }
 }
 
+pub enum HistoryPickerResult {
+    None,
+    Cancel,
+    Select(String),
+}
+
+/// `Ctrl+R` search over the prompts this folder has sent in earlier runs.
+pub struct HistoryPicker {
+    /// Newest first, each text once.
+    entries: Vec<String>,
+    selected: usize,
+    query: Editor,
+}
+
+impl HistoryPicker {
+    fn new(entries: Vec<String>) -> Self {
+        Self {
+            entries,
+            selected: 0,
+            query: Editor::default(),
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> HistoryPickerResult {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return HistoryPickerResult::None;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => return HistoryPickerResult::Cancel,
+            KeyCode::Char('c') if ctrl => return HistoryPickerResult::Cancel,
+            KeyCode::Enter => {
+                return self
+                    .filtered()
+                    .get(self.selected)
+                    .map(|&index| HistoryPickerResult::Select(self.entries[index].clone()))
+                    .unwrap_or(HistoryPickerResult::None);
+            }
+            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Char('p') if ctrl => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Down => {
+                self.selected = (self.selected + 1).min(self.filtered().len().saturating_sub(1));
+            }
+            KeyCode::Char('n') if ctrl => {
+                self.selected = (self.selected + 1).min(self.filtered().len().saturating_sub(1));
+            }
+            KeyCode::Char('u') if ctrl => {
+                self.query.clear();
+                self.selected = 0;
+            }
+            KeyCode::Backspace => {
+                self.query.backspace();
+                self.selected = 0;
+            }
+            KeyCode::Left => self.query.move_left(),
+            KeyCode::Right => self.query.move_right(),
+            KeyCode::Char(ch) if !ctrl => {
+                self.query.insert(ch);
+                self.selected = 0;
+            }
+            _ => {}
+        }
+        HistoryPickerResult::None
+    }
+
+    fn handle_paste(&mut self, text: &str) {
+        self.query.insert_str(text);
+        self.selected = 0;
+    }
+
+    fn overlay_view(&self) -> OverlayView<'_> {
+        let filtered = self.filtered();
+        let window = visible_window(
+            Some(self.selected),
+            filtered.len(),
+            visible_resume_picker_rows(),
+        );
+        let start = window.start;
+        let mut lines = filtered[window]
+            .iter()
+            .enumerate()
+            .map(|(offset, &index)| OverlayLine {
+                // One painted row per prompt, however many lines it has.
+                text: self.entries[index].split_whitespace().collect::<Vec<_>>().join(" "),
+                selected: start + offset == self.selected,
+                muted: false,
+            })
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            lines.push(OverlayLine {
+                text: if self.query.is_empty() {
+                    tr("이 폴더에서 보낸 프롬프트가 없습니다.", "No prompts sent from this folder yet.").to_owned()
+                } else {
+                    tr("검색과 일치하는 프롬프트가 없습니다.", "No prompts match your search.").to_owned()
+                },
+                selected: false,
+                muted: true,
+            });
+        }
+        OverlayView {
+            closable: true,
+            title: format!("History · {}", filtered.len()),
+            lines,
+            slider: None,
+            hint: "↑↓ navigate  Enter use  Esc cancel".to_owned(),
+            style: OverlayStyle::KeyboardOnlyCompactPanel,
+            input: Some(&self.query),
+            input_label: "",
+            input_placeholder: "Search prompt history…",
+        }
+    }
+
+    /// Indexes into `entries` that match the query, best match first; equal
+    /// scores keep the newest-first order.
+    fn filtered(&self) -> Vec<usize> {
+        let query = self.query.text().to_lowercase();
+        let mut scored = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, text)| {
+                fuzzy_score(&text.to_lowercase(), &query).map(|score| (score, index))
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by_key(|&(score, _)| score);
+        scored.into_iter().map(|(_, index)| index).collect()
+    }
+}
+
 /// 줄에 세워 둔 프롬프트. 컴포저에 붙여 둔 이미지도 함께 기다렸다가 실제로
 /// 나갈 때 같이 실린다. `display`는 카드와 줄에 보일 글자로, 이미지 자리는
 /// `[Image #n]`으로 적혀 있다.
@@ -3521,6 +3662,9 @@ fn submission_display(source: &str, image_count: usize) -> String {
 pub struct TickResult {
     pub redraw: bool,
     pub animation_only: bool,
+    /// Only an idle running row's spinner moved. Worth the narrow patch, never
+    /// a full frame: the next elapsed second repaints the rows anyway.
+    pub spinner_only: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3674,6 +3818,8 @@ pub struct AppState {
     /// `!` entered on an empty composer runs the following text locally instead
     /// of sending it to a provider.
     shell_mode: bool,
+    /// `shell_mode` at the moment history navigation began, restored on return to the draft.
+    draft_shell_mode: bool,
     /// The syllable the host's IME is still composing, drawn at the cursor
     /// without being part of the draft. See `preedit`.
     composer_preedit: String,
@@ -3692,6 +3838,10 @@ pub struct AppState {
     /// (text, display) of the last prompt that started a turn. Kept so a
     /// safeguard-blocked turn can resend or restore it without the composer.
     blocked_prompt: Option<(String, String)>,
+    /// 이번 턴에 보낸 프롬프트(원문, 첨부)를 순서대로. Esc 중단이나 전송 실패 때 되돌린다.
+    unsent_prompt: Vec<(String, Vec<String>)>,
+    /// `unsent_prompt`가 `submit_prompt`가 남긴 원문뿐이라 첨부가 아직 컴포저에 있는 동안 참.
+    unsent_provisional: bool,
     /// Keep an async answer separate from the unsent composer until turn/start succeeds.
     pending_async_answer: Option<String>,
     /// Async notifications may be repeated after their answer starts a new turn.
@@ -3830,6 +3980,10 @@ pub struct AppState {
     /// 턴이 끝났는데 하위 에이전트 행이 남아 있으면 그 시각. 유예가 지나도록
     /// 갱신이 없으면 종료 알림을 놓친 것으로 보고 행을 거둔다.
     subagents_settled_at: Option<Instant>,
+    /// Idle rows spin between full frames only where dvz draws the IME preedit
+    /// itself (DevezCode). An external terminal paints its own preedit and loses
+    /// it whenever the cursor hides, so there idle rows wait for the next second.
+    idle_row_spinner: bool,
     /// Recorded subagent work, keyed by the parent tool-use id. Kept for the rest
     /// of the turn so a panel opened on a finished subagent still has something
     /// to show.
@@ -3934,6 +4088,10 @@ pub struct AppState {
     completion_catalog: Vec<CompletionCandidate>,
     completion_mode: CompletionMode,
     dollar_completion_source: CompletionSource,
+    /// Model ids starred in `/model`, across every provider.
+    model_favorites: Vec<String>,
+    /// Whether `/model` shows only the starred models of the current provider.
+    model_favorites_tab: bool,
     suggestions_dismissed_text: Option<String>,
     selected_completion_bindings: Vec<SelectedCompletionBinding>,
     claude_integrations: ProviderIntegrationSnapshot,
@@ -4045,9 +4203,11 @@ impl AppState {
         let context_window = models
             .get(selected_model)
             .and_then(|model| model.context_window);
+        let editor = editor_with_prompt_history(&cwd);
         let mut state = Self {
-            editor: Editor::default(),
+            editor,
             shell_mode: false,
+            draft_shell_mode: false,
             composer_preedit: String::new(),
             composer_images: Vec::new(),
             stashed_prompt: None,
@@ -4060,6 +4220,8 @@ impl AppState {
             queued_input_pending: false,
             queued_images: Vec::new(),
             blocked_prompt: None,
+            unsent_prompt: Vec::new(),
+            unsent_provisional: false,
             handled_async_questions: HashSet::new(),
             codex_permission_mode: PermissionMode::FullAccess,
             handoff_prompt: None,
@@ -4129,6 +4291,7 @@ impl AppState {
             dismissed_artifacts: read_dismissed_artifacts(),
             codex_subagents: HashMap::new(),
             subagents_settled_at: None,
+            idle_row_spinner: crate::devezcode::room_id().is_some(),
             subagent_logs: HashMap::new(),
             command_selection: 0,
             spinner_frame: 0,
@@ -4201,6 +4364,8 @@ impl AppState {
             completion_catalog: Vec::new(),
             completion_mode: CompletionMode::All,
             dollar_completion_source: CompletionSource::User,
+            model_favorites: read_model_favorites(),
+            model_favorites_tab: false,
             suggestions_dismissed_text: None,
             selected_completion_bindings: Vec::new(),
             claude_integrations: ProviderIntegrationSnapshot::default(),
@@ -4499,8 +4664,26 @@ impl AppState {
         self.apply_model(index, None);
     }
 
+    /// The current provider's starred models, newest star first.
+    fn favorite_model_indices(&self) -> Vec<usize> {
+        let provider = self.current_provider_model_indices();
+        self.model_favorites
+            .iter()
+            .filter_map(|id| provider.iter().copied().find(|index| &self.models[*index].id == id))
+            .collect()
+    }
+
+    /// The favorites tab exists only while the provider has a starred model.
+    fn model_favorites_tab_shown(&self) -> bool {
+        self.model_favorites_tab && !self.favorite_model_indices().is_empty()
+    }
+
     fn model_picker_indices(&self, query: Option<&Editor>) -> Vec<usize> {
-        let candidates = self.current_provider_model_indices();
+        let candidates = if self.model_favorites_tab_shown() {
+            self.favorite_model_indices()
+        } else {
+            self.current_provider_model_indices()
+        };
         let Some(query) = query else {
             return candidates;
         };
@@ -5046,6 +5229,7 @@ impl AppState {
                 self.auto_knowledge = read_project_auto_knowledge(&cwd);
             }
             self.cwd = cwd;
+            self.editor.set_history_cwd(self.cwd.clone());
             self.branch_cwd = None;
             self.branch = read_git_branch(&self.cwd);
             self.workspace_entries.clear();
@@ -5337,6 +5521,9 @@ impl AppState {
     }
 
     pub fn turn_input(&mut self, text: String) -> Vec<Value> {
+        if std::mem::take(&mut self.unsent_provisional) {
+            self.unsent_prompt.clear();
+        }
         let queued = std::mem::take(&mut self.queued_input_pending);
         // 인용문은 사람이 쓴 글자가 아니다. 순정처럼 사용자 글자와 다른 조각으로
         // 앞에 서야 @나 $가 멘션으로 읽히지 않고, 컴포저에서 고른 첨부의 글자
@@ -5346,10 +5533,12 @@ impl AppState {
             .unwrap_or_default();
         if self.pending_async_answer.as_deref() == Some(text.as_str()) {
             input.push(json!({"type": "text", "text": text, "text_elements": []}));
+            self.unsent_prompt.clear();
             return input;
         }
         let triggers = mention_triggers(&text);
         let text_chars = text.chars().collect::<Vec<_>>();
+        let sent_text = text.clone();
         input.push(json!({
             "type": "text",
             "text": text,
@@ -5360,6 +5549,7 @@ impl AppState {
         } else {
             std::mem::take(&mut self.composer_images)
         };
+        self.unsent_prompt.push((sent_text, images.clone()));
         for path in images {
             input.push(json!({ "type": "localImage", "path": path }));
         }
@@ -6114,6 +6304,7 @@ impl AppState {
                 self.auto_knowledge = read_project_auto_knowledge(&cwd);
             }
             self.cwd = cwd;
+            self.editor.set_history_cwd(self.cwd.clone());
             self.workspace_entries.clear();
             self.rebuild_completion_catalog();
         }
@@ -6372,6 +6563,8 @@ impl AppState {
     }
 
     fn reset_turn_item_tracking(&mut self) {
+        self.unsent_prompt.clear();
+        self.unsent_provisional = false;
         self.queued_input_pending = false;
         self.resume_queue_after_interrupt = false;
         self.pending_async_answer = None;
@@ -6558,7 +6751,66 @@ impl AppState {
         }
     }
 
+    /// 이번 턴에 보낸 입력을 모두 입력창에 되돌린다. 입력창이 비어 있지 않으면
+    /// 덮어쓰지 않는다.
+    pub fn restore_unsent_prompt(&mut self) -> bool {
+        self.restore_unsent(self.queued_input_pending, false)
+    }
+
+    /// `turn/steer`가 실패했을 때 방금 보낸 후속 입력만 되돌린다. 앞선 프롬프트는
+    /// 이미 턴에 들어갔다.
+    pub fn restore_unsent_steer(&mut self) -> bool {
+        self.restore_unsent(self.queued_input_pending, true)
+    }
+
+    /// 턴이 이미 서버에서 시작 중이면 그 프롬프트는 되돌릴 대상이 아니다.
+    pub fn forget_unsent_prompt(&mut self) {
+        self.unsent_prompt.clear();
+        self.unsent_provisional = false;
+    }
+
+    fn restore_unsent(&mut self, queued: bool, last_only: bool) -> bool {
+        let provisional = !last_only && std::mem::take(&mut self.unsent_provisional);
+        let entries = if last_only {
+            self.unsent_prompt.pop().into_iter().collect()
+        } else {
+            std::mem::take(&mut self.unsent_prompt)
+        };
+        if entries.is_empty() {
+            return false;
+        }
+        let text = entries.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>().join("\n\n");
+        // 첨부가 아직 컴포저(또는 줄)에 있는 경우는 그 첨부가 이 입력의 것이다.
+        let own_images = provisional && !queued;
+        if !self.editor.is_empty()
+            || (!self.composer_images.is_empty() && !own_images)
+            || self.shell_mode
+            || self.is_handoff_prompt(&text)
+        {
+            return false;
+        }
+        let images = if own_images {
+            std::mem::take(&mut self.composer_images)
+        } else if provisional {
+            std::mem::take(&mut self.queued_images)
+        } else {
+            entries.into_iter().flat_map(|(_, images)| images).collect()
+        };
+        // 글자 속 자리표시자 수가 곧 첨부 수라서, 첨부마다 자리를 먼저 만든다.
+        for _ in &images {
+            self.editor.insert_attachment();
+        }
+        self.editor.insert_str(&text);
+        self.composer_images = images;
+        self.set_composer_notice(
+            tr("보내지 못한 입력을 입력창에 되돌렸습니다.", "Put the unsent input back in the composer.").to_owned(),
+        );
+        true
+    }
+
     pub fn set_request_failed(&mut self, message: impl Into<String>) {
+        let never_started = self.busy && self.turn_id.is_none() && !self.turn_response_started;
+        let queued = self.queued_input_pending;
         self.queued_input_pending = false;
         self.resume_queue_after_interrupt = false;
         self.busy = false;
@@ -6575,6 +6827,9 @@ impl AppState {
         }
         self.committed
             .push(Block::new(BlockKind::Error, "Request failed", message));
+        if never_started {
+            self.restore_unsent(queued, false);
+        }
     }
 
     fn preserve_failed_question_answer(&mut self, answer: &str) {
@@ -6674,7 +6929,11 @@ impl AppState {
             .retain(|id, _| !ids.contains(id));
         self.turn_response_boundaries
             .retain(|block| !ids.contains(&block.id()));
+        let discarded = !ids.is_empty();
         self.discarded_prompt_ids.extend(ids);
+        if discarded {
+            self.restore_unsent_prompt();
+        }
     }
 
     pub fn take_discarded_prompt_ids(&mut self) -> Vec<u64> {
@@ -6705,6 +6964,28 @@ impl AppState {
             self.cwd.clone(),
             Some(self.thread_id.clone()),
         )));
+    }
+
+    fn open_history_picker(&mut self) {
+        self.pending = Some(PendingInteraction::HistoryPicker(HistoryPicker::new(
+            self.editor.logged_history(),
+        )));
+    }
+
+    /// Puts a picked history entry in the composer; a `!command` comes back in
+    /// shell mode without its prefix. The edit lands on the undo list like any
+    /// other, so the draft it replaced can be got back with Ctrl+Z.
+    fn recall_history_entry(&mut self, text: &str) {
+        let (shell, text) = match text.strip_prefix('!') {
+            Some(command) => (true, command),
+            None => (false, text),
+        };
+        self.editor.set_text(text);
+        self.shell_mode = shell;
+        self.composer_images.clear();
+        self.selected_completion_bindings.clear();
+        self.suggestions_dismissed_text = None;
+        self.command_selection = 0;
     }
 
     pub fn open_mcp_picker(&mut self, servers: Vec<McpServerInfo>, notice: Option<String>) {
@@ -7002,7 +7283,7 @@ impl AppState {
 
     pub fn begin_local_shell(&mut self, command: &str) -> Block {
         self.commit_welcome_card();
-        let block = Block::new(BlockKind::Tool, "Running Shell Command", command);
+        let block = Block::new(BlockKind::Tool, "Running Shell Command · Esc to stop", command);
         self.local_shell_ids.insert(block.id());
         self.committed.push(block.clone());
         block
@@ -7013,18 +7294,23 @@ impl AppState {
         anchor: &Block,
         command: &str,
         output: String,
-        exit_code: i32,
+        exit_code: Option<i32>,
         duration_ms: u64,
     ) -> u64 {
-        let kind = if exit_code == 0 {
+        let kind = if exit_code == Some(0) {
             BlockKind::Tool
         } else {
             BlockKind::Warning
         };
+        // None은 Esc로 중단된 경우다.
+        let status = match exit_code {
+            Some(code) => format!("exit {code}"),
+            None => "interrupted".to_owned(),
+        };
         let mut block = Block::new(
             kind,
             format!(
-                "Shell · {} · exit {exit_code} · {}",
+                "Shell · {} · {status} · {}",
                 compact_command(command, 96),
                 format_duration(duration_ms)
             ),
@@ -7384,8 +7670,8 @@ impl AppState {
         // loop alive even on a runtime that reports no turn while it runs.
         let animating = self.busy || self.compacting() || self.host_loading;
         // A background Claude agent outlives its parent turn. Its elapsed label
-        // changes once a second, and the narrow animation path does not repaint
-        // these rows, so only that boundary asks for a full frame.
+        // changes once a second, and the narrow animation path repaints only the
+        // rows' spinners, so only that boundary asks for a full frame.
         let mut subagent_elapsed_changed = false;
         for running in &mut self.subagents {
             let elapsed = running.started_at.elapsed().as_secs();
@@ -7397,6 +7683,7 @@ impl AppState {
         if self.sweep_settled_subagents() {
             full_redraw = true;
         }
+        let subagents_spinning = !self.subagents.is_empty() && self.idle_row_spinner;
         if self.refresh_side_panel_diff() {
             full_redraw = true;
         }
@@ -7470,12 +7757,19 @@ impl AppState {
         TickResult {
             redraw: !inline_answer_active
                 && (animating
+                    || subagents_spinning
                     || subagent_elapsed_changed
                     || plan_shimmer_active
                     || response_collapse_active
                     || full_redraw),
             animation_only: !inline_answer_active
-                && (animating || plan_shimmer_active)
+                && (animating || subagents_spinning || plan_shimmer_active)
+                && !response_collapse_active
+                && !subagent_elapsed_changed
+                && !full_redraw,
+            spinner_only: subagents_spinning
+                && !animating
+                && !plan_shimmer_active
                 && !response_collapse_active
                 && !subagent_elapsed_changed
                 && !full_redraw,
@@ -7671,6 +7965,7 @@ impl AppState {
                 form.editor.insert_str(text);
             }
             Some(PendingInteraction::SessionPicker(picker)) => picker.handle_paste(text),
+            Some(PendingInteraction::HistoryPicker(picker)) => picker.handle_paste(text),
             Some(PendingInteraction::ModelPicker {
                 query: Some(query), ..
             }) => {
@@ -7988,10 +8283,27 @@ impl AppState {
             return Action::None;
         }
 
-        if key.code == KeyCode::Esc && !self.busy {
+        // 제안 목록이 열려 있으면 Esc는 아래 목록 처리가 목록만 닫는다.
+        // "No matches"도 화면에 목록으로 떠 있으므로 일치가 없어도 열린 것으로 본다.
+        let suggestions_open = key.code == KeyCode::Esc
+            && !self.busy
+            && !self.shell_mode
+            && (self.matching_completions().is_some()
+                || !self.matching_agent_arguments().is_empty()
+                || (self.suggestions_dismissed_text.as_deref() != Some(self.editor.text().as_str())
+                    && self.matching_slash_commands().len() + self.matching_slash_skills().len() > 0));
+        if key.code == KeyCode::Esc && !self.busy && !suggestions_open {
+            if !self.editor.is_empty() || !self.composer_images.is_empty() {
+                self.set_composer_notice(
+                    tr("입력을 지웠습니다 · Ctrl+Z로 되돌리기", "Input cleared · Ctrl+Z to restore").to_owned(),
+                );
+            } else {
+                // Ctrl+Z는 인용 배지를 되살리지 못하므로, 글자나 첨부가 있으면 배지는
+                // 두고 다음 Esc가 거둔다.
+                self.clear_diff_reference();
+            }
             self.editor.clear();
             self.composer_images.clear();
-            self.clear_diff_reference();
             self.shell_mode = false;
             self.selected_completion_bindings.clear();
             self.suggestions_dismissed_text = None;
@@ -8301,6 +8613,12 @@ impl AppState {
                 self.toggle_composer_stash();
                 Action::None
             }
+            // Ctrl+R searches the prompts this folder has sent before. With a
+            // Korean IME on, the chord arrives as its 두벌식 jamo.
+            KeyCode::Char('r' | 'ㄱ') if ctrl => {
+                self.open_history_picker();
+                Action::None
+            }
             KeyCode::Char('j') if ctrl => {
                 self.editor.newline();
                 Action::None
@@ -8378,15 +8696,24 @@ impl AppState {
             }
             KeyCode::Up => {
                 if !self.editor.move_up() {
+                    if self.editor.history_position().is_none() {
+                        self.draft_shell_mode = self.shell_mode;
+                    }
                     self.editor.history_previous();
+                    self.sync_shell_mode_with_history();
                     self.sync_composer_images_after_history_navigation();
                 }
                 Action::None
             }
             KeyCode::Down => {
                 if !self.editor.move_down() {
+                    // Outside history, ↓ has nothing to move and must leave the mode alone.
+                    let navigating = self.editor.history_position().is_some();
                     self.editor.history_next();
-                    self.sync_composer_images_after_history_navigation();
+                    if navigating {
+                        self.sync_shell_mode_with_history();
+                        self.sync_composer_images_after_history_navigation();
+                    }
                 }
                 Action::None
             }
@@ -8399,11 +8726,33 @@ impl AppState {
         }
     }
 
+    /// A recalled `!command` comes back in shell mode without its prefix; a
+    /// recalled prompt leaves shell mode; the draft gets its own mode back.
+    fn sync_shell_mode_with_history(&mut self) {
+        if self.editor.history_position().is_none() {
+            self.shell_mode = self.draft_shell_mode;
+            return;
+        }
+        let text = self.editor.text();
+        match text.strip_prefix('!') {
+            Some(command) => {
+                self.editor.replace_recalled(command.to_owned());
+                self.shell_mode = true;
+            }
+            None => self.shell_mode = false,
+        }
+    }
+
     pub fn begin_server_request(&mut self, id: Value, method: &str, params: &Value) -> Action {
         if method == "item/tool/requestUserInput" {
             // A modal takes over the frame. Apply any paced turn boundary first
             // so cancelling this question cannot target the preceding turn.
             self.flush_before_question();
+        }
+        // 이력 창은 응답을 기다리며 열어 두는 창이고 초안을 건드리지 않으므로, 요청이
+        // 오면 닫고 그대로 처리한다.
+        if matches!(self.pending, Some(PendingInteraction::HistoryPicker(_))) {
+            self.pending = None;
         }
         if self.pending.is_some() {
             if method == "item/tool/requestUserInput" {
@@ -10058,6 +10407,7 @@ impl AppState {
             if command.trim().is_empty() {
                 return Action::None;
             }
+            self.editor.push_shell_history(command.trim());
             self.editor.clear();
             self.shell_mode = false;
             self.selected_completion_bindings.clear();
@@ -10257,6 +10607,10 @@ impl AppState {
             // Kept before the block moves into the transcript, so a safeguard
             // block can resend or restore this exact prompt.
             self.blocked_prompt = Some((text.clone(), prompt.body.clone()));
+            // 세션을 만들다 실패하거나 Esc로 접어도 원문이 돌아오도록 첨부가 컴포저를
+            // 떠나기 전에 남긴다. `turn_input`이 첨부와 함께 다시 기록한다.
+            self.unsent_prompt = vec![(text.clone(), Vec::new())];
+            self.unsent_provisional = true;
             self.begin_turn_prompt(prompt, started_at);
             self.busy = true;
             // Time the turn from Enter, not from the server's acknowledgement: a
@@ -10360,8 +10714,8 @@ impl AppState {
                     BlockKind::System,
                     "Commands",
                     tr(
-                        format!("/provider [claude|codex|opencode]  provider 선택\n/provider [claude|codex] MODEL  provider와 모델 선택\nOpenCode는 /provider opencode로 전환한 뒤 /model로 모델 선택\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}/auto-knowledge [on|off]  지식 자동 기록 켜기·끄기\n{effort_help}/Response [All|Completed]  응답 압축 방식\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/vibemode  응답·Shell·Diff 표시 한 번에 설정\n/theme [minimal|soft|dark|gray|softpink|midnight]  화면 테마\n/language [korean|english]  화면 언어\n/agent [builder|planner|goal-runner|reviewer|researcher]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 열기·닫기\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/worktree [NAME]  git 작업 트리에서 대화 이어 가기\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n/exit  /quit 별칭\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+Z / Ctrl+Y  입력 실행 취소·다시 실행\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 열기·닫기(폭은 패널 머리글의 [◀][▶])\nShift+Tab  Claude 권한 모드 전환"),
-                        format!("/provider [claude|codex|opencode]  Select a provider\n/provider [claude|codex] MODEL  Select a provider and model\nFor OpenCode, switch with /provider opencode, then select a model with /model\n/model [MODEL] [EFFORT]  Select the current provider's model and effort\n{provider_help}{fast_help}/auto-knowledge [on|off]  Turn automatic knowledge recording on or off\n{effort_help}/Response [All|Completed]  Response compression\n/shell [hide|collapse|expand]  Shell display\n/diff [hide|collapse|expand]  Diff display\n/vibemode  Set response, shell, and diff display at once\n/theme [minimal|soft|dark|gray|softpink|midnight]  Screen theme\n/language [korean|english]  Screen language\n/agent [builder|planner|goal-runner|reviewer|researcher]  Choose the agent role\n/statusline  Status line items\n/side-panel  Open or close the right side panel\n{integration_help}/btw [MESSAGE]  Ephemeral side conversation\n/compact  Compact the context\n/copy  Copy the last response\n/worktree [NAME]  Continue the conversation in a git worktree\n/resume [SESSION]  Pick an earlier session\n/continue  Alias for /resume\n/new  New conversation\n/clear  Alias for /new\n{login_help}/status  Current settings\n/usage  Usage limits\n/quit  Quit\n/exit  Alias for /quit\n\n$  Search plugins, skills, and apps\n@  Search plugins, skills, files, and folders\nEsc or Ctrl+C  Stop the run\nCtrl+Enter / Shift+Enter  New line\nTab  Switch the agent role\nAlt+Enter  Queue a prompt while a response runs\nCtrl+Z / Ctrl+Y  Undo or redo input\nCtrl+S  Stash or restore the input draft\nShift+Space or Alt+W  Collapse or expand task steps\nAlt+P  Open or close the right side panel (resize with [◀][▶] in the panel header)\nShift+Tab  Switch the Claude permission mode"),
+                        format!("/provider [claude|codex|opencode]  provider 선택\n/provider [claude|codex] MODEL  provider와 모델 선택\nOpenCode는 /provider opencode로 전환한 뒤 /model로 모델 선택\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}/auto-knowledge [on|off]  지식 자동 기록 켜기·끄기\n{effort_help}/Response [All|Completed]  응답 압축 방식\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/vibemode  응답·Shell·Diff 표시 한 번에 설정\n/theme [minimal|soft|dark|gray|softpink|midnight]  화면 테마\n/language [korean|english]  화면 언어\n/agent [builder|planner|goal-runner|reviewer|researcher]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 열기·닫기\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/worktree [NAME]  git 작업 트리에서 대화 이어 가기\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n/exit  /quit 별칭\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+Z / Ctrl+Y  입력 실행 취소·다시 실행\nCtrl+S  입력 초안 보관·되돌리기\nCtrl+R  프롬프트 이력 검색\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 열기·닫기(폭은 패널 머리글의 [◀][▶])\nShift+Tab  Claude 권한 모드 전환"),
+                        format!("/provider [claude|codex|opencode]  Select a provider\n/provider [claude|codex] MODEL  Select a provider and model\nFor OpenCode, switch with /provider opencode, then select a model with /model\n/model [MODEL] [EFFORT]  Select the current provider's model and effort\n{provider_help}{fast_help}/auto-knowledge [on|off]  Turn automatic knowledge recording on or off\n{effort_help}/Response [All|Completed]  Response compression\n/shell [hide|collapse|expand]  Shell display\n/diff [hide|collapse|expand]  Diff display\n/vibemode  Set response, shell, and diff display at once\n/theme [minimal|soft|dark|gray|softpink|midnight]  Screen theme\n/language [korean|english]  Screen language\n/agent [builder|planner|goal-runner|reviewer|researcher]  Choose the agent role\n/statusline  Status line items\n/side-panel  Open or close the right side panel\n{integration_help}/btw [MESSAGE]  Ephemeral side conversation\n/compact  Compact the context\n/copy  Copy the last response\n/worktree [NAME]  Continue the conversation in a git worktree\n/resume [SESSION]  Pick an earlier session\n/continue  Alias for /resume\n/new  New conversation\n/clear  Alias for /new\n{login_help}/status  Current settings\n/usage  Usage limits\n/quit  Quit\n/exit  Alias for /quit\n\n$  Search plugins, skills, and apps\n@  Search plugins, skills, files, and folders\nEsc or Ctrl+C  Stop the run\nCtrl+Enter / Shift+Enter  New line\nTab  Switch the agent role\nAlt+Enter  Queue a prompt while a response runs\nCtrl+Z / Ctrl+Y  Undo or redo input\nCtrl+S  Stash or restore the input draft\nCtrl+R  Search prompt history\nShift+Space or Alt+W  Collapse or expand task steps\nAlt+P  Open or close the right side panel (resize with [◀][▶] in the panel header)\nShift+Tab  Switch the Claude permission mode"),
                     ),
                 ));
                 Action::None
@@ -10503,8 +10857,14 @@ impl AppState {
                             .position(|effort| effort.id == self.selected_effort)
                     })
                     .unwrap_or(0);
+                // Like `$`, the picker opens on its first tab: the stars, when
+                // there are any.
+                self.model_favorites_tab = !self.favorite_model_indices().is_empty();
+                let mut model_index = self.selected_model;
+                let mut effort_index = effort_index;
+                self.reset_filtered_model_selection(&mut model_index, &mut effort_index, None);
                 self.pending = Some(PendingInteraction::ModelPicker {
-                    model_index: self.selected_model,
+                    model_index,
                     effort_index,
                     query: (self.selected_provider() == ModelProvider::OpenCode)
                         .then(Editor::default),
@@ -10908,22 +11268,7 @@ impl AppState {
             }
             "/new" | "/clear" => Action::NewThread,
             "/status" => Action::ShowStatus,
-            "/usage" => {
-                let five_hour = self
-                    .five_hour_percent
-                    .map(|value| format!("{value}%"))
-                    .unwrap_or_else(|| "—".to_owned());
-                let weekly = self
-                    .weekly_percent
-                    .map(|value| format!("{value}%"))
-                    .unwrap_or_else(|| "—".to_owned());
-                self.committed.push(Block::new(
-                    BlockKind::System,
-                    "Usage",
-                    format!("5h: {five_hour}\nweek: {weekly}"),
-                ));
-                Action::None
-            }
+            "/usage" => Action::ShowUsage,
             "/quit" | "/exit" => Action::Quit,
             unknown => {
                 self.committed.push(Block::new(
@@ -10937,6 +11282,56 @@ impl AppState {
                 Action::None
             }
         }
+    }
+
+    /// `/usage`: plan, window usage and reset credits from the cached account
+    /// plan. Rows without a value are left out.
+    pub fn show_usage(&mut self) {
+        let mut lines = Vec::new();
+        if let Some(plan) = &self.account_plan.plan {
+            lines.push(format!("Plan: {plan}"));
+        }
+        if !self.account_plan.usage_lines.is_empty() {
+            lines.extend(self.account_plan.usage_lines.clone());
+        } else {
+            if let Some(percent) = self.five_hour_percent {
+                let left = self
+                    .five_hour_remaining
+                    .as_deref()
+                    .filter(|left| !left.is_empty())
+                    .map(|left| format!(" · resets in {left}"))
+                    .unwrap_or_default();
+                lines.push(format!("5h: {percent}%{left}"));
+            }
+            if let Some(percent) = self.weekly_percent {
+                lines.push(format!("week: {percent}%"));
+            }
+            if self.account_plan.available_credits > 0 || !self.account_plan.credits.is_empty() {
+                let mut credits = self.account_plan.credit_lines().into_iter();
+                if let Some(first) = credits.next() {
+                    lines.push(format!("Reset credits: {first}"));
+                }
+                lines.extend(credits);
+            }
+        }
+        let body = if lines.is_empty() {
+            // 한도를 알려 주는 제공자가 값을 못 받았을 때와 아예 알려 주지 않는 제공자를 구분한다.
+            if self.selected_provider() == ModelProvider::OpenCode {
+                tr(
+                    "이 제공자는 사용량 정보를 제공하지 않습니다.".to_owned(),
+                    "This provider doesn't report usage.".to_owned(),
+                )
+            } else {
+                tr(
+                    "아직 사용량 정보를 받지 못했습니다.".to_owned(),
+                    "No usage data yet.".to_owned(),
+                )
+            }
+        } else {
+            lines.join("\n")
+        };
+        self.committed
+            .push(Block::new(BlockKind::System, "Usage", body));
     }
 
     pub fn show_status(&mut self) {
@@ -11035,8 +11430,44 @@ impl AppState {
                 mut search_focused,
             } => {
                 let searchable = query.is_some();
+                let mut action = Action::None;
                 match key.code {
                     KeyCode::Esc => return Action::None,
+                    KeyCode::Char(' ') if !search_focused && !ctrl && !alt => {
+                        if self
+                            .model_picker_indices(query.as_ref())
+                            .contains(&model_index)
+                        {
+                            let id = &self.models[model_index].id;
+                            if let Some(position) =
+                                self.model_favorites.iter().position(|starred| starred == id)
+                            {
+                                self.model_favorites.remove(position);
+                            } else {
+                                self.model_favorites.insert(0, id.clone());
+                            }
+                            // A first star keeps the full list in view, and the
+                            // last unstar falls back to it.
+                            self.model_favorites_tab = self.model_favorites_tab_shown();
+                            self.reset_filtered_model_selection(
+                                &mut model_index,
+                                &mut effort_index,
+                                query.as_ref(),
+                            );
+                            action = Action::PersistModelFavorites(self.model_favorites.clone());
+                        }
+                    }
+                    // ←→ switch Favorites/All the way they switch the `$` tabs.
+                    KeyCode::Left | KeyCode::Right
+                        if !search_focused && !self.favorite_model_indices().is_empty() =>
+                    {
+                        self.model_favorites_tab = key.code == KeyCode::Left;
+                        self.reset_filtered_model_selection(
+                            &mut model_index,
+                            &mut effort_index,
+                            query.as_ref(),
+                        );
+                    }
                     KeyCode::Up => {
                         let candidates = self.model_picker_indices(query.as_ref());
                         // The search field sits above the list, so ↑ past the
@@ -11052,7 +11483,8 @@ impl AppState {
                         }
                     }
                     KeyCode::Char('k') if !searchable && !ctrl && !alt => {
-                        model_index = self.move_model_index(model_index, -1);
+                        let candidates = self.model_picker_indices(None);
+                        model_index = move_model_index_in(&candidates, model_index, -1);
                         effort_index = self.effort_index_for_model(model_index);
                     }
                     KeyCode::Char('p') if ctrl => {
@@ -11074,7 +11506,8 @@ impl AppState {
                         effort_index = self.effort_index_for_model(model_index);
                     }
                     KeyCode::Char('j') if !searchable && !ctrl && !alt => {
-                        model_index = self.move_model_index(model_index, 1);
+                        let candidates = self.model_picker_indices(None);
+                        model_index = move_model_index_in(&candidates, model_index, 1);
                         effort_index = self.effort_index_for_model(model_index);
                     }
                     KeyCode::Char('n') if ctrl => {
@@ -11086,8 +11519,7 @@ impl AppState {
                         if !searchable && !ctrl && !alt && ('1'..='9').contains(&ch) =>
                     {
                         let index = ch.to_digit(10).unwrap_or_default() as usize - 1;
-                        if let Some(model_index) =
-                            self.current_provider_model_indices().get(index).copied()
+                        if let Some(model_index) = self.model_picker_indices(None).get(index).copied()
                         {
                             self.open_model_scope(
                                 model_index,
@@ -11165,18 +11597,6 @@ impl AppState {
                             query.as_ref(),
                         );
                     }
-                    KeyCode::Left => {
-                        effort_index = effort_index.saturating_sub(1);
-                    }
-                    KeyCode::Right => {
-                        let count = self
-                            .models
-                            .get(model_index)
-                            .map(|model| model.efforts.len())
-                            .unwrap_or(1)
-                            .max(1);
-                        effort_index = (effort_index + 1).min(count - 1);
-                    }
                     KeyCode::Enter => {
                         if self
                             .model_picker_indices(query.as_ref())
@@ -11194,7 +11614,7 @@ impl AppState {
                     query,
                     search_focused,
                 });
-                Action::None
+                action
             }
             PendingInteraction::ModelScope {
                 model_index,
@@ -11709,6 +12129,17 @@ impl AppState {
                 SessionPickerResult::Cancel => Action::None,
                 SessionPickerResult::Select(thread_id) => Action::ResumeThread(thread_id),
             },
+            PendingInteraction::HistoryPicker(mut picker) => match picker.handle_key(key) {
+                HistoryPickerResult::None => {
+                    self.pending = Some(PendingInteraction::HistoryPicker(picker));
+                    Action::None
+                }
+                HistoryPickerResult::Cancel => Action::None,
+                HistoryPickerResult::Select(text) => {
+                    self.recall_history_entry(&text);
+                    Action::None
+                }
+            },
             PendingInteraction::McpPicker(mut picker) => match picker.handle_key(key) {
                 McpPickerResult::None => {
                     self.pending = Some(PendingInteraction::McpPicker(picker));
@@ -11965,6 +12396,25 @@ impl AppState {
                             id,
                             result: choice.result.clone(),
                         })
+                    }
+                }
+                // 선택지 줄에 번호가 붙어 있으니 숫자 키가 그 줄을 바로 고른다.
+                // 위험 승인은 클릭과 같이 첫 입력은 확인 대기, 같은 번호 재입력이 확정이다.
+                KeyCode::Char(ch)
+                    if !ctrl
+                        && !alt
+                        && ch
+                            .to_digit(10)
+                            .is_some_and(|digit| digit >= 1 && digit as usize <= choices.len()) =>
+                {
+                    let index = ch.to_digit(10).unwrap_or(1) as usize - 1;
+                    if guarded && approval_is_allow(&choices[index]) && (!confirming || selected != index) {
+                        self.pending = Some(PendingInteraction::Approval {
+                            id, title, detail, selected: index, choices, guarded, confirming: true,
+                        });
+                        Action::None
+                    } else {
+                        Action::RpcResponse { id, result: choices[index].result.clone() }
                     }
                 }
                 _ => {
@@ -12324,9 +12774,9 @@ impl AppState {
         match self.pending.as_ref()? {
             PendingInteraction::ModelPicker {
                 model_index,
-                effort_index,
                 query,
                 search_focused,
+                ..
             } => {
                 let provider_models = self.model_picker_indices(query.as_ref());
                 let selected_position = provider_models
@@ -12341,8 +12791,13 @@ impl AppState {
                     .enumerate()
                     .map(|(offset, index)| {
                         let model = &self.models[*index];
+                        let star = if self.model_favorites.contains(&model.id) {
+                            " ★"
+                        } else {
+                            ""
+                        };
                         OverlayLine {
-                            text: format!("{}. {}", start + offset + 1, model.display_name),
+                            text: format!("{}. {}{star}", start + offset + 1, model.display_name),
                             selected: *index == *model_index,
                             muted: false,
                         }
@@ -12362,42 +12817,31 @@ impl AppState {
                         muted: true,
                     }));
                 }
-                let slider = self
-                    .models
-                    .get(*model_index)
-                    .filter(|_| provider_models.contains(model_index))
-                    .filter(|model| !model.efforts.is_empty())
-                    .map(|model| {
-                        lines.push(OverlayLine {
-                            text: String::new(),
-                            selected: false,
-                            muted: true,
-                        });
-                        effort_slider(model, *effort_index)
-                    });
-                if slider.is_none() {
-                    lines.extend((0..MODEL_PICKER_EFFORT_ROWS).map(|_| OverlayLine {
-                        text: String::new(),
-                        selected: false,
-                        muted: true,
-                    }));
-                }
+                let tabs = !self.favorite_model_indices().is_empty();
                 let hint = if query.is_some() && *search_focused {
                     "Type to search  ·  ←→ cursor  ·  ↓ model  ·  Enter to continue  ·  Esc to cancel"
-                } else if query.is_some() && slider.is_some() {
-                    "Type to search  ·  ↑↓ model  ·  ←→ effort  ·  Enter to continue  ·  Esc to cancel"
+                } else if query.is_some() && tabs {
+                    "Type to search  ·  ↑↓ model  ·  ←→ tab  ·  Space ★  ·  Enter to continue  ·  Esc to cancel"
                 } else if query.is_some() {
-                    "Type to search  ·  ↑↓ model  ·  Enter to continue  ·  Esc to cancel"
-                } else if slider.is_some() {
-                    "↑↓ model  ·  ←→ effort  ·  Enter to continue  ·  Esc to cancel"
+                    "Type to search  ·  ↑↓ model  ·  Space ★  ·  Enter to continue  ·  Esc to cancel"
+                } else if tabs {
+                    "↑↓ model  ·  ←→ tab  ·  Space ★  ·  Enter to continue  ·  Esc to cancel"
                 } else {
-                    "↑↓ model  ·  Enter to continue  ·  Esc to cancel"
+                    "↑↓ model  ·  Space ★  ·  Enter to continue  ·  Esc to cancel"
+                };
+                // With nothing starred there is only the full list, so no tabs.
+                let title = if !tabs {
+                    "Model".to_owned()
+                } else if self.model_favorites_tab_shown() {
+                    format!("Model{COMPLETION_TAB_MARKER}[ Favorites ]   All")
+                } else {
+                    format!("Model{COMPLETION_TAB_MARKER}  Favorites   [ All ]")
                 };
                 Some(OverlayView {
                     closable: true,
-                    title: "Model".to_owned(),
+                    title,
                     lines,
-                    slider,
+                    slider: None,
                     hint: hint.to_owned(),
                     style: if query.is_some() {
                         OverlayStyle::SearchPicker {
@@ -12479,15 +12923,6 @@ impl AppState {
                 if self.ultracode_available() {
                     slider.efforts.push("ultracode".to_owned());
                     slider.selected = (*effort_index).min(model.efforts.len());
-                    // Shown for every step, so the panel keeps its height as the
-                    // selection crosses onto ultracode.
-                    slider.detail = Some(format!(
-                        "Ultracode: {}",
-                        tr(
-                            "모든 작업에 동적 워크플로우를 씁니다",
-                            "dynamic workflows on every task"
-                        )
-                    ));
                 }
                 Some(OverlayView {
                     closable: true,
@@ -12857,6 +13292,7 @@ impl AppState {
                 input_placeholder: "",
             }),
             PendingInteraction::SessionPicker(picker) => Some(picker.overlay_view()),
+            PendingInteraction::HistoryPicker(picker) => Some(picker.overlay_view()),
             PendingInteraction::McpPicker(picker) => Some(picker.overlay_view()),
             PendingInteraction::PluginPicker(picker) => Some(picker.overlay_view()),
             PendingInteraction::MarketplacePicker(picker) => Some(picker.overlay_view()),
@@ -12971,7 +13407,7 @@ impl AppState {
                     })
                     .collect::<Vec<_>>();
                 lines.extend(choices.iter().enumerate().map(|(index, choice)| OverlayLine {
-                    text: choice.label.clone(),
+                    text: format!("{}. {}", index + 1, choice.label),
                     selected: *selected == index,
                     muted: false,
                 }));
@@ -12981,9 +13417,9 @@ impl AppState {
                     lines,
                     slider: None,
                     hint: if *confirming {
-                        "Enter Again to Allow   Esc Decline"
+                        "Enter or Same Number Again to Allow   Esc Decline"
                     } else {
-                        "↑↓ Select   Enter Confirm   Esc Decline"
+                        "1-9 Pick   ↑↓ Select   Enter Confirm   Esc Decline"
                     }.to_owned(),
                     style: OverlayStyle::Panel,
                     input: None,
@@ -13021,7 +13457,7 @@ impl AppState {
                     title: "MCP approval".to_owned(),
                     lines,
                     slider: None,
-                    hint: "↑↓ Select   Enter Confirm   Esc Cancel".to_owned(),
+                    hint: "1-9 Pick   ↑↓ Select   Enter Confirm   Esc Cancel".to_owned(),
                     style: OverlayStyle::KeyboardOnlyPanel,
                     input: None,
                     input_label: "",
@@ -13570,6 +14006,9 @@ impl AppState {
     /// argument, mirroring how command names complete.
     fn matching_agent_arguments(&self) -> Vec<AgentMode> {
         let text = self.editor.text();
+        if self.suggestions_dismissed_text.as_deref() == Some(text.as_str()) {
+            return Vec::new();
+        }
         let Some(rest) = text.strip_prefix("/agent ") else {
             return Vec::new();
         };
@@ -13926,7 +14365,17 @@ impl AppState {
     /// Activity text animation runs from the wall clock rather than counted ticks,
     /// so its pace stays stable even when frames are delayed.
     fn activity_phase(&self) -> f32 {
-        let Some(started) = self.compacting_started_at.or(self.turn_started_at) else {
+        // Background rows outlive the turn, so their spinners keep their own clock.
+        let Some(started) = self
+            .compacting_started_at
+            .or(self.turn_started_at)
+            .or_else(|| {
+                self.subagents
+                    .iter()
+                    .map(|running| running.started_at)
+                    .min()
+            })
+        else {
             return 0.0;
         };
         let position = started.elapsed().as_millis() % SHIMMER_PERIOD.as_millis();
@@ -14133,9 +14582,17 @@ impl AppState {
         }
     }
 
+    /// Shift+↑↓ cycles the starred models when there are any, else them all.
+    /// From an unstarred model the first step lands on the first star.
     fn move_model_index(&self, model_index: usize, direction: i8) -> usize {
-        let candidates = self.current_provider_model_indices();
-        move_model_index_in(&candidates, model_index, direction)
+        let favorites = self.favorite_model_indices();
+        if favorites.is_empty() {
+            return move_model_index_in(&self.current_provider_model_indices(), model_index, direction);
+        }
+        if !favorites.contains(&model_index) {
+            return favorites[0];
+        }
+        move_model_index_in(&favorites, model_index, direction)
     }
 
     fn move_selected_model(&mut self, direction: i8) -> Action {
@@ -14619,6 +15076,12 @@ impl AppState {
     /// A click on a source tab above the `$` list switches catalogues the way
     /// ←→ do, and the new list starts from its first row.
     pub fn click_completion_source(&mut self, index: usize) -> Action {
+        // `/model` draws its Favorites/All row the same way.
+        if matches!(self.pending, Some(PendingInteraction::ModelPicker { .. })) {
+            self.model_favorites_tab = index == 0;
+            self.normalize_pending_model_picker();
+            return Action::None;
+        }
         let source = match index {
             0 => CompletionSource::User,
             1 => CompletionSource::Plugin,
@@ -14983,30 +15446,9 @@ impl AppState {
         }
     }
 
-    /// A click on one step of an effort track. In the model picker the track is a
-    /// control beside the list, so the click only moves it; the effort picker has
-    /// nothing else to answer for, so a click there settles it.
+    /// A click on one step of an effort track settles it.
     pub fn click_effort_step(&mut self, step: usize) -> Action {
         match self.pending.take() {
-            Some(PendingInteraction::ModelPicker {
-                model_index, query, ..
-            }) => {
-                let count = self
-                    .models
-                    .get(model_index)
-                    .map(|model| model.efforts.len())
-                    .unwrap_or(1)
-                    .max(1);
-                self.pending = Some(PendingInteraction::ModelPicker {
-                    model_index,
-                    effort_index: step.min(count - 1),
-                    query,
-                    // A click on the track is an effort interaction, so ←→
-                    // should keep adjusting it afterwards.
-                    search_focused: false,
-                });
-                Action::None
-            }
             Some(PendingInteraction::EffortPicker { effort_index }) => {
                 if self.apply_effort_step(step) {
                     Action::None
@@ -17614,7 +18056,19 @@ fn model_runtime(model: &str) -> &'static str {
     }
 }
 
-fn path_eq(left: &str, right: &str) -> bool {
+/// The composer's editor, with this folder's earlier prompts ready for up/down
+/// recall and later submissions appended to the same file.
+fn editor_with_prompt_history(cwd: &str) -> Editor {
+    let mut editor = Editor::default();
+    if let Some(path) = crate::prompt_history::default_path() {
+        crate::prompt_history::compact(&path);
+        editor.replace_history(crate::prompt_history::recent(&path, cwd));
+        editor.set_history_log(path, cwd.to_owned());
+    }
+    editor
+}
+
+pub(crate) fn path_eq(left: &str, right: &str) -> bool {
     #[cfg(windows)]
     {
         left.eq_ignore_ascii_case(right)
@@ -17980,6 +18434,31 @@ pub fn write_dismissed_artifacts(urls: impl IntoIterator<Item = String>) -> std:
     fs::write(path, text)
 }
 
+fn model_favorites_path() -> Option<PathBuf> {
+    vibe_settings_path().and_then(|path| Some(path.parent()?.join("model-favorites.json")))
+}
+
+fn read_model_favorites() -> Vec<String> {
+    // Tests must not depend on the developer's own stars.
+    if cfg!(test) {
+        return Vec::new();
+    }
+    model_favorites_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+pub fn write_model_favorites(ids: &[String]) -> std::io::Result<()> {
+    let Some(path) = model_favorites_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_string(ids)?)
+}
+
 /// Where each session's own open/shut state is kept. It is a per-session
 /// preference, so it rides beside the settings file rather than inside it.
 fn side_panel_stages_path() -> Option<PathBuf> {
@@ -18231,7 +18710,7 @@ fn write_project_auto_knowledge_at(path: &Path, cwd: &str, enabled: bool) -> std
     result
 }
 
-fn vibe_settings_path() -> Option<PathBuf> {
+pub(crate) fn vibe_settings_path() -> Option<PathBuf> {
     env::var_os("APPDATA")
         .map(PathBuf::from)
         .map(|root| root.join("DevezVibe").join("settings.toml"))
@@ -18875,6 +19354,104 @@ mod tests {
         state.prepare_new_thread();
         assert!(state.composer_undo.is_empty());
         assert!(state.composer_redo.is_empty());
+    }
+
+    /// A state whose prompt history lives in its own temporary file, never in
+    /// the real `%APPDATA%` one.
+    fn state_with_history_log(name: &str) -> (AppState, PathBuf) {
+        let path = env::temp_dir()
+            .join(format!("devez-history-ui-{}-{name}", std::process::id()))
+            .join("prompt-history.jsonl");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+        let mut state = test_state();
+        state.editor.set_history_log(path.clone(), state.cwd.clone());
+        (state, path)
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn submitted_prompts_and_shell_commands_are_logged_without_placeholders() {
+        let (mut state, path) = state_with_history_log("logged");
+        state.handle_paste("first prompt");
+        state.editor.insert_attachment();
+        state.editor.take_for_submit();
+        // An image alone, a slash command and an empty submit leave nothing behind.
+        state.editor.insert_attachment();
+        state.editor.take_for_submit();
+        state.editor.set_text("/help");
+        state.editor.take_for_submit();
+        state.editor.push_shell_history("git status");
+
+        assert_eq!(
+            crate::prompt_history::entries(&path, &state.cwd),
+            ["!git status", "first prompt"]
+        );
+    }
+
+    #[test]
+    fn ctrl_r_searches_logged_history_and_enter_fills_the_composer() {
+        let (mut state, path) = state_with_history_log("search");
+        for text in ["fix the parser", "write the docs", "fix the lexer"] {
+            crate::prompt_history::append(&path, &state.cwd, text);
+        }
+        crate::prompt_history::append(&path, "elsewhere", "other folder");
+
+        state.handle_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        let view = state.overlay_view().expect("history picker");
+        assert_eq!(view.title, "History · 3");
+        assert_eq!(view.lines[0].text, "fix the lexer");
+        assert!(view.lines[0].selected);
+
+        for ch in "docs".chars() {
+            state.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(state.overlay_view().unwrap().lines[0].text, "write the docs");
+        state.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(state.pending.is_none());
+        assert_eq!(state.editor.text(), "write the docs");
+        assert!(!state.shell_mode);
+    }
+
+    #[test]
+    fn ctrl_r_arrives_as_its_hangul_jamo_and_esc_changes_nothing() {
+        let (mut state, path) = state_with_history_log("jamo");
+        crate::prompt_history::append(&path, &state.cwd, "old prompt");
+        state.handle_paste("draft");
+
+        state.handle_key(key(KeyCode::Char('ㄱ'), KeyModifiers::CONTROL));
+        assert!(matches!(state.pending, Some(PendingInteraction::HistoryPicker(_))));
+        state.handle_key(key(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(state.pending.is_none());
+        assert_eq!(state.editor.text(), "draft");
+    }
+
+    #[test]
+    fn a_bang_entry_turns_shell_mode_on_and_undo_brings_the_draft_back() {
+        let (mut state, path) = state_with_history_log("shell");
+        crate::prompt_history::append(&path, &state.cwd, "!cargo test");
+        state.handle_paste("unsent draft");
+
+        state.handle_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        state.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(state.editor.text(), "cargo test");
+        assert!(state.shell_mode);
+
+        state.handle_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert_eq!(state.editor.text(), "unsent draft");
+        assert!(!state.shell_mode);
+    }
+
+    #[test]
+    fn ctrl_r_inside_another_overlay_is_left_to_that_overlay() {
+        let (mut state, _) = state_with_history_log("overlay");
+        state.open_session_picker(Vec::new());
+        state.handle_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(matches!(state.pending, Some(PendingInteraction::SessionPicker(_))));
     }
 
     #[test]
@@ -20107,7 +20684,7 @@ mod tests {
         let filtered = state.overlay_view().expect("filtered model picker");
         assert!(filtered.lines[0].text.contains("GPT-5.6 Luna"));
         assert!(filtered.lines[0].selected);
-        assert_eq!(filtered.lines.len(), PICKER_ROWS + 1);
+        assert_eq!(filtered.lines.len(), PICKER_ROWS);
         assert!(
             filtered.lines[1..PICKER_ROWS]
                 .iter()
@@ -20134,7 +20711,7 @@ mod tests {
         let empty = state.overlay_view().expect("empty model picker");
         assert_eq!(empty.lines[0].text, "검색과 일치하는 모델이 없습니다.");
         assert!(empty.slider.is_none());
-        assert_eq!(empty.lines.len(), PICKER_ROWS + MODEL_PICKER_EFFORT_ROWS);
+        assert_eq!(empty.lines.len(), PICKER_ROWS);
 
         state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(
@@ -20144,44 +20721,9 @@ mod tests {
     }
 
     #[test]
-    fn opencode_picker_arrows_adjust_effort_while_a_model_is_focused() {
-        let mut state = opencode_picker_state();
-        state.run_slash_command("/model");
-
-        let start = {
-            let view = state.overlay_view().expect("model picker");
-            assert!(matches!(
-                view.style,
-                OverlayStyle::SearchPicker {
-                    input_focused: false
-                }
-            ));
-            assert!(view.hint.contains("←→ effort"));
-            view.slider.as_ref().expect("effort slider").selected
-        };
-
-        state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        {
-            let view = state.overlay_view().expect("model picker");
-            assert_eq!(
-                view.slider.as_ref().expect("effort slider").selected,
-                start + 1
-            );
-        }
-
-        state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        let view = state.overlay_view().expect("model picker");
-        assert_eq!(view.slider.as_ref().expect("effort slider").selected, start);
-    }
-
-    #[test]
     fn up_from_the_top_model_moves_focus_to_search_and_down_hands_it_back() {
         let mut state = opencode_picker_state();
         state.run_slash_command("/model");
-        let start = {
-            let view = state.overlay_view().expect("model picker");
-            view.slider.as_ref().expect("effort slider").selected
-        };
 
         state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         for ch in "ab".chars() {
@@ -20211,10 +20753,7 @@ mod tests {
                 input_focused: false
             }
         ));
-        assert_eq!(
-            view.slider.as_ref().expect("effort slider").selected,
-            start + 1
-        );
+        assert_eq!(view.input.expect("search editor").text(), "");
     }
 
     #[test]
@@ -20274,6 +20813,308 @@ mod tests {
         assert!(state.view().suggestions.is_empty());
         assert!(!state.pending_interrupt);
         assert!(!state.turn_interrupted);
+    }
+
+    #[test]
+    fn idle_esc_closes_an_open_suggestion_list_and_keeps_the_draft() {
+        let mut state = test_state();
+        state.attach_local_image(r"C:\Temp.png".to_owned());
+        state.editor.set_text("/model");
+        assert!(!state.view().suggestions.is_empty());
+
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(state.view().suggestions.is_empty());
+        assert_eq!(state.editor.text(), "/model");
+        assert_eq!(state.composer_images.len(), 1);
+        assert_eq!(state.view().composer_notice, None);
+    }
+
+    #[test]
+    fn idle_esc_clears_the_draft_with_a_notice_and_ctrl_z_restores_it_with_images() {
+        let mut state = test_state();
+        state.attach_local_image(r"C:\Temp.png".to_owned());
+        state.handle_paste("초안");
+
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(state.editor.is_empty() && state.composer_images.is_empty());
+        assert_eq!(
+            state.view().composer_notice,
+            Some("입력을 지웠습니다 · Ctrl+Z로 되돌리기".to_owned())
+        );
+
+        state.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert_eq!(state.editor.text(), "초안");
+        assert_eq!(state.composer_images, vec![r"C:\Temp.png".to_owned()]);
+    }
+
+    #[test]
+    fn interrupt_before_any_response_puts_the_prompt_and_images_back() {
+        let mut state = test_state();
+        state.attach_local_image(r"C:\Temp.png".to_owned());
+        state.handle_paste("중단할 요청");
+        let Action::Submit(text) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
+            panic!("제출돼야 한다");
+        };
+        state.turn_input(text);
+        assert!(state.editor.is_empty() && state.composer_images.is_empty());
+
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(state.editor.text(), "중단할 요청");
+        assert_eq!(state.composer_images, vec![r"C:\Temp.png".to_owned()]);
+        assert_eq!(placeholder_count(&state), 1);
+    }
+
+    fn placeholder_count(state: &AppState) -> usize {
+        state.editor.chars().iter().filter(|&&ch| ch == ATTACHMENT_PLACEHOLDER).count()
+    }
+
+    #[test]
+    fn a_session_that_fails_to_open_puts_the_first_prompt_back_once() {
+        let mut state = test_state();
+        state.attach_local_image(r"C:\Temp.png".to_owned());
+        state.handle_paste("첫 요청");
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::Submit(_)
+        ));
+        // thread/start failed, so `turn_input` never ran.
+        state.set_request_failed("start failed");
+
+        assert_eq!(state.editor.text(), "첫 요청");
+        assert_eq!(state.composer_images, vec![r"C:\Temp.png".to_owned()]);
+        assert_eq!(placeholder_count(&state), 1);
+    }
+
+    #[test]
+    fn interrupting_two_unanswered_prompts_restores_both_in_order() {
+        let mut state = test_state();
+        state.attach_local_image(r"C:\a.png".to_owned());
+        state.handle_paste("A");
+        let Action::Submit(text) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
+            panic!("제출돼야 한다");
+        };
+        state.turn_input(text);
+        state.attach_local_image(r"C:\b.png".to_owned());
+        state.handle_paste("B");
+        let Action::Steer(text) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
+            panic!("후속 입력이어야 한다");
+        };
+        state.turn_input(text);
+
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(state.editor.text(), "A\n\nB");
+        assert_eq!(
+            state.composer_images,
+            vec![r"C:\a.png".to_owned(), r"C:\b.png".to_owned()]
+        );
+        assert_eq!(placeholder_count(&state), 2);
+        assert_eq!(state.take_discarded_prompt_ids().len(), 2);
+    }
+
+    #[test]
+    fn a_failed_steer_restores_only_the_follow_up() {
+        let mut state = test_state();
+        state.handle_paste("A");
+        let Action::Submit(text) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
+            panic!("제출돼야 한다");
+        };
+        state.turn_input(text);
+        state.handle_paste("B");
+        let Action::Steer(text) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
+            panic!("후속 입력이어야 한다");
+        };
+        state.turn_input(text);
+
+        assert!(state.restore_unsent_steer());
+        assert_eq!(state.editor.text(), "B");
+    }
+
+    #[test]
+    fn a_steer_refused_before_turn_started_does_not_bring_back_the_running_prompt() {
+        let mut state = test_state();
+        state.handle_paste("A");
+        let Action::Submit(text) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
+            panic!("제출돼야 한다");
+        };
+        state.turn_input(text);
+
+        state.forget_unsent_prompt();
+        state.set_request_failed("no active turn");
+        assert!(state.editor.is_empty());
+    }
+
+    #[test]
+    fn down_outside_history_leaves_shell_mode_alone() {
+        let mut state = test_state();
+        state.handle_key(KeyEvent::from(KeyCode::Char('!')));
+        assert!(state.shell_mode);
+        state.handle_paste("cargo test");
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        assert!(state.shell_mode);
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::RunShell(_)
+        ));
+
+        // A stale draft mode left by a shell-history round trip must not overwrite
+        // an ordinary prompt.
+        state.handle_key(KeyEvent::from(KeyCode::Up));
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        state.shell_mode = false;
+        state.handle_paste("summarize the README");
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        assert!(!state.shell_mode);
+        assert!(!matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::RunShell(_)
+        ));
+
+        state.editor.clear();
+        state.recall_history_entry("!cargo test");
+        assert!(state.shell_mode);
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        assert!(state.shell_mode);
+    }
+
+    #[test]
+    fn esc_closes_a_no_matches_list_before_clearing_the_draft() {
+        let mut state = test_state();
+        state.attach_local_image(r"C:\Temp.png".to_owned());
+        state.handle_paste("이 파일 봐줘 @zzzqq");
+        assert_eq!(state.view().suggestions[0].command, "No matches");
+
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(state.view().suggestions.is_empty());
+        assert_eq!(state.editor.text(), "이 파일 봐줘 @zzzqq");
+        assert_eq!(state.composer_images.len(), 1);
+        assert_eq!(state.view().composer_notice, None);
+
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(state.editor.is_empty() && state.composer_images.is_empty());
+        assert!(state.view().composer_notice.is_some());
+    }
+
+    #[test]
+    fn esc_on_a_closed_agent_list_clears_the_draft_the_second_time() {
+        let mut state = test_state();
+        state.editor.set_text("/agent ");
+        assert!(!state.view().suggestions.is_empty());
+
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(state.view().suggestions.is_empty());
+        assert_eq!(state.editor.text(), "/agent ");
+
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(state.editor.is_empty());
+    }
+
+    #[test]
+    fn esc_keeps_the_quote_badge_while_the_draft_can_still_be_restored() {
+        let mut state = test_state();
+        state.side_panel_diff_path = Some("src/main.rs".to_owned());
+        assert!(state.set_diff_reference("let fresh = 1;".to_owned()));
+        state.handle_paste("초안");
+
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(state.editor.is_empty());
+        assert_eq!(state.view().diff_reference_lines, Some(1));
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(state.view().diff_reference_lines, None);
+    }
+
+    #[test]
+    fn an_approval_request_closes_an_open_history_window_instead_of_being_refused() {
+        let (mut state, path) = state_with_history_log("approval");
+        crate::prompt_history::append(&path, &state.cwd, "old prompt");
+        state.busy = true;
+        state.handle_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(matches!(state.pending, Some(PendingInteraction::HistoryPicker(_))));
+
+        let action = state.begin_server_request(
+            json!(7),
+            "item/commandExecution/requestApproval",
+            &json!({ "command": "cargo test" }),
+        );
+        assert!(matches!(action, Action::None));
+        assert!(!matches!(state.pending, Some(PendingInteraction::HistoryPicker(_))));
+        assert!(state.pending.is_some());
+    }
+
+    #[test]
+    fn history_follows_the_working_folder_after_a_resume() {
+        let (mut state, path) = state_with_history_log("cwd-change");
+        let original = state.cwd.clone();
+        state.attach_thread(
+            "other-thread".to_owned(),
+            "other-project".to_owned(),
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+        state.handle_paste("from the other project");
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+
+        assert_eq!(
+            crate::prompt_history::entries(&path, "other-project"),
+            ["from the other project"]
+        );
+        assert!(crate::prompt_history::entries(&path, &original).is_empty());
+    }
+
+    #[test]
+    fn usage_without_data_tells_a_reporting_provider_from_one_that_never_reports() {
+        let last = |state: &AppState| state.committed.last().unwrap().body.clone();
+        let mut codex = test_state();
+        codex.set_account_plan(AccountPlan::default());
+        codex.five_hour_percent = None;
+        codex.weekly_percent = None;
+        codex.show_usage();
+        assert_eq!(last(&codex), "아직 사용량 정보를 받지 못했습니다.");
+
+        let mut opencode = AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![test_model("opencode:openai/gpt-5", "OpenCode GPT-5", false)],
+            "opencode:openai/gpt-5",
+            None,
+        );
+        opencode.set_account_plan(AccountPlan::default());
+        opencode.five_hour_percent = None;
+        opencode.weekly_percent = None;
+        opencode.show_usage();
+        assert_eq!(last(&opencode), "이 제공자는 사용량 정보를 제공하지 않습니다.");
+    }
+
+    #[test]
+    fn failed_turn_start_puts_the_prompt_back_but_never_over_a_new_draft() {
+        for (draft, expected) in [("", "보낼 요청"), ("새 초안", "새 초안")] {
+            let mut state = test_state();
+            state.attach_local_image(r"C:\Temp.png".to_owned());
+            state.handle_paste("보낼 요청");
+            let Action::Submit(text) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
+                panic!("제출돼야 한다");
+            };
+            state.turn_input(text);
+            state.handle_paste(draft);
+
+            state.set_request_failed("start failed");
+            assert_eq!(state.editor.text(), expected);
+            assert_eq!(state.composer_images.len(), usize::from(draft.is_empty()));
+        }
+    }
+
+    #[test]
+    fn a_failure_after_the_turn_started_does_not_restore_the_prompt() {
+        let mut state = test_state();
+        state.handle_paste("보낸 요청");
+        let Action::Submit(text) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
+            panic!("제출돼야 한다");
+        };
+        state.turn_input(text);
+        state.set_turn_started("turn-1".to_owned());
+
+        state.set_request_failed("later failure");
+        assert!(state.editor.is_empty());
     }
 
     #[test]
@@ -20491,7 +21332,7 @@ mod tests {
         let anchor = state.begin_local_shell("git status");
         assert_eq!(state.drain_committed().len(), 1);
 
-        state.finish_local_shell(&anchor, "git status", "clean".to_owned(), 0, 12);
+        state.finish_local_shell(&anchor, "git status", "clean".to_owned(), Some(0), 12);
         let committed = state.drain_committed();
         assert_eq!(committed.len(), 1);
         assert_eq!(committed[0].body, "clean");
@@ -22055,8 +22896,22 @@ mod tests {
         assert!(tick.redraw);
         assert!(!tick.animation_only);
 
+        assert!(!tick.spinner_only);
+
+        // An external terminal draws its own IME preedit, so an idle row waits
+        // for the next elapsed second instead of spinning.
+        state.idle_row_spinner = false;
+        assert!(!state.render_tick().redraw);
+
+        // Where dvz draws the preedit, only the row's spinner advances in between.
+        state.idle_row_spinner = true;
         let same_second = state.render_tick();
-        assert!(!same_second.redraw);
+        assert!(same_second.redraw && same_second.animation_only && same_second.spinner_only);
+        assert!(state.animation_view().activity_phase > 0.0);
+
+        // A running turn animates anyway, so its frames may still fall back.
+        state.busy = true;
+        assert!(!state.render_tick().spinner_only);
     }
 
     #[test]
@@ -22989,6 +23844,45 @@ mod tests {
     }
 
     #[test]
+    fn usage_command_shows_plan_windows_and_reset_credits() {
+        let last = |state: &AppState| state.committed.last().unwrap().body.clone();
+
+        let mut claude = test_state();
+        assert!(matches!(claude.run_slash_command("/usage"), Action::ShowUsage));
+        let account = json!({ "subscriptionType": "team" });
+        let usage = json!({
+            "rate_limits": {
+                "five_hour": { "utilization": 37.0, "resets_at": "2026-08-06T05:00:00Z" },
+                "seven_day": { "utilization": 61.0, "resets_at": "2026-08-10T05:00:00Z" }
+            }
+        });
+        claude.set_account_plan(AccountPlan::from_claude(Some(&account), Some(&usage)));
+        claude.show_usage();
+        let body = last(&claude);
+        assert!(body.starts_with("Plan: Claude Team\n5h 37% used · reset "), "{body}");
+        assert!(body.contains("\n7d 61% used · reset "), "{body}");
+
+        let mut codex = test_state();
+        codex.set_account_plan(AccountPlan::from_rate_limits(&rate_limits_fixture()));
+        codex.five_hour_percent = Some(42);
+        codex.weekly_percent = Some(61);
+        codex.five_hour_remaining = Some("25m".to_owned());
+        codex.show_usage();
+        let body = last(&codex);
+        assert!(
+            body.starts_with("Plan: Pro 5x\n5h: 42% · resets in 25m\nweek: 61%\nReset credits: 3 available\n· "),
+            "{body}"
+        );
+
+        let mut none = test_state();
+        none.set_account_plan(AccountPlan::default());
+        none.five_hour_percent = None;
+        none.weekly_percent = None;
+        none.show_usage();
+        assert_eq!(last(&none), "아직 사용량 정보를 받지 못했습니다.");
+    }
+
+    #[test]
     fn welcome_card_carries_the_plan_instead_of_the_model() {
         let mut state = test_state();
         state.set_account_plan(AccountPlan::from_rate_limits(&rate_limits_fixture()));
@@ -23353,17 +24247,7 @@ mod tests {
         let model_picker = state.overlay_view().expect("model picker");
         assert!(model_picker.slider.is_none());
         assert!(!model_picker.hint.contains("effort"));
-        let physical_body_rows =
-            model_picker.lines.len() + usize::from(model_picker.slider.is_some()) * 3;
-        assert_eq!(physical_body_rows, 1 + MODEL_PICKER_EFFORT_ROWS);
-        assert_eq!(
-            model_picker
-                .lines
-                .iter()
-                .filter(|line| line.text.is_empty())
-                .count(),
-            MODEL_PICKER_EFFORT_ROWS
-        );
+        assert_eq!(model_picker.lines.len(), 1);
 
         state.pending = None;
         assert!(matches!(state.run_slash_command("/effort"), Action::None));
@@ -24864,6 +25748,71 @@ mod tests {
     }
 
     #[test]
+    fn space_stars_a_model_and_the_picker_grows_favorites_and_all_tabs() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut state = AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![
+                test_model("claude:opus", "Claude Opus", true),
+                test_model("claude:sonnet", "Claude Sonnet", false),
+                test_model("claude:haiku", "Claude Haiku", false),
+            ],
+            "claude:opus",
+            Some("high"),
+        );
+        let rows = |state: &AppState| {
+            state
+                .overlay_view()
+                .expect("model picker")
+                .lines
+                .iter()
+                .filter(|line| !line.text.is_empty())
+                .map(|line| line.text.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // Nothing starred: the full list alone, no tab row.
+        state.run_slash_command("/model");
+        assert_eq!(state.overlay_view().expect("model picker").title, "Model");
+        state.handle_key(key(KeyCode::Down));
+        let saved = state.handle_key(key(KeyCode::Char(' ')));
+        assert!(
+            matches!(&saved, Action::PersistModelFavorites(ids) if ids == &["claude:sonnet".to_owned()])
+        );
+        assert!(rows(&state)[1].ends_with("Claude Sonnet ★"));
+        assert!(state.overlay_view().expect("model picker").title.contains("[ All ]"));
+
+        // Reopening lands on the stars; ←→ and a tab click switch the lists.
+        state.handle_key(key(KeyCode::Esc));
+        state.run_slash_command("/model");
+        assert!(state.overlay_view().expect("model picker").title.contains("[ Favorites ]"));
+        assert_eq!(rows(&state), ["1. Claude Sonnet ★"]);
+        state.handle_key(key(KeyCode::Right));
+        assert_eq!(rows(&state).len(), 3);
+        state.handle_key(key(KeyCode::Left));
+        assert_eq!(rows(&state), ["1. Claude Sonnet ★"]);
+        state.click_completion_source(1);
+        assert_eq!(rows(&state).len(), 3);
+        state.click_completion_source(0);
+        assert_eq!(rows(&state), ["1. Claude Sonnet ★"]);
+
+        // Unstarring the last one leaves only the full list again.
+        let saved = state.handle_key(key(KeyCode::Char(' ')));
+        assert!(matches!(&saved, Action::PersistModelFavorites(ids) if ids.is_empty()));
+        assert_eq!(state.overlay_view().expect("model picker").title, "Model");
+        assert_eq!(rows(&state).len(), 3);
+
+        // The newest star sits on top of the favorites.
+        state.handle_key(key(KeyCode::Char(' ')));
+        state.handle_key(key(KeyCode::Down));
+        state.handle_key(key(KeyCode::Char(' ')));
+        state.handle_key(key(KeyCode::Left));
+        assert_eq!(rows(&state), ["1. Claude Haiku ★", "2. Claude Sonnet ★"]);
+    }
+
+    #[test]
     fn ultracode_is_the_effort_track_step_past_max() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut opus = test_model("claude:opus", "Claude Opus", true);
@@ -24883,7 +25832,7 @@ mod tests {
         let slider = state.overlay_view().expect("effort picker").slider.expect("effort track");
         assert_eq!(slider.efforts.last().map(String::as_str), Some("ultracode"));
         assert_eq!(slider.selected, 5);
-        assert!(slider.detail.is_some());
+        assert!(slider.detail.is_none());
         // Tab toggles nothing any more, and nothing lies past ultracode.
         state.handle_key(key(KeyCode::Tab));
         state.handle_key(key(KeyCode::Right));
@@ -24937,7 +25886,7 @@ mod tests {
         let _ = state.run_slash_command("/model");
         let model = state.overlay_view().expect("model picker");
         assert_eq!(model.title, "Model");
-        assert!(model.slider.is_some());
+        assert!(model.slider.is_none());
         assert!(
             model.lines.iter().all(|line| line.text != "Effort"),
             "Effort must not be a standalone model-picker row"
@@ -28741,7 +29690,7 @@ mod tests {
         ));
         let overlay = state.overlay_view().expect("approval selection");
         assert!(overlay.lines[3].selected);
-        assert_eq!(overlay.hint, "↑↓ Select   Enter Confirm   Esc Decline");
+        assert_eq!(overlay.hint, "1-9 Pick   ↑↓ Select   Enter Confirm   Esc Decline");
         match state.handle_key(KeyEvent::from(KeyCode::Enter)) {
             Action::RpcResponse { result, .. } => {
                 assert_eq!(
@@ -29643,7 +30592,7 @@ mod tests {
         for code in [
             KeyCode::Char('y'),
             KeyCode::Char('n'),
-            KeyCode::Char('2'),
+            KeyCode::Char('9'),
             KeyCode::Tab,
         ] {
             assert!(matches!(
@@ -30657,12 +31606,19 @@ mod tests {
     }
 
     #[test]
-    fn composer_escape_clears_the_prompt_and_attachments() {
+    fn composer_escape_closes_the_list_then_clears_the_prompt_and_attachments() {
         let mut state = composer_completion_state();
         state.editor.set_text("$rev");
         state.attach_local_image(r"C:\Temp\clipboard-image.bmp".to_owned());
         assert!(!state.view().suggestions.is_empty());
 
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Esc)),
+            Action::None
+        ));
+        assert!(state.view().suggestions.is_empty());
+        assert_eq!(state.editor.text(), "$rev");
+        assert_eq!(state.composer_image_count(), 1);
         assert!(matches!(
             state.handle_key(KeyEvent::from(KeyCode::Esc)),
             Action::None
@@ -30740,6 +31696,42 @@ mod tests {
     }
 
     #[test]
+    fn shell_commands_are_recalled_in_shell_mode_and_prompts_leave_it() {
+        let mut state = test_state();
+        state.editor.replace_history(["hello prompt".to_owned()]);
+
+        state.handle_key(KeyEvent::from(KeyCode::Char('!')));
+        state.handle_paste("cargo test");
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::RunShell(_)
+        ));
+        assert!(!state.shell_mode);
+
+        state.handle_key(KeyEvent::from(KeyCode::Up));
+        assert!(state.shell_mode);
+        assert_eq!(state.editor.text(), "cargo test");
+
+        state.handle_key(KeyEvent::from(KeyCode::Up));
+        assert!(!state.shell_mode);
+        assert_eq!(state.editor.text(), "hello prompt");
+
+        // A shell draft survives a round trip through history.
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        assert!(!state.shell_mode);
+        state.handle_key(KeyEvent::from(KeyCode::Char('!')));
+        state.handle_paste("ls");
+        state.handle_key(KeyEvent::from(KeyCode::Up));
+        state.handle_key(KeyEvent::from(KeyCode::Up));
+        assert!(!state.shell_mode);
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        assert!(state.shell_mode);
+        assert_eq!(state.editor.text(), "ls");
+    }
+
+    #[test]
     fn pasted_leading_bang_enters_shell_mode_but_later_bang_stays_a_prompt() {
         let mut shell = test_state();
         shell.handle_paste("!git status");
@@ -30767,7 +31759,7 @@ mod tests {
             &anchor,
             "Write-Output hello",
             "hello".to_owned(),
-            0,
+            Some(0),
             25,
         );
         let completed = state.drain_committed().pop().expect("shell result");
@@ -30777,6 +31769,20 @@ mod tests {
         assert!(matches!(completed.kind, BlockKind::Tool));
         assert_eq!(completed.title, "Shell · Write-Output hello · exit 0 · 25ms");
         assert_eq!(completed.body, "hello");
+    }
+
+    #[test]
+    fn interrupted_local_shell_keeps_output_and_is_marked() {
+        let mut state = test_state();
+        let anchor = state.begin_local_shell("ping -t host");
+        state.drain_committed();
+
+        state.finish_local_shell(&anchor, "ping -t host", "reply 1".to_owned(), None, 3000);
+        let done = state.drain_committed().pop().expect("shell result");
+
+        assert!(matches!(done.kind, BlockKind::Warning));
+        assert_eq!(done.title, "Shell · ping -t host · interrupted · 3.0s");
+        assert_eq!(done.body, "reply 1");
     }
 
     #[test]
@@ -31555,6 +32561,39 @@ mod tests {
     }
 
     #[test]
+    fn shifted_model_navigation_cycles_only_the_stars_when_there_are_any() {
+        let mut codex = AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![
+                test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
+                test_model("gpt-5.6-luna", "GPT-5.6 Luna", false),
+                test_model("gpt-5.6-terra", "GPT-5.6 Terra", false),
+                test_model("gpt-6-astra", "GPT-6 Astra", false),
+            ],
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+        // Another provider's star does not count for this one.
+        codex.model_favorites = vec!["claude:opus".to_owned()];
+        codex.move_selected_model(1);
+        assert_eq!(codex.selected_model_name(), "gpt-5.6-luna");
+
+        // Newest star first, as `/model` lists them.
+        codex.model_favorites = vec!["gpt-6-astra".to_owned(), "gpt-5.6-sol".to_owned()];
+        // From an unstarred model the first step lands on the first star.
+        codex.move_selected_model(1);
+        assert_eq!(codex.selected_model_name(), "gpt-6-astra");
+        codex.move_selected_model(1);
+        assert_eq!(codex.selected_model_name(), "gpt-5.6-sol");
+        codex.move_selected_model(1);
+        assert_eq!(codex.selected_model_name(), "gpt-5.6-sol");
+        codex.move_selected_model(-1);
+        assert_eq!(codex.selected_model_name(), "gpt-6-astra");
+    }
+
+    #[test]
     fn shifted_model_navigation_stays_scoped_and_follows_catalog_order() {
         let mut codex = AppState::new(
             "thread".to_owned(),
@@ -31778,7 +32817,7 @@ mod tests {
                 .iter()
                 .any(|line| line.text.contains("Always allow in this project"))
         );
-        assert_eq!(overlay.hint, "↑↓ Select   Enter Confirm   Esc Decline");
+        assert_eq!(overlay.hint, "1-9 Pick   ↑↓ Select   Enter Confirm   Esc Decline");
 
         let mut state = test_state();
         state.begin_server_request(
@@ -31793,10 +32832,10 @@ mod tests {
         let overlay = state.overlay_view().expect("Claude persistent approval");
         assert!(
             overlay.lines.iter().any(|line| {
-                line.text == "Always allow in this project: Bash(npm test)"
+                line.text.ends_with(". Always allow in this project: Bash(npm test)")
             })
         );
-        assert_eq!(overlay.hint, "↑↓ Select   Enter Confirm   Esc Decline");
+        assert_eq!(overlay.hint, "1-9 Pick   ↑↓ Select   Enter Confirm   Esc Decline");
     }
 
     #[test]
@@ -31835,7 +32874,7 @@ mod tests {
             ));
             assert_eq!(
                 state.overlay_view().expect("confirmation").hint,
-                "Enter Again to Allow   Esc Decline"
+                "Enter or Same Number Again to Allow   Esc Decline"
             );
             match state.handle_key(KeyEvent::from(KeyCode::Enter)) {
                 Action::RpcResponse { result, .. } => {
@@ -31845,6 +32884,58 @@ mod tests {
                 _ => panic!("guarded approval must answer after confirmation"),
             }
         }
+    }
+
+    #[test]
+    fn approval_digit_picks_row_and_guarded_needs_second_press() {
+        let mut state = command_approval_state();
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Char('9'))),
+            Action::None
+        ));
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::CONTROL)),
+            Action::None
+        ));
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Char('2'))),
+            Action::RpcResponse { result, .. }
+                if result.get("decision").and_then(Value::as_str) == Some("acceptForSession")
+        ));
+
+        let mut state = test_state();
+        state.begin_server_request(
+            json!(96),
+            "item/commandExecution/requestApproval",
+            &json!({ "claudePermission": true, "defaultToNo": true, "command": "npm test" }),
+        );
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Char('1'))),
+            Action::None
+        ));
+        assert!(matches!(
+            state.pending.as_ref(),
+            Some(PendingInteraction::Approval { confirming: true, .. })
+        ));
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Char('1'))),
+            Action::RpcResponse { result, .. }
+                if result.get("decision").and_then(Value::as_str) == Some("accept")
+        ));
+    }
+
+    #[test]
+    fn mcp_approval_digit_answers_with_that_option() {
+        let mut approval = McpApproval::parse(json!(1), &json!({ "message": "Run?" }))
+            .expect("message-only approval");
+        assert!(approval.handle_key(KeyEvent::from(KeyCode::Char('9'))).is_none());
+        assert!(approval.handle_key(KeyEvent::from(KeyCode::Char('0'))).is_none());
+        let last = approval.options.len();
+        assert!(approval.handle_key(KeyEvent::from(KeyCode::Char('x'))).is_none());
+        assert!(approval.handle_key(KeyEvent::from(KeyCode::Char(
+            char::from_digit(last as u32, 10).unwrap()
+        ))).is_some());
+        assert_eq!(approval.selected, last - 1);
     }
 
     #[test]

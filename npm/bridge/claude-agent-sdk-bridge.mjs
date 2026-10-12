@@ -2610,9 +2610,11 @@ function startDelegatedSubagent(session, block) {
 }
 
 // Bash의 백그라운드 실행 접수는 backgroundTaskId로 온다. Agent의 비동기 접수와
-// 같은 의미이므로 같은 경로로 행을 남긴다.
+// 같은 의미이므로 같은 경로로 행을 남긴다. 클라우드로 띄운 원격 Agent의
+// remote_launched도 끝난 결과가 아니라 접수다.
 function isBackgroundSubagentResult(result) {
   return result?.isAsync === true || result?.status === "async_launched"
+    || result?.status === "remote_launched"
     || typeof result?.backgroundTaskId === "string";
 }
 
@@ -2741,6 +2743,8 @@ function upsertStructuredSubagent(session, message) {
   }
   if (toolUseId) running.toolUseId = toolUseId;
   if (taskId) running.taskId = taskId;
+  // 스크립트 Monitor는 local_bash 작업으로 와서 스냅숏 이름이 Bash가 된다.
+  if (session.tools?.get(toolUseId)?.name === "Monitor") running.name = "Monitor";
   const parentTaskId = firstLine(message.parent_task_id || "", 80);
   if (parentTaskId) running.parentTaskId = parentTaskId;
   // Agent 호출이 붙인 작업 이름이 있으면 SDK가 뒤늦게 알려 주는 에이전트 종류로 덮지 않는다.
@@ -3190,8 +3194,11 @@ function processUser(session, message) {
   for (const block of content) {
     if (block.type !== "tool_result") continue;
     const pending = session.tools.get(block.tool_use_id);
+    // Workflow·Monitor는 행을 직접 띄우지 않고 결과가 접수 영수증이다. task_started가
+    // 스냅숏 행에 이 호출 id를 묶어 두므로, 그 행은 종료 통지와 다음 스냅숏만 거둔다.
     const staysInBackground = (SUBAGENT_TOOLS.includes(pending?.name) || pending?.name === "Bash")
-      && keepBackgroundSubagent(session, block.tool_use_id, message.tool_use_result);
+      ? keepBackgroundSubagent(session, block.tool_use_id, message.tool_use_result)
+      : findSubagent(session, block.tool_use_id)?.background === true;
     if (!staysInBackground) finishSubagent(session, block.tool_use_id);
     if (pending?.name === "SendMessage") {
       resumeBackgroundSubagent(session, block.tool_use_id, pending, message.tool_use_result);
@@ -6150,6 +6157,88 @@ async function runSelfTest() {
       subtype: "background_tasks_changed",
       tasks: [],
     });
+    // 백그라운드로 시작한 작업은 스냅숏이 task_started보다 먼저 오고, task_started가
+    // 행에 도구 호출 id를 묶는다. 그 도구의 접수 결과가 행을 지우면 안 된다.
+    for (const [tool, taskId, taskType, receipt] of [
+      ["Workflow", "wf-1", "local_workflow", { status: "async_launched", taskId: "wf-1", taskType: "local_workflow" }],
+      ["Monitor", "monitor-2", "local_bash", { taskId: "monitor-2", timeoutMs: 0, persistent: true }],
+    ]) {
+      const toolUseId = `toolu_${taskId}`;
+      commandSession.tools.set(toolUseId, { name: tool, input: {}, item: { id: toolUseId } });
+      processSubagentSystemMessage(commandSession, {
+        type: "system",
+        subtype: "background_tasks_changed",
+        tasks: [{ task_id: taskId, task_type: taskType, description: `${tool} 작업` }],
+      });
+      processSubagentSystemMessage(commandSession, {
+        type: "system",
+        subtype: "task_started",
+        task_id: taskId,
+        tool_use_id: toolUseId,
+        task_type: taskType,
+        description: `${tool} 작업`,
+      });
+      processUser(commandSession, {
+        message: { content: [{ type: "tool_result", tool_use_id: toolUseId, content: `${tool} launched` }] },
+        tool_use_result: receipt,
+      });
+      const row = findSubagent(commandSession, taskId);
+      if (commandSession.subagents.size !== 1 || row?.name !== tool || row.backgroundTask !== true) {
+        throw new Error(`Claude ${tool} launch receipt removed its row: ${JSON.stringify([...commandSession.subagents])}`);
+      }
+      processSubagentSystemMessage(commandSession, {
+        type: "system",
+        subtype: "background_tasks_changed",
+        tasks: [],
+      });
+      if (commandSession.subagents.size !== 0) {
+        throw new Error(`Claude ${tool} row outlived its snapshot`);
+      }
+    }
+    // 포그라운드로 끝난 작업은 여전히 그 도구 결과가 행을 거둔다.
+    commandSession.tools.set("toolu_skill", { name: "Skill", input: {}, item: { id: "toolu_skill" } });
+    processSubagentSystemMessage(commandSession, {
+      type: "system",
+      subtype: "task_started",
+      task_id: "agent-skill",
+      tool_use_id: "toolu_skill",
+      task_type: "local_agent",
+      subagent_type: "general-purpose",
+    });
+    processUser(commandSession, {
+      message: { content: [{ type: "tool_result", tool_use_id: "toolu_skill", content: "done" }] },
+      tool_use_result: { success: true },
+    });
+    if (commandSession.subagents.size !== 0) {
+      throw new Error(`Claude foreground row outlived its tool result: ${JSON.stringify([...commandSession.subagents])}`);
+    }
+    // 클라우드로 띄운 원격 Agent도 접수 결과에서 줄이 남고, 종료 통지가 거둔다.
+    commandSession.tools.set("toolu_remote", { name: "Agent", input: { name: "cloud_review" }, item: { id: "toolu_remote" } });
+    startSubagent(commandSession, { id: "toolu_remote", input: { name: "cloud_review" } });
+    processUser(commandSession, {
+      message: { content: [{ type: "tool_result", tool_use_id: "toolu_remote", content: "Remote agent launched" }] },
+      tool_use_result: {
+        status: "remote_launched",
+        taskId: "remote-1",
+        sessionUrl: "https://claude.ai/code/session_remote",
+        description: "원격 검토",
+        prompt: "검토",
+        outputFile: "remote-1.output",
+      },
+    });
+    if (findSubagent(commandSession, "remote-1")?.background !== true) {
+      throw new Error(`Claude remote agent receipt removed its row: ${JSON.stringify([...commandSession.subagents])}`);
+    }
+    processSubagentSystemMessage(commandSession, {
+      type: "system",
+      subtype: "task_notification",
+      task_id: "remote-1",
+      status: "completed",
+      summary: "Remote agent finished",
+    });
+    if (commandSession.subagents.size !== 0) {
+      throw new Error("Claude remote agent row outlived its notification");
+    }
 
     processSubagentSystemMessage(structuredSession, {
       type: "system",

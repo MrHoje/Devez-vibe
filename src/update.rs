@@ -23,12 +23,20 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude `/effort`에 ultracode를 추가했고, max 다음 단계로 고를 수 있습니다.",
+    "`/model`에서 Space로 모델을 즐겨찾기에 넣고 빼며, 즐겨찾기가 있으면 상단의 Favorites·All 탭을 ←→로 오가고 Shift+↑↓도 즐겨찾기 안에서만 모델을 바꿉니다.",
+    "Claude가 워크플로·Monitor·원격 하위 에이전트를 백그라운드로 실행하면 컴포저 아래 실행 줄이 바로 사라지던 문제를 고쳤습니다.",
+    "`!` 셸 명령이 실행 중에도 화면을 멈추지 않고 Esc·Ctrl+C로 중단할 수 있으며, 셸 명령도 ↑ 이력에 셸 모드와 함께 남습니다.",
+    "보낸 프롬프트를 프로젝트별로 저장해 다시 실행해도 ↑로 불러오고, Ctrl+R로 이력을 검색해 고를 수 있습니다.",
+    "승인 카드에서 숫자 키로 선택지를 바로 고를 수 있습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Added ultracode to Claude `/effort`; you can pick it as the step after max.",
+    "In `/model`, Space adds or removes a favorite model; with favorites, ←→ switches between the Favorites and All tabs at the top, and Shift+↑↓ cycles only through favorites.",
+    "Fixed the running rows under the composer vanishing right away when Claude ran a workflow, Monitor, or remote subagent in the background.",
+    "`!` shell commands no longer freeze the screen while running and can be stopped with Esc or Ctrl+C; they also stay in ↑ history together with shell mode.",
+    "Sent prompts are saved per project, so ↑ recalls them even after a restart, and Ctrl+R searches the history to pick one.",
+    "Approval cards let you pick an option directly with number keys.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

@@ -3659,6 +3659,24 @@ impl Renderer {
             return Ok(false);
         }
         updates.extend(plan_lines.into_iter().enumerate());
+        // Running rows under the composer keep their text; only the spinner in
+        // the bullet's place advances, in step with the plan's.
+        let spinner = working_spinner_frame(view.activity_phase);
+        updates.extend(
+            self.previous_lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| is_subagent_spinner_row(line))
+                .map(|(row, line)| {
+                    (
+                        row,
+                        PaintLine {
+                            text: spinner.to_owned(),
+                            ..line.clone()
+                        },
+                    )
+                }),
+        );
         let painted_height = self
             .painted_frame
             .as_ref()
@@ -6411,6 +6429,10 @@ fn shimmer_spans_with_band(label: &str, phase: f32, base: Rgb, band: f32) -> Vec
 /// Gajae-Code's Unicode activity loader frames.
 const WORKING_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+fn working_spinner_frame(phase: f32) -> &'static str {
+    WORKING_SPINNER[(phase.clamp(0.0, 0.999) * WORKING_SPINNER.len() as f32) as usize]
+}
+
 /// Activity labels that carry the loader glyph and the shimmer sweep.
 const SPINNING_ACTIVITY_LABELS: [&str; 2] = ["Working..", "Compacting.."];
 
@@ -6660,11 +6682,11 @@ fn steer_preview_lines(prompts: &[SteeredPromptView], width: u16) -> Vec<PaintLi
 /// Running subagents are listed under the status line, one row each, so a fan-out
 /// stays visible without pushing the transcript around. Rows disappear as each
 /// subagent finishes; background rows may outlive the parent turn.
-fn subagent_lines(subagents: &[SubagentView], width: u16) -> Vec<PaintLine> {
+fn subagent_lines(subagents: &[SubagentView], width: u16, phase: f32) -> Vec<PaintLine> {
     subagents
         .iter()
         .enumerate()
-        .map(|(index, subagent)| subagent_line(subagent, index, width))
+        .map(|(index, subagent)| subagent_line(subagent, index, width, phase))
         .collect()
 }
 
@@ -6713,13 +6735,15 @@ fn subagent_indent(subagent: &SubagentView, room: usize) -> String {
 /// Indent gives way first on a narrow row, so the name keeps this much.
 const SUBAGENT_NAME_MIN_WIDTH: usize = 8;
 
-fn subagent_line(subagent: &SubagentView, index: usize, width: u16) -> PaintLine {
+fn subagent_line(subagent: &SubagentView, index: usize, width: u16, phase: f32) -> PaintLine {
     let label = subagent_label_prefix(subagent);
     let elapsed = format!(" · {}", format_subagent_elapsed(subagent.elapsed.as_secs()));
+    // 계획의 진행 중 단계와 같은 스피너가 점 자리에서 돈다.
+    let glyph = working_spinner_frame(phase);
     // The gutter, glyph, label, and elapsed reading are fixed, so the name is compacted
     // first and the call description takes only what the name leaves behind.
     let fixed = 1
-        + UnicodeWidthStr::width(SUBAGENT_GLYPH)
+        + UnicodeWidthStr::width(glyph)
         + 2
         + UnicodeWidthStr::width(label)
         + UnicodeWidthStr::width(elapsed.as_str());
@@ -6754,16 +6778,28 @@ fn subagent_line(subagent: &SubagentView, index: usize, width: u16) -> PaintLine
     PaintLine {
         prefix: format!(" {indent}"),
         prefix_tone: Tone::Muted,
-        text: SUBAGENT_GLYPH.to_owned(),
+        text: glyph.to_owned(),
         tone: Tone::Accent,
         bold: false,
         tool_heading: None,
         pick: None,
         tail,
     }
-    // The bullet, agent name, and its description open the same panel; the
+    // The spinner, agent name, and its description open the same panel; the
     // elapsed reading is left alone so the row's right edge stays quiet.
     .with_picks(&picks)
+}
+
+/// A running-subagent row under the composer: its spinner opens the row's
+/// panel. The animation path advances only that glyph between full frames.
+fn is_subagent_spinner_row(line: &PaintLine) -> bool {
+    WORKING_SPINNER.contains(&line.text.as_str())
+        && line.pick.as_ref().is_some_and(|picks| {
+            picks
+                .0
+                .iter()
+                .any(|(_, _, pick)| matches!(pick, Pick::Subagent(_)))
+        })
 }
 
 fn format_subagent_elapsed(seconds: u64) -> String {
@@ -6775,10 +6811,6 @@ fn format_subagent_elapsed(seconds: u64) -> String {
         format!("{minutes}m {seconds}s")
     }
 }
-
-/// A small bullet keeps the running-subagent rows lighter than the transcript's
-/// tool bullet, so a fan-out reads as quieter activity under the status line.
-const SUBAGENT_GLYPH: &str = "•";
 
 /// The newest published artifact as one row under the status line: its name is
 /// the link, older ones are counted, and `x` puts the row away. Claude Code's
@@ -7552,7 +7584,7 @@ fn normal_frame_with_expansion(
     if status_line_painted && (!subagents.is_empty() || !artifacts.is_empty()) {
         lines.push(PaintLine::blank());
     }
-    lines.extend(subagent_lines(subagents, width));
+    lines.extend(subagent_lines(subagents, width, activity_phase));
     lines.extend(artifact_line(artifacts, width));
 
     Frame {
@@ -8472,12 +8504,18 @@ fn overlay_frame_with_expansion(
             // Keep one ordinary terminal cell open before the closing border;
             // the effort track below uses the same narrower content area.
             let inner_width = panel_width.saturating_sub(3);
-            lines.push(panel_title_row(
-                &overlay.title,
-                panel_width,
-                overlay.closable,
-            ));
+            let (title, tabs) = overlay
+                .title
+                .split_once(COMPLETION_TAB_MARKER)
+                .map_or((overlay.title.as_str(), None), |(title, tabs)| (title, Some(tabs)));
+            lines.push(panel_title_row(title, panel_width, overlay.closable));
             lines.push(panel_padding_row(panel_width));
+            if let Some(tabs) = tabs {
+                let row = question_tab_row(tabs, panel_width.saturating_sub(2));
+                let picks = completion_tab_picks(&row);
+                lines.push(close_panel_row(row.with_picks(&picks), panel_width));
+                lines.push(panel_padding_row(panel_width));
+            }
 
             if let OverlayStyle::SearchPicker { input_focused } = overlay.style
                 && let Some(editor) = overlay.input
@@ -19960,17 +19998,23 @@ mod tests {
         let mut child = test_subagent("Bash", "npm run dev", "", 12);
         child.is_background_task = true;
         child.depth = 1;
-        assert_eq!(painted(&subagent_line(&parent, 0, 80)), " •  sub agnet: explore · 40s");
         assert_eq!(
-            painted(&subagent_line(&child, 1, 80)),
-            "   •  background task: Bash · npm run dev · 12s"
+            painted(&subagent_line(&parent, 0, 80, 0.0)),
+            " ⠋  sub agnet: explore · 40s"
+        );
+        assert_eq!(
+            painted(&subagent_line(&child, 1, 80, 0.0)),
+            "   ⠋  background task: Bash · npm run dev · 12s"
         );
         // A deep chain stops at four levels, and on a narrow row the indent
         // gives way before the name does.
         child.depth = 9;
-        assert!(painted(&subagent_line(&child, 1, 80)).starts_with(&format!(" {}•", " ".repeat(8))));
-        let deep = subagent_line(&child, 1, 32);
-        assert!(painted(&deep).starts_with(" •  background task: Bash"));
+        assert!(
+            painted(&subagent_line(&child, 1, 80, 0.0))
+                .starts_with(&format!(" {}⠋", " ".repeat(8)))
+        );
+        let deep = subagent_line(&child, 1, 32, 0.0);
+        assert!(painted(&deep).starts_with(" ⠋  background task: Bash"));
         assert!(painted_line_width(&deep) <= 32);
         let deep_panel = side_panel_subagent_lines(&[child.clone()], 30);
         assert!(painted(&deep_panel[2]).starts_with("• background task: Bash"));
@@ -19986,10 +20030,10 @@ mod tests {
         for name in ["Bash", "Workflow", "Monitor"] {
             let mut task = test_subagent(name, "npm test", "", 29);
             task.is_background_task = true;
-            let line = subagent_line(&task, 0, 80);
+            let line = subagent_line(&task, 0, 80, 0.0);
             assert_eq!(
                 painted(&line),
-                format!(" •  background task: {name} · npm test · 29s")
+                format!(" ⠋  background task: {name} · npm test · 29s")
             );
             assert_eq!(pick_on(&line, "background task:"), Some(Pick::Subagent(0)));
             assert_eq!(pick_on(&line, "npm test"), Some(Pick::Subagent(0)));
@@ -19999,8 +20043,8 @@ mod tests {
                 painted(&lines[2]),
                 format!("• background task: {name} · npm test · 29s")
             );
-            let narrow = subagent_line(&task, 0, 32);
-            assert!(painted(&narrow).starts_with(" •  background task: "));
+            let narrow = subagent_line(&task, 0, 32, 0.0);
+            assert!(painted(&narrow).starts_with(" ⠋  background task: "));
             assert!(painted(&narrow).ends_with(" · 29s"));
             assert!(painted_line_width(&narrow) <= 32);
             let narrow_panel = side_panel_subagent_lines(&[task], 32);
@@ -20068,13 +20112,13 @@ mod tests {
         ];
 
         assert_eq!(
-            subagent_lines(&subagents, 80)
+            subagent_lines(&subagents, 80, 0.0)
                 .iter()
                 .map(painted)
                 .collect::<Vec<_>>(),
             [
-                " •  sub agnet: Explore · Find auth code · 1m 33s",
-                " •  sub agnet: developer · Fix the parser · 3s",
+                " ⠋  sub agnet: Explore · Find auth code · 1m 33s",
+                " ⠋  sub agnet: developer · Fix the parser · 3s",
             ]
         );
     }
@@ -20084,8 +20128,8 @@ mod tests {
         let subagent = test_subagent("Explore", "", "Grep(fn login)", 4);
 
         assert_eq!(
-            painted(&subagent_line(&subagent, 0, 80)),
-            " •  sub agnet: Explore · 4s"
+            painted(&subagent_line(&subagent, 0, 80, 0.0)),
+            " ⠋  sub agnet: Explore · 4s"
         );
     }
 
@@ -20095,12 +20139,12 @@ mod tests {
         let claude = test_subagent("devez-reviewer", "변경 검토", "", 3);
 
         assert_eq!(
-            painted(&subagent_line(&codex, 0, 80)),
-            " •  sub agnet: eghis2 daily popup · 28s"
+            painted(&subagent_line(&codex, 0, 80, 0.0)),
+            " ⠋  sub agnet: eghis2 daily popup · 28s"
         );
         assert_eq!(
-            painted(&subagent_line(&claude, 1, 80)),
-            " •  sub agnet: devez reviewer · 변경 검토 · 3s"
+            painted(&subagent_line(&claude, 1, 80, 0.0)),
+            " ⠋  sub agnet: devez reviewer · 변경 검토 · 3s"
         );
     }
 
@@ -20113,10 +20157,10 @@ mod tests {
             93,
         );
 
-        let line = subagent_line(&subagent, 0, 30);
+        let line = subagent_line(&subagent, 0, 30, 0.0);
 
         assert!(!painted(&line).contains("hidden"));
-        assert!(painted(&line).starts_with(" •  sub agnet: "));
+        assert!(painted(&line).starts_with(" ⠋  sub agnet: "));
         assert!(painted(&line).ends_with(" · 1m 33s"));
         assert!(painted_line_width(&line) <= 30);
 
@@ -20130,7 +20174,7 @@ mod tests {
     fn a_narrow_subagent_row_drops_the_description_before_the_name() {
         let subagent = test_subagent("Explore", "Find the auth code path", "", 4);
 
-        let line = subagent_line(&subagent, 0, 36);
+        let line = subagent_line(&subagent, 0, 36, 0.0);
 
         assert!(painted(&line).contains("Explore"));
         assert!(!painted(&line).contains("Find"));
@@ -20145,9 +20189,10 @@ mod tests {
                 test_subagent("developer", "Fix the parser", "", 1),
             ],
             80,
+            0.0,
         );
 
-        assert_eq!(pick_on(&lines[0], "•"), Some(Pick::Subagent(0)));
+        assert_eq!(pick_on(&lines[0], "⠋"), Some(Pick::Subagent(0)));
         assert_eq!(pick_on(&lines[0], "sub agnet:"), Some(Pick::Subagent(0)));
         assert_eq!(pick_on(&lines[0], "Explore"), Some(Pick::Subagent(0)));
         assert_eq!(pick_on(&lines[0], "Find auth code"), Some(Pick::Subagent(0)));
@@ -26215,6 +26260,41 @@ mod tests {
         );
     }
 
+    /// Between full frames the fast path advances only the spinner of a running
+    /// row under the composer; its text and click target stay as painted.
+    #[test]
+    fn the_animation_fast_path_spins_running_subagent_rows() {
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.painted_frame = Some(CellFrame::new(80, 24));
+        renderer.last_width = 80;
+        renderer.last_total_width = 80;
+        renderer.previous_lines = vec![PaintLine::blank(); 24];
+        let row = subagent_line(&test_subagent("Workflow", "조사", "", 5), 0, 80, 0.0);
+        renderer.previous_lines[20] = row.clone();
+
+        let animated = renderer
+            .render_animation(AnimationView {
+                activity: None,
+                activity_model: None,
+                activity_phase: 0.5,
+                waiting_for_response: false,
+                activity_progress_phase: 0.0,
+                plan_summary: None,
+                plan_active: false,
+                plan_shimmer_phase: None,
+                plan_agent: AgentMode::Standard,
+                composer_notice: None,
+                composer_mode: None,
+            })
+            .expect("no io error");
+
+        assert!(animated);
+        let spun = &renderer.previous_lines[20];
+        assert_eq!(spun.text, working_spinner_frame(0.5));
+        assert_ne!(spun.text, row.text);
+        assert!(spun.tail == row.tail && spun.pick == row.pick);
+    }
+
     #[test]
     fn opening_and_closing_a_question_discards_the_panel_frame_once() {
         let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
@@ -26691,6 +26771,47 @@ mod tests {
         assert!(frame.lines[1].text.starts_with("DEVEZ VIBE"));
         assert!(painted.contains("Select model"));
         assert!(frame.dock_index > 0, "the picker docks below the card");
+    }
+
+    #[test]
+    fn model_picker_tabs_sit_under_the_title_and_answer_to_a_click() {
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                closable: true,
+                title: format!("Model{COMPLETION_TAB_MARKER}[ Favorites ]   All"),
+                lines: vec![OverlayLine {
+                    text: "1. Claude Sonnet ★".to_owned(),
+                    selected: true,
+                    muted: false,
+                }],
+                slider: None,
+                hint: "↑↓ model".to_owned(),
+                style: OverlayStyle::Picker,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            },
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+        let tab_row = frame
+            .lines
+            .iter()
+            .find(|line| painted(line).contains("[ Favorites ]"))
+            .expect("tab row");
+        assert!(!painted(tab_row).contains("Model"));
+        let regions = tab_row.pick.as_ref().expect("the tabs answer to a click");
+        assert!(regions.columns_of(&Pick::CompletionSource(1)).is_some());
+        assert!(!frame.lines.iter().any(|line| painted(line).contains(COMPLETION_TAB_MARKER)));
     }
 
     #[test]

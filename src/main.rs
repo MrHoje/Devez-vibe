@@ -17,6 +17,7 @@ mod open_code;
 mod paste;
 mod perf;
 mod preedit;
+mod prompt_history;
 mod pricing;
 mod provider;
 mod renderer;
@@ -514,12 +515,11 @@ async fn await_with_activity<T>(
     renderer: &mut Renderer,
     request: impl Future<Output = T>,
 ) -> Result<T> {
-    await_with_ticks(
+    await_deferring_input(
         request,
         Duration::from_millis(80),
-        true,
         |wake| match wake {
-            Wake::Tick => activity_frame(state, renderer),
+            Wake::Tick => activity_frame(state, renderer).map(|()| None),
             // Esc here means the prompt just sent, so the cancel is recorded now and
             // leaves with the turn the moment it opens. An Esc this wait has no turn
             // to attach to — the session itself is still being built — is passed on
@@ -527,15 +527,45 @@ async fn await_with_activity<T>(
             Wake::Input(Ok(Event::Key(key)))
                 if is_wait_interrupt_key(&key) && state.note_interrupt_while_sending() =>
             {
-                draw(state, renderer)
+                draw(state, renderer).map(|()| None)
             }
             Wake::Input(event) => {
-                input_hub::defer(event);
-                Ok(())
+                // Keys typed now land only after this wait, behind any Esc or failure
+                // that puts the sent prompt back, and would be glued onto it.
+                let typed = match &event {
+                    Ok(Event::Key(key)) => key.code != KeyCode::Esc && key.kind != KeyEventKind::Release,
+                    Ok(Event::Paste(_)) => true,
+                    _ => false,
+                };
+                if typed {
+                    state.forget_unsent_prompt();
+                }
+                Ok(Some(event))
             }
         },
     )
     .await
+}
+
+/// `await_with_ticks` that reads input too. Events the wake handler hands back are
+/// held until the wait ends and then deferred in order; deferring them one by one
+/// would put each straight back in front of the next read, starving the stream
+/// (and the Esc waiting behind it).
+async fn await_deferring_input<T>(
+    request: impl Future<Output = T>,
+    interval: Duration,
+    mut on_wake: impl FnMut(Wake) -> Result<Option<input_hub::Incoming>>,
+) -> Result<T> {
+    let mut held = Vec::new();
+    let result = await_with_ticks(request, interval, true, |wake| {
+        held.extend(on_wake(wake)?);
+        Ok(())
+    })
+    .await;
+    for event in held {
+        input_hub::defer(event);
+    }
+    result
 }
 
 /// The paint the activity row needs between a request and its answer.
@@ -545,7 +575,7 @@ fn activity_frame(state: &mut AppState, renderer: &mut Renderer) -> Result<()> {
         return Ok(());
     }
     let animated = tick.animation_only && renderer.render_animation(state.animation_view())?;
-    if !animated {
+    if !animated && !tick.spinner_only {
         draw(state, renderer)?;
     }
     Ok(())
@@ -803,6 +833,10 @@ async fn await_thread(
                 refresh_account(server, state).await;
                 state.show_status();
             }
+            Some(Action::ShowUsage) => {
+                refresh_account(server, state).await;
+                state.show_usage();
+            }
             Some(action) => {
                 if execute_local_action(state, renderer, action)? {
                     return Ok(Startup::Quit);
@@ -834,6 +868,7 @@ fn hold_until_thread(
         | Action::SetTheme(_)
         | Action::PersistAutoKnowledge(_)
         | Action::PersistLanguage(_)
+        | Action::PersistModelFavorites(_)
         | Action::Copy(_)
         | Action::CopyQuietly(_)
         | Action::Cut(_)
@@ -842,6 +877,7 @@ fn hold_until_thread(
         | Action::OpenUrl(_)
         | Action::OpenLinkDirectory(_)) => Some(action),
         Action::ShowStatus => Some(Action::ShowStatus),
+        Action::ShowUsage => Some(Action::ShowUsage),
         Action::ScrollToBottom => Some(Action::ScrollToBottom),
         // Once a switch is owed, the prompt belongs to the session being resumed. The
         // session being started is about to be walked away from, and `prepare_resume`
@@ -1485,6 +1521,8 @@ async fn execute_split_conversation_action(
         }
         Action::Steer(text) => {
             let Some(turn_id) = state.turn_id.clone() else {
+                // The prompt before this one is still opening its turn; it isn't unsent.
+                state.forget_unsent_prompt();
                 state.set_request_failed(tr(
                     "활성 turn ID가 없어 추가 입력을 보낼 수 없습니다.",
                     "There is no active turn ID, so the follow-up input can't be sent.",
@@ -1508,6 +1546,7 @@ async fn execute_split_conversation_action(
                 .await
             {
                 state.push_notice(BlockKind::Error, "Follow-up input failed", error.to_string());
+                state.restore_unsent_steer();
             }
             Ok(false)
         }
@@ -1658,6 +1697,7 @@ async fn event_loop(
         }
         let mut connection_closed = false;
         let mut animation_tick = false;
+        let mut spinner_tick = false;
         // Set when an edit took a selection. Paste batching holds the screen still
         // while keys arrive in a burst, but text vanishing from the prompt has to
         // be seen at once — otherwise the selection looks untouched until the next
@@ -2096,9 +2136,12 @@ async fn event_loop(
                 let mut redraw = main_tick.redraw
                     || btw_tick.as_ref().is_some_and(|tick| tick.redraw);
                 animation_tick = btw_state.is_none() && main_tick.animation_only;
+                spinner_tick = main_tick.spinner_only
+                    && !btw_tick.as_ref().is_some_and(|tick| tick.redraw);
                 if renderer.recover_external_screen_write() {
                     redraw = true;
                     animation_tick = false;
+                    spinner_tick = false;
                 }
                 // Ctrl+wheel font zoom changes the cell grid without always
                 // sending a `Resize`, so the size is polled here as well.
@@ -2108,6 +2151,7 @@ async fn event_loop(
                     renderer.relayout()?;
                     redraw = true;
                     animation_tick = false;
+                    spinner_tick = false;
                 } else if resize.pending() {
                     // Nothing painted onto a grid that is still moving survives.
                     redraw = false;
@@ -2182,7 +2226,9 @@ async fn event_loop(
             if animated {
                 perf::record_animation(animation_started.elapsed());
             }
-            if !animated {
+            // An idle row spinner never forces a full frame on its own.
+            let spinner_only = spinner_tick && !selection_edited && !force_paint;
+            if !animated && !spinner_only {
                 draw_conversations(state, &mut btw_state, split_focus, renderer)?;
             }
         }
@@ -2677,24 +2723,73 @@ async fn run_local_shell(
         .stderr(std::process::Stdio::piped());
     // 셸이 다시 띄운 프로세스는 작업 개체가 잡는다. 명령이 끝나거나 dvz가 끝나면
     // 개체가 버려지면서 함께 정리된다.
-    let result = match process.spawn() {
-        Ok(child) => {
-            let _job = child_process::adopt_backend(&child);
-            child.wait_with_output().await
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let mut stop = Some(stop);
+    let run = async {
+        match process.spawn() {
+            Ok(child) => run_shell_child(child, stopped).await,
+            Err(error) => Err(error),
         }
-        Err(error) => Err(error),
     };
+    // 끝나지 않는 명령이 화면과 입력을 막지 않도록 틱과 입력을 계속 처리한다.
+    // Esc·Ctrl+C는 응답 진행 여부와 상관없이 셸만 멈추고, 다른 키는 셸이 끝난 뒤로 미룬다.
+    let result = await_deferring_input(run, Duration::from_millis(80), |wake| match wake {
+        Wake::Tick => activity_frame(state, renderer).map(|()| None),
+        // 놓기 이벤트까지 여기서 삼킨다. 미뤄 두면 셸이 끝난 뒤 Ctrl+C 종료 안내가 켜진다.
+        Wake::Input(Ok(Event::Key(key))) if is_side_exit_key(&key) => {
+            if key.kind != KeyEventKind::Release
+                && let Some(stop) = stop.take()
+            {
+                let _ = stop.send(());
+            }
+            Ok(None)
+        }
+        Wake::Input(event) => Ok(Some(event)),
+    })
+    .await?;
     let (output, exit_code) = match result {
-        Ok(output) => (
-            local_shell_output(&output.stdout, &output.stderr),
-            output.status.code().unwrap_or(-1),
-        ),
-        Err(error) => (error.to_string(), -1),
+        Ok((stdout, stderr, code)) => (local_shell_output(&stdout, &stderr), code),
+        Err(error) => (error.to_string(), Some(-1)),
     };
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let id = state.finish_local_shell(&anchor, &command, output, exit_code, duration_ms);
     renderer.toggle_tool(id);
     Ok(())
+}
+
+/// 셸 자식을 끝까지 기다리며 출력을 읽는다. `stopped`가 오면 작업 개체를 버려
+/// 손자 프로세스까지 끝내고, 그때까지의 출력과 `None`(중단)을 돌려준다.
+async fn run_shell_child(
+    mut child: tokio::process::Child,
+    stopped: tokio::sync::oneshot::Receiver<()>,
+) -> std::io::Result<(Vec<u8>, Vec<u8>, Option<i32>)> {
+    use tokio::io::AsyncReadExt;
+    fn drain(pipe: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>) -> tokio::task::JoinHandle<Vec<u8>> {
+        tokio::spawn(async move {
+            let mut buffer = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buffer).await;
+            }
+            buffer
+        })
+    }
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let job = child_process::adopt_backend(&child);
+    let code = tokio::select! {
+        status = child.wait() => Some(status?.code().unwrap_or(-1)),
+        _ = stopped => {
+            let _ = child.kill().await;
+            None
+        }
+    };
+    // 작업 개체를 버려 손자 프로세스를 끝내야 파이프가 닫혀 출력이 모두 읽힌다.
+    drop(job);
+    // 파이프를 쥔 프로세스가 남아 있어도 중단 뒤에는 오래 기다리지 않는다.
+    let grace = Duration::from_secs(2);
+    let stdout = tokio::time::timeout(grace, stdout).await.map_or_else(|_| Vec::new(), Result::unwrap_or_default);
+    let stderr = tokio::time::timeout(grace, stderr).await.map_or_else(|_| Vec::new(), Result::unwrap_or_default);
+    Ok((stdout, stderr, code))
 }
 
 /// `dvz update`를 자식 프로세스로 돌린다. 업데이트는 수십 초가 걸리므로 메인
@@ -2773,6 +2868,10 @@ async fn execute_action(
             refresh_account(server, state).await;
             state.show_status();
         }
+        Action::ShowUsage => {
+            refresh_account(server, state).await;
+            state.show_usage();
+        }
         Action::Submit(text) => {
             renderer.scroll_to_bottom();
             let handoff = provider_handoff_snapshot(state, renderer);
@@ -2791,6 +2890,8 @@ async fn execute_action(
         Action::Steer(text) => {
             renderer.scroll_to_bottom();
             let Some(turn_id) = state.turn_id.clone() else {
+                // The prompt before this one is still opening its turn; it isn't unsent.
+                state.forget_unsent_prompt();
                 state.set_request_failed(tr(
                     "활성 turn ID가 없어 추가 입력을 보낼 수 없습니다.",
                     "There is no active turn ID, so the follow-up input can't be sent.",
@@ -2815,6 +2916,7 @@ async fn execute_action(
             }
             if let Err(error) = server.request("turn/steer", params).await {
                 state.push_notice(BlockKind::Error, "Follow-up input failed", error.to_string());
+                state.restore_unsent_steer();
             }
         }
         Action::RunShell(command) => run_local_shell(state, renderer, command).await?,
@@ -2988,6 +3090,11 @@ async fn execute_action(
         Action::PersistAutoKnowledge(enabled) => {
             if let Err(error) = state::write_project_auto_knowledge(&state.cwd, enabled) {
                 state.push_notice(BlockKind::Warning, "Auto knowledge setting save failed", error.to_string());
+            }
+        }
+        Action::PersistModelFavorites(ids) => {
+            if let Err(error) = state::write_model_favorites(&ids) {
+                state.push_notice(BlockKind::Warning, "Failed to save favorites", error.to_string());
             }
         }
         Action::PersistLanguage(english) => {
@@ -4697,6 +4804,7 @@ async fn send_queued_prompt(
         await_with_activity(state, renderer, server.request("turn/steer", params)).await?
     {
         state.push_notice(BlockKind::Error, "Follow-up input failed", error.to_string());
+        state.restore_unsent_steer();
     }
     Ok(())
 }
@@ -4855,6 +4963,38 @@ fn execute_local_action(
                 Ok(()) => state.set_cut_notice(),
                 Err(error) => {
                     state.push_notice(BlockKind::Error, "Cut failed", error.to_string())
+                }
+            }
+        }
+        Action::OpenUrl(url) if is_executable_link_target(&url) => {
+            let result = link_directory(&url, Path::new(&state.cwd)).and_then(|directory| {
+                if let Some(directory) = &directory {
+                    open_url(&directory.to_string_lossy())?;
+                }
+                Ok(directory)
+            });
+            match result {
+                Ok(Some(directory)) => {
+                    let path = directory.display();
+                    state.push_notice(
+                        BlockKind::Warning,
+                        "Blocked executable link",
+                        tr(
+                            format!("실행 파일은 열지 않고 폴더를 열었습니다: {path}"),
+                            format!("Executable files aren't opened; opened the folder instead: {path}"),
+                        ),
+                    );
+                }
+                Ok(None) => state.push_notice(
+                    BlockKind::Warning,
+                    "Blocked executable link",
+                    tr(
+                        format!("실행 파일은 열지 않습니다: {url}"),
+                        format!("Executable files aren't opened: {url}"),
+                    ),
+                ),
+                Err(error) => {
+                    state.push_notice(BlockKind::Warning, "Folder open failed", error.to_string())
                 }
             }
         }
@@ -5975,6 +6115,60 @@ fn context_click_action(pick: Option<Pick>, out: &mut impl std::io::Write) -> Ac
     Action::Tick(false)
 }
 
+/// True when a link points at a local file that Windows would run on open.
+fn is_executable_link_target(target: &str) -> bool {
+    const EXECUTABLE: &[&str] = &[
+        "exe", "com", "bat", "cmd", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "hta",
+        "msi", "msp", "scr", "pif", "cpl", "lnk", "reg", "jar",
+    ];
+    let target = renderer::markdown_link_open_target(target);
+    let path = if target
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
+    {
+        let target = strip_line_suffix(&target);
+        match reqwest::Url::parse(target) {
+            Ok(url) => url
+                .to_file_path()
+                .unwrap_or_else(|_| PathBuf::from(url.path())),
+            Err(_) => PathBuf::from(target),
+        }
+    } else {
+        if !Path::new(&target).is_absolute() && is_url_target(&target) {
+            return false;
+        }
+        // Relative targets keep their `:line[:col]` suffix; drop it before reading the extension.
+        PathBuf::from(strip_line_suffix(&target))
+    };
+    // Windows ignores trailing dots and spaces, so `run.bat.` still runs as `run.bat`.
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    Path::new(name.trim_end_matches(['.', ' ']))
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| EXECUTABLE.iter().any(|item| extension.eq_ignore_ascii_case(item)))
+}
+
+/// Drops up to two trailing `:digits` groups (`:line[:col]`).
+fn strip_line_suffix(mut target: &str) -> &str {
+    for _ in 0..2 {
+        match target.rsplit_once(':') {
+            Some((head, tail))
+                if !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit()) =>
+            {
+                target = head
+            }
+            _ => break,
+        }
+    }
+    target
+}
+
+/// A real URL scheme. A one-letter scheme is a drive (`C:a.bat`) and a dotted one
+/// is a file name with a line suffix (`app.js:12`); `tel:5551234` stays a URL.
+fn is_url_target(target: &str) -> bool {
+    reqwest::Url::parse(target).is_ok_and(|url| url.scheme().len() > 1 && !url.scheme().contains('.'))
+}
+
 fn link_directory(target: &str, cwd: &Path) -> Result<Option<PathBuf>> {
     let target = renderer::markdown_link_open_target(target);
     let path = if target
@@ -5990,11 +6184,10 @@ fn link_directory(target: &str, cwd: &Path) -> Result<Option<PathBuf>> {
                 ))
             })?
     } else {
-        let path = PathBuf::from(&target);
-        if !path.is_absolute() && reqwest::Url::parse(&target).is_ok() {
+        if !Path::new(&target).is_absolute() && is_url_target(&target) {
             return Ok(None);
         }
-        cwd.join(path)
+        cwd.join(strip_line_suffix(&target))
     };
     let directory = if path.is_dir() {
         path
@@ -7220,6 +7413,53 @@ mod tests {
         assert_eq!(local_shell_output(&output.stdout, &output.stderr), "직접 실행");
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn stopping_a_local_shell_ends_it_with_its_output() {
+        let mut process = local_shell_command("Write-Output started; Start-Sleep -Seconds 60", ".");
+        process
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = process.spawn().expect("PowerShell starts");
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let run = tokio::spawn(run_shell_child(child, stopped));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        stop.send(()).unwrap();
+
+        let (stdout, stderr, code) = tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("stop ends the shell within seconds")
+            .unwrap()
+            .unwrap();
+        assert_eq!(code, None);
+        assert_eq!(local_shell_output(&stdout, &stderr), "started");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_shell_that_leaves_a_child_holding_the_pipe_keeps_its_output() {
+        let mut process = local_shell_command(
+            "Write-Output hi; Start-Process -NoNewWindow ping -ArgumentList '-n','20','127.0.0.1'",
+            ".",
+        );
+        process
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = process.spawn().expect("PowerShell starts");
+        let (_stop, stopped) = tokio::sync::oneshot::channel();
+        let started = Instant::now();
+        let (stdout, stderr, code) = tokio::time::timeout(
+            Duration::from_secs(15),
+            run_shell_child(child, stopped),
+        )
+        .await
+        .expect("the shell ends without waiting for its child")
+        .unwrap();
+        assert_eq!(code, Some(0));
+        assert!(local_shell_output(&stdout, &stderr).contains("hi"));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
     #[test]
     fn claude_account_status_prefers_email_and_reports_signed_out() {
         assert_eq!(
@@ -7599,6 +7839,38 @@ mod tests {
     }
 
     #[test]
+    fn executable_link_targets_are_detected() {
+        for target in [
+            "C:/tmp/a.bat",
+            "file:///C:/x/run.CMD",
+            "src/app.js",
+            "src/app.js:12",
+            "app.js:12",
+            "run.bat:3:1",
+            "C:/tmp/a.bat.",
+            "file:///C:/x/run.cmd.",
+            "a.bat.",
+            "C:a.bat",
+            "c:a.CMD:3",
+            "<C:/tmp/a.exe>",
+            "tool.Ps1",
+        ] {
+            assert!(is_executable_link_target(target), "{target}");
+        }
+        for target in [
+            "https://x/a.exe",
+            "mailto:a@b.c",
+            "src/main.rs",
+            "C:/tmp/dir",
+            "file:///C:/x/readme.md",
+            "README",
+            "tel:5551234",
+        ] {
+            assert!(!is_executable_link_target(target), "{target}");
+        }
+    }
+
+    #[test]
     fn context_click_directories_resolve_file_urls_paths_and_missing_files() {
         let cwd = std::env::current_dir().unwrap();
         let file = cwd.join("Cargo.toml");
@@ -7608,8 +7880,16 @@ mod tests {
         assert_eq!(link_directory(&format!("{uri}:12:3"), &cwd).unwrap(), Some(cwd.clone()));
         assert_eq!(link_directory(&cwd.to_string_lossy(), &cwd).unwrap(), Some(cwd.clone()));
         assert_eq!(link_directory("not-created-file.md", &cwd).unwrap(), Some(cwd.clone()));
+        assert_eq!(link_directory("Cargo.toml:12", &cwd).unwrap(), Some(cwd.clone()));
+        assert_eq!(link_directory("app.js:12:3", &cwd).unwrap(), Some(cwd.clone()));
         assert!(link_directory("missing-parent-for-context-test/file.md", &cwd).is_err());
-        for url in ["https://example.com/a.md", "mailto:test@example.com", "ftp://example.com/a"] {
+        for url in [
+            "https://example.com/a.md",
+            "mailto:test@example.com",
+            "ftp://example.com/a",
+            "tel:5551234",
+            "localhost:3000",
+        ] {
             assert_eq!(link_directory(url, &cwd).unwrap(), None);
         }
         assert!(link_directory("file:///%ZZ", &cwd).is_err());
@@ -9202,6 +9482,47 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }));
+    }
+
+    #[tokio::test]
+    async fn a_wait_holds_other_input_once_and_still_sees_escape() {
+        use crossterm::event::{KeyEventKind, KeyEventState};
+
+        let key = |code, kind| {
+            Ok(Event::Key(KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+                kind,
+                state: KeyEventState::NONE,
+            }))
+        };
+        input_hub::defer(key(KeyCode::Enter, KeyEventKind::Release));
+        input_hub::defer(key(KeyCode::Esc, KeyEventKind::Press));
+        let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+        let waiting = std::sync::Arc::clone(&stop);
+        let result = timeout(
+            Duration::from_secs(2),
+            await_deferring_input(
+                async move { waiting.notified().await },
+                Duration::from_millis(50),
+                |wake| match wake {
+                    Wake::Input(Ok(Event::Key(pressed))) if is_wait_interrupt_key(&pressed) => {
+                        stop.notify_one();
+                        Ok(None)
+                    }
+                    Wake::Input(event) => Ok(Some(event)),
+                    Wake::Tick => Ok(None),
+                },
+            ),
+        )
+        .await
+        .expect("the Esc behind another key reached the wait");
+        assert!(result.is_ok());
+        assert!(matches!(
+            input_hub::deferred_event(),
+            Some(Ok(Event::Key(KeyEvent { code: KeyCode::Enter, .. })))
+        ));
+        assert!(input_hub::deferred_event().is_none());
     }
 
     #[tokio::test]

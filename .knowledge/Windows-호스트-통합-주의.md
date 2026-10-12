@@ -12,6 +12,7 @@
 - 재개한 세션이 마지막에 쓴 모델이 아니라 방을 만들 때 고른 모델로 열림: 「DevezCode 재개 인자와 기억된 모델」.
 - 데스크톱에서는 Computer Use가 되지만 Vibe에서는 `native pipe` 연결이 실패함: 「Computer Use의 데스크톱 연결 수명」.
 - Claude Computer Use가 터미널에 입력함·사용자 화면 노출 없이 검증해야 함: 「Claude Computer Use(`devez-computer`)」.
+- dvz 화면 동작을 사용자 창 없이 시험해야 함·디버그 빌드가 시작 직후 스택 넘침으로 죽음: 「ConPTY로 실제 화면 시험」.
 
 아래 배포·미배포 표현은 당시 기록이다. 비동기 질문 변경의 최종 배포는 같은 절의 Vibe 1.8.23·DevezCode 1.27.2 기록을 함께 읽는다. 현재 확인 위치는 [src/devezcode.rs](../src/devezcode.rs), [src/input_hub.rs](../src/input_hub.rs), [호스트 상태 검사](../scripts/test-devezcode-question-state.mjs)다.
 
@@ -100,6 +101,18 @@ Sixel 모서리 관련 `#[ignore]` 시험(`live_native_terminal_metrics`, `live_
 - 창 안의 그림은 화면 캡처(`CopyFromScreen`)로 확인한다.
 - 이 PC의 Windows Terminal에서 확인된 값: DA1이 Sixel(4)을 보고하고 셀 크기는 10×20 픽셀이며, 답변 카드의 위·아래 모서리 한 칸이 실제로 Sixel로 그려진다.
 - 그려진 모서리의 청록은 글리프 쪽보다 1/255 밝다. `corner()`가 팔레트를 퍼센트로 적는 양자화 때문이며 눈으로 구분되지 않는다. 색이 한 단계 다르다는 이유로 버그로 보지 않는다.
+
+## ConPTY로 실제 화면 시험 — 2026-10-12
+
+사용자 창을 건드리지 않고 dvz 화면 동작(키 입력·셸·선택 창·마우스 클릭)을 확인할 때 쓴다.
+
+- 임시 폴더에 venv를 만들어 `pywinpty`와 `pyte`를 설치하고, `winpty.PtyProcess.spawn([exe, ...])`로 dvz를 띄운 뒤 읽은 출력을 `pyte.Screen`에 먹여 화면 글자를 덤프한다. 명령은 문자열이 아니라 인자 목록으로 넘긴다(따옴표 붙은 문자열은 실행 파일을 찾지 못한다). 콘솔 출력은 `sys.stdout.reconfigure(encoding="utf-8")`로 바꿔야 `•` 등에서 cp949 오류가 나지 않는다.
+- **디버그 빌드는 시작 직후 `thread 'main' has overflowed its stack`으로 죽는다**(1.9.47 HEAD에서도 같다). 화면 시험은 `cargo build --release` 결과로 한다. 단위 시험은 디버그로 통과하므로 이 증상만으로 회귀라고 보지 않는다.
+- 띄울 때 `APPDATA`를 임시 폴더로 바꾸면 설정·`prompt-history.jsonl`이 사용자 것과 분리되고, Claude 구독 로그인과 Codex 로그인은 그대로 쓴다. 입력 가능 시점은 화면에 `Tab: Cycle`이 보일 때다.
+- 키는 VT로 보낸다: Esc `\x1b`, ↑ `\x1b[A`, Ctrl+R `\x12`, Alt+Enter `\x1b\r`, Shift+Tab `\x1b[Z`, 마우스 왼쪽 클릭 `\x1b[<0;열;행M` 뒤 `\x1b[<0;열;행m`(1부터). SGR 마우스 클릭은 dvz의 링크 클릭까지 전달된다. 한글 IME 자모가 붙은 Ctrl 조합은 보낼 수 없다.
+- ConPTY로 보낸 Ctrl+C는 누름 뒤 놓기 이벤트도 온다. 대기 중 키를 따로 처리하는 곳에서 놓기를 미뤄 두면 뒤늦게 기본 처리(종료 안내 등)가 켜진다.
+- 글자를 보낸 직후 0.15초 안에 Enter를 보내면 제출되지 않고 줄바꿈으로 들어간 사례가 있었다(원인 미확인). 입력과 Enter 사이에 0.5초 이상 둔다.
+- 사용자가 띄운 dvz(`%LOCALAPPDATA%\DevezVibe\versions\...\dvz.exe`)가 함께 돌고 있을 수 있으니 프로세스 정리는 경로로 구분한다.
 
 ## DevezCode 재개 인자와 기억된 모델 — 2026-09-23
 

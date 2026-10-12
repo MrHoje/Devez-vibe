@@ -117,7 +117,7 @@ pub async fn next_event() -> Option<Incoming> {
     hub().events.lock().await.next().await
 }
 
-fn deferred_event() -> Option<Incoming> {
+pub fn deferred_event() -> Option<Incoming> {
     hub()
         .deferred
         .lock()
