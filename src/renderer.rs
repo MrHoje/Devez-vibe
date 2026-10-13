@@ -4932,6 +4932,13 @@ fn paint_line_into_frame(
     hovered_columns: Option<Range<usize>>,
     background_width: Option<usize>,
 ) {
+    let pointed_row;
+    let (line, hovered_columns) = if hovered_columns.is_some() && is_subagent_row(line) {
+        pointed_row = pointed_subagent_row(line);
+        (&pointed_row, None)
+    } else {
+        (line, hovered_columns)
+    };
     let question_card = is_question_card_line(line);
     let background = if question_card { Some(theme::palette().user_prompt_bg) } else { row_background(line.tone) };
     let bubble_background = bubble_background(line);
@@ -6771,7 +6778,10 @@ fn subagent_lines(subagents: &[SubagentView], width: u16) -> Vec<PaintLine> {
         .map(|subagent| line_console_extra(&subagent_line(subagent, edge)))
         .max()
         .unwrap_or(0);
-    let mut lines = vec![subagent_main_line(subagents, " ")];
+    // 앞 두 칸은 마우스가 올라간 줄의 `❯` 자리다. `main`도 줄 끝까지 누를 수 있다.
+    let mut main = subagent_main_line(subagents, "  ");
+    main.pick = Some(PickRegions::span(0, edge, Pick::ViewSubagent(None)));
+    let mut lines = vec![main];
     lines.extend(
         subagents
             .iter()
@@ -6801,6 +6811,33 @@ fn subagent_view_title(name: &str, description: &str, width: u16) -> PaintLine {
         description,
         room.saturating_sub(UnicodeWidthStr::width(name.as_str())),
     ));
+    line
+}
+
+fn is_subagent_row(line: &PaintLine) -> bool {
+    line.pick.as_ref().is_some_and(|regions| {
+        regions
+            .0
+            .iter()
+            .any(|(_, _, pick)| matches!(pick, Pick::ViewSubagent(_)))
+    })
+}
+
+/// 하단 하위 에이전트 줄은 순정 Claude Code처럼 배경 대신 앞의 `❯`와 굵고 밝은
+/// 글씨로 마우스가 올라간 줄을 가리킨다.
+fn pointed_subagent_row(line: &PaintLine) -> PaintLine {
+    let brighten = |tone| if tone == Tone::Muted { Tone::Plain } else { tone };
+    let mut line = line.clone();
+    if line.prefix.starts_with(' ') {
+        line.prefix.replace_range(..1, "❯");
+    }
+    line.prefix_tone = brighten(line.prefix_tone);
+    line.tone = brighten(line.tone);
+    line.bold = true;
+    for span in &mut line.tail {
+        span.tone = brighten(span.tone);
+        span.bold = true;
+    }
     line
 }
 
@@ -6888,7 +6925,7 @@ fn subagent_line(subagent: &SubagentView, right_edge: usize) -> PaintLine {
     let glyph = "•";
     // The gutter, glyph, label, gap, and elapsed reading are fixed, so the name
     // is compacted first and the call description takes only what the name leaves behind.
-    let fixed = 1
+    let fixed = 2
         + UnicodeWidthStr::width(glyph)
         + 1
         + UnicodeWidthStr::width(label)
@@ -6912,7 +6949,7 @@ fn subagent_line(subagent: &SubagentView, right_edge: usize) -> PaintLine {
         bold: false,
     }];
     tail.extend(description);
-    let used = 1 + indent.len() + UnicodeWidthStr::width(glyph) + spans_width(&tail);
+    let used = 2 + indent.len() + UnicodeWidthStr::width(glyph) + spans_width(&tail);
     let gap = right_edge.saturating_sub(used + elapsed_width).max(1);
     tail.push(PaintSpan {
         text: format!("{}{elapsed}", " ".repeat(gap)),
@@ -6921,7 +6958,7 @@ fn subagent_line(subagent: &SubagentView, right_edge: usize) -> PaintLine {
     });
 
     let line = PaintLine {
-        prefix: format!(" {indent}"),
+        prefix: format!("  {indent}"),
         prefix_tone: Tone::Muted,
         text: glyph.to_owned(),
         tone: glyph_tone,
@@ -20293,21 +20330,21 @@ mod tests {
         child.depth = 1;
         assert_eq!(
             painted(&subagent_line(&parent, 80)),
-            aligned(" • Explore", "40s", 80)
+            aligned("  • Explore", "40s", 80)
         );
         assert_eq!(
             painted(&subagent_line(&child, 80)),
-            aligned("   • Background task: Bash · npm run dev", "12s", 80)
+            aligned("    • Background task: Bash · npm run dev", "12s", 80)
         );
         // A deep chain stops at four levels, and on a narrow row the indent
         // gives way before the name does.
         child.depth = 9;
         assert!(
             painted(&subagent_line(&child, 80))
-                .starts_with(&format!(" {}•", " ".repeat(8)))
+                .starts_with(&format!("  {}•", " ".repeat(8)))
         );
         let deep = subagent_line(&child, 32);
-        assert!(painted(&deep).starts_with(" • Background task: Bash"));
+        assert!(painted(&deep).starts_with("  • Background task: Bash"));
         assert!(painted_line_width(&deep) <= 32);
         let deep_panel = side_panel_subagent_lines(&[child.clone()], 30, true);
         assert!(painted(&deep_panel[3]).starts_with("• Background task: Bash"));
@@ -20326,7 +20363,7 @@ mod tests {
             let line = subagent_line(&task, 80);
             assert_eq!(
                 painted(&line),
-                aligned(&format!(" • Background task: {name} · npm test"), "29s", 80)
+                aligned(&format!("  • Background task: {name} · npm test"), "29s", 80)
             );
             let lines = side_panel_subagent_lines(&[task.clone()], 80, true);
             assert_eq!(
@@ -20334,7 +20371,7 @@ mod tests {
                 format!("• Background task: {name} · npm test · 29s")
             );
             let narrow = subagent_line(&task, 32);
-            assert!(painted(&narrow).starts_with(" • Background task: "));
+            assert!(painted(&narrow).starts_with("  • Background task: "));
             assert!(painted(&narrow).ends_with(" 29s"));
             assert!(painted_line_width(&narrow) <= 32);
             let narrow_panel = side_panel_subagent_lines(&[task], 32, true);
@@ -20408,9 +20445,9 @@ mod tests {
                 .map(painted)
                 .collect::<Vec<_>>(),
             [
-                " • main".to_owned(),
-                aligned(" • Explore · Find auth code", "1m 33s", 78),
-                aligned(" • Developer · Fix the parser", "3s", 78),
+                "  • main".to_owned(),
+                aligned("  • Explore · Find auth code", "1m 33s", 78),
+                aligned("  • Developer · Fix the parser", "3s", 78),
             ]
         );
     }
@@ -20421,7 +20458,7 @@ mod tests {
 
         assert_eq!(
             painted(&subagent_line(&subagent, 80)),
-            aligned(" • Explore", "4s", 80)
+            aligned("  • Explore", "4s", 80)
         );
     }
 
@@ -20432,11 +20469,11 @@ mod tests {
 
         assert_eq!(
             painted(&subagent_line(&named, 80)),
-            aligned(" • Eghis2 daily popup", "28s", 80)
+            aligned("  • Eghis2 daily popup", "28s", 80)
         );
         assert_eq!(
             painted(&subagent_line(&claude, 80)),
-            aligned(" • Devez reviewer · 변경 검토", "3s", 80)
+            aligned("  • Devez reviewer · 변경 검토", "3s", 80)
         );
     }
 
@@ -20452,7 +20489,7 @@ mod tests {
         let line = subagent_line(&subagent, 30);
 
         assert!(!painted(&line).contains("hidden"));
-        assert!(painted(&line).starts_with(" • "));
+        assert!(painted(&line).starts_with("  • "));
         assert!(painted(&line).ends_with(" 1m 33s"));
         assert!(painted_line_width(&line) <= 30);
 
@@ -20479,7 +20516,7 @@ mod tests {
         let subagent = test_subagent("Plan", "Find auth code", "", 4);
 
         let line = subagent_line(&subagent, 80);
-        assert_eq!(painted(&line), aligned(" • Plan · Find auth code", "4s", 80));
+        assert_eq!(painted(&line), aligned("  • Plan · Find auth code", "4s", 80));
         for label in ["•", "Plan", "Find auth code", "4s"] {
             assert_eq!(pick_on(&line, label), None, "{label}");
         }
@@ -20503,7 +20540,7 @@ mod tests {
 
         let lines = subagent_lines(&[viewed, task], 60);
 
-        assert_eq!(painted(&lines[0]), " • main");
+        assert_eq!(painted(&lines[0]), "  • main");
         assert_eq!(pick_on(&lines[0], "main"), Some(Pick::ViewSubagent(None)));
         assert_eq!((lines[0].prefix_tone, lines[0].tone), (Tone::Muted, Tone::Plain));
         assert_eq!((lines[1].tone, lines[1].tail[0].tone), (Tone::Accent, Tone::Accent));
@@ -20513,6 +20550,32 @@ mod tests {
         );
         assert_eq!(lines[2].tone, Tone::Muted);
         assert_eq!(pick_on(&lines[2], "Bash"), None);
+    }
+
+    /// 순정 Claude Code처럼 마우스가 올라간 줄은 배경 없이 `❯`와 굵은 글씨로 가리키고,
+    /// `main`은 글자 밖에서도 눌린다.
+    #[test]
+    fn a_pointed_subagent_row_shows_a_marker_instead_of_a_background() {
+        let mut subagent = test_subagent("Explore", "Find auth code", "", 4);
+        subagent.viewable = true;
+        let lines = subagent_lines(&[subagent], 60);
+        assert_eq!(
+            lines[0].pick.as_ref().unwrap().at(40),
+            Some(Pick::ViewSubagent(None))
+        );
+
+        for line in &lines {
+            let mut frame = CellFrame::new(60, 1);
+            paint_line_into_frame(&mut frame, 0, line, None, Some(0..58), None);
+            assert_eq!(frame.cell(0, 0).glyph, "❯");
+            assert!(frame.cell(4, 0).style.bold);
+            assert!((0..60).all(|column| frame.cell(column, 0).style.background.is_none()));
+
+            let mut frame = CellFrame::new(60, 1);
+            paint_line_into_frame(&mut frame, 0, line, None, None, None);
+            assert_eq!(frame.cell(0, 0).glyph, " ");
+            assert!(!frame.cell(4, 0).style.bold);
+        }
     }
 
     /// 하위 에이전트를 띄우면 그 기록이 본문 줄이 되고 스크롤은 맨 아래로 돌아간다.
@@ -20672,7 +20735,7 @@ mod tests {
         assert!(update_index > composer_index);
         // 상태줄·갱신 안내와 서브에이전트 행 사이에는 빈 줄 하나가 들어간다.
         // 빈 줄 다음은 목록 맨 위의 `main`이다.
-        assert_eq!(painted(&frame.lines[update_index + 2]), " • main");
+        assert_eq!(painted(&frame.lines[update_index + 2]), "  • main");
         assert_eq!(update_index + 3, subagent_index);
         assert!(frame.lines[update_index + 1] == PaintLine::blank());
         assert!(painted(&frame.lines[update_index]).ends_with("dvz update or click here"));

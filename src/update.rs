@@ -23,14 +23,18 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "플러그인·마켓플레이스·`/skills`·`/new`·`/status`·`/connect`를 기다리는 동안 화면이 멈추지 않고 컴포저 위에 진행 상태를 표시합니다.",
-    "하위 에이전트 줄은 점·경과 시간·`이름 · 설명`으로 간결하게 표시하고 줄의 `x`는 없앴으며, Subagents 섹션을 접을 수 있습니다.",
+    "하위 에이전트를 띄울 때 하단 목록에 `Local agent` 줄이 겹치거나, 백그라운드 명령을 기다리는 하위 에이전트 줄이 사라지던 문제를 고쳤습니다.",
+    "하위 에이전트 줄의 설명이 순정 Claude Code처럼 약 30초마다 진행 요약으로 바뀝니다.",
+    "하위 에이전트 목록에서 마우스를 올린 줄은 `❯`와 굵은 글씨로 표시하고, `main` 줄은 줄 어디를 눌러도 열립니다.",
+    "화면 언어가 영어면 한국어 응답을 강제하지 않고 요청한 언어로 답하며, 한국어면 하위 에이전트 지시문도 한국어로 씁니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Waiting on plugins, marketplaces, `/skills`, `/new`, `/status` or `/connect` no longer freezes the screen; progress shows above the composer.",
-    "Subagent rows are compact — a dot, elapsed time and `name · description` — the row `x` is gone, and the Subagents section can be collapsed.",
+    "Fixed a duplicate `Local agent` row when launching subagents, and subagent rows vanishing while they wait on their own background commands.",
+    "Subagent row descriptions update to a progress summary about every 30 seconds, like stock Claude Code.",
+    "The hovered subagent row shows `❯` in bold, and clicking anywhere on the `main` row opens it.",
+    "With the English screen language, replies are no longer forced into Korean and follow the request's language; in Korean, subagent prompts are written in Korean too.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

@@ -749,6 +749,8 @@ function makeOptions(params, sessionId, resume) {
     // DevezVibe keeps per-task controls available through Claude's TaskStop
     // tool, so a turn interrupt must not tear down independent background work.
     perTaskStopAffordance: true,
+    // 순정처럼 하위 에이전트 줄의 설명을 약 30초마다 진행 요약으로 바꾼다.
+    agentProgressSummaries: true,
     systemPrompt: {
       type: "preset",
       preset: "claude_code",
@@ -2790,6 +2792,10 @@ function upsertStructuredSubagent(session, message) {
   return running;
 }
 
+function hasLiveChildren(session, taskId) {
+  return !!taskId && [...session.subagents.values()].some((agent) => agent.parentTaskId === taskId);
+}
+
 function finishStructuredSubagent(session, message) {
   const taskId = firstLine(message.task_id || "", 80);
   const toolUseId = firstLine(message.tool_use_id || "", 80);
@@ -2803,6 +2809,8 @@ function finishStructuredSubagent(session, message) {
   const running = (toolUseId && findSubagent(session, toolUseId))
     || (taskId && findSubagent(session, taskId));
   if (!running) return wasHidden;
+  // 자기 백그라운드 명령을 기다리며 멈춘 에이전트는 그 명령이 끝나면 다시 돌므로 행을 남긴다.
+  if (hasLiveChildren(session, running.taskId)) return true;
   session.subagents.delete(running.id);
   emitSubagents(session);
   return true;
@@ -2827,7 +2835,8 @@ function syncBackgroundSubagents(session, tasks) {
       changed = true;
       continue;
     }
-    if (!running.background || !running.taskId || liveIds.has(running.taskId)) continue;
+    if (!running.background || !running.taskId || liveIds.has(running.taskId)
+      || live.some((task) => task?.parent_task_id === running.taskId)) continue;
     session.subagents.delete(id);
     changed = true;
   }
@@ -2902,6 +2911,8 @@ function processSubagentSystemMessage(session, message) {
     if (!running) return false;
     const tool = firstLine(message.last_tool_name || "", 80);
     if (tool) running.tool = tool;
+    const summary = firstLine(message.summary || "", SUBAGENT_DESCRIPTION_LIMIT);
+    if (summary) running.description = summary;
     emitSubagents(session);
     return true;
   }
@@ -3059,6 +3070,8 @@ function emitSubagents(session) {
     turnId: session.turn?.id,
     subagents: subagentRows(session).map(({ agent, depth }) => ({
       id: agent.id,
+      // 스냅숏 자리표시자가 Agent 행에 접혀 사라져도 화면이 끝난 줄로 남기지 않게 한다.
+      taskId: agent.taskId || "",
       name: agent.name,
       description: agent.description,
       backgroundTask: agent.backgroundTask === true,
@@ -6069,7 +6082,8 @@ async function runSelfTest() {
       summary: "Reading lifecycle source",
     });
     const structured = structuredSession.subagents.get("toolu_structured");
-    if (!structured?.background || structured.tool !== "Read" || structured.backgroundTask === true) {
+    if (!structured?.background || structured.tool !== "Read" || structured.backgroundTask === true
+      || structured.description !== "Reading lifecycle source") {
       throw new Error(`Claude structured task progress self-test failed: ${JSON.stringify(structured)}`);
     }
     processSubagentSystemMessage(structuredSession, {
@@ -6140,6 +6154,34 @@ async function runSelfTest() {
     });
     if (nestedSession.subagents.get("toolu_inner")?.tool !== "Read(a.rs)") {
       throw new Error("Claude subagent agent_id self-test failed");
+    }
+    clearSubagents(nestedSession);
+    // 자기 백그라운드 명령을 기다리며 멈춘 에이전트는 그 명령이 도는 동안 행을 지킨다.
+    processSubagentSystemMessage(nestedSession, {
+      type: "system",
+      subtype: "task_started",
+      task_id: "agent-wait",
+      tool_use_id: "toolu_wait",
+      task_type: "local_agent",
+      subagent_type: "general-purpose",
+    });
+    nestedSession.subagents.get("toolu_wait").background = true;
+    const waitSnapshot = (tasks) => processSubagentSystemMessage(nestedSession, {
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks,
+    });
+    waitSnapshot([{ task_id: "shell-wait", task_type: "local_bash", description: "sleep 300", parent_task_id: "agent-wait" }]);
+    processSubagentSystemMessage(nestedSession, {
+      type: "system",
+      subtype: "task_notification",
+      task_id: "agent-wait",
+      status: "completed",
+    });
+    const waitingKept = nestedSession.subagents.has("toolu_wait");
+    waitSnapshot([]);
+    if (!waitingKept || nestedSession.subagents.size !== 0) {
+      throw new Error(`Claude waiting subagent self-test failed: ${waitingKept} ${nestedSession.subagents.size}`);
     }
     clearSubagents(nestedSession);
 

@@ -2725,6 +2725,10 @@ fn combined_turn_instructions(params: &Value, runtime: RuntimeKind) -> Option<St
     let knowledge = params
         .pointer("/additionalContext/devez-vibe-knowledge/value")
         .and_then(Value::as_str);
+    // The response language follows `/language` per turn, last so it wins.
+    let language = params
+        .pointer("/additionalContext/devez-vibe-language/value")
+        .and_then(Value::as_str);
     let parts = [
         rules,
         params
@@ -2733,6 +2737,7 @@ fn combined_turn_instructions(params: &Value, runtime: RuntimeKind) -> Option<St
         knowledge,
         agent,
         claude_reminder,
+        language,
     ]
     .into_iter()
     .flatten()
@@ -3553,6 +3558,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 응답 언어 묶음은 세 제공자 모두 매 턴 받는다. Codex는 additionalContext 그대로다.
+    #[test]
+    fn the_response_language_entry_reaches_all_three_runtimes() {
+        for english in [false, true] {
+            crate::language::set_english(english);
+            let context = crate::turn_additional_context(crate::agent::AgentMode::Standard, false);
+            let rule = context["devez-vibe-language"]["value"].as_str().unwrap().to_owned();
+            let mut params = json!({"additionalContext": context});
+            for runtime in [RuntimeKind::Claude, RuntimeKind::OpenCode] {
+                assert!(combined_turn_instructions(&params, runtime).unwrap().ends_with(&rule));
+            }
+            prepare_codex_turn_context(&mut params);
+            assert_eq!(params["additionalContext"]["devez-vibe-language"]["value"], rule);
+        }
+        crate::language::set_english(false);
     }
 
     #[test]

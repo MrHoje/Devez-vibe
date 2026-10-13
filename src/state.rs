@@ -3688,6 +3688,8 @@ struct ResponseCollapseTransition {
 #[derive(Clone, Debug)]
 struct RunningSubagent {
     id: String,
+    /// SDK 작업 id. 자리표시자 행과 Agent 행이 같은 작업인지 가린다.
+    task_id: String,
     name: String,
     is_background_task: bool,
     description: String,
@@ -3711,6 +3713,7 @@ struct ArtifactLink {
 /// cannot revive work that a turn-completed or thread-closed event already ended.
 #[derive(Clone, Debug, Default)]
 struct CodexSubagent {
+    task_name: Option<String>,
     nickname: Option<String>,
     role: Option<String>,
     tool: String,
@@ -3720,10 +3723,13 @@ struct CodexSubagent {
 }
 
 impl CodexSubagent {
-    /// Claude 줄처럼 `닉네임 · 역할`로 보이도록 역할은 설명 칸에 둔다.
-    /// `/root/<task_name>` 경로는 쓰지 않는다. 저장 값은 이미 다듬어져 있다.
+    /// 지정한 작업 이름을 먼저 쓰고, 없으면 닉네임을 쓴다. 역할은 설명 칸에 둔다.
     fn display_name(&self) -> String {
-        self.nickname.clone().unwrap_or_else(|| "Agent".to_owned())
+        self.task_name
+            .as_ref()
+            .or(self.nickname.as_ref())
+            .cloned()
+            .unwrap_or_else(|| "Agent".to_owned())
     }
 
     fn description(&self) -> String {
@@ -9489,6 +9495,7 @@ impl AppState {
     fn update_codex_subagent_identity(
         &mut self,
         id: &str,
+        task_name: Option<&str>,
         nickname: Option<&str>,
         role: Option<&str>,
     ) {
@@ -9496,6 +9503,9 @@ impl AppState {
         let Some(metadata) = self.codex_subagents.get_mut(id) else {
             return;
         };
+        if let Some(task_name) = task_name.map(str::trim).filter(|name| !name.is_empty()) {
+            metadata.task_name = Some(task_name.to_owned());
+        }
         if let Some(nickname) = nickname
             .map(str::trim)
             .filter(|nickname| !nickname.is_empty())
@@ -9547,6 +9557,7 @@ impl AppState {
         } else {
             self.subagents.push(RunningSubagent {
                 id: id.to_owned(),
+                task_id: String::new(),
                 name,
                 is_background_task: false,
                 // v2 지시문은 암호문이라 요약할 수 없어 역할을 설명 칸에 둔다.
@@ -9616,6 +9627,7 @@ impl AppState {
                 }
                 self.update_codex_subagent_identity(
                     id,
+                    None,
                     thread.get("agentNickname").and_then(Value::as_str),
                     thread.get("agentRole").and_then(Value::as_str),
                 );
@@ -9683,7 +9695,14 @@ impl AppState {
                 let Some(id) = item.get("agentThreadId").and_then(Value::as_str) else {
                     return;
                 };
-                self.remember_codex_subagent(id);
+                self.update_codex_subagent_identity(
+                    id,
+                    item.get("agentPath")
+                        .and_then(Value::as_str)
+                        .and_then(|path| path.trim().rsplit('/').next()),
+                    None,
+                    None,
+                );
                 match item.get("kind").and_then(Value::as_str) {
                     Some("started") => self.start_codex_subagent(id, false),
                     // Matches Codex's own TUI: interaction is activity copy, not
@@ -10235,6 +10254,11 @@ impl AppState {
                             .unwrap_or_else(|| started_at.elapsed().as_secs());
                         Some(RunningSubagent {
                             id: id.to_owned(),
+                            task_id: entry
+                                .get("taskId")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
                             is_background_task: entry
                                 .get("backgroundTask")
                                 .and_then(Value::as_bool)
@@ -15168,8 +15192,12 @@ impl AppState {
     /// 목록에서 빠진 줄을 순정처럼 끝난 줄로 30초 더 남긴다.
     fn linger_finished_subagents(&mut self, before: Vec<RunningSubagent>) {
         for running in before {
+            // 자리표시자가 같은 작업의 Agent 행에 접힌 것은 끝난 것이 아니다.
             if !listed_subagent(&running)
-                || self.subagents.iter().any(|row| row.id == running.id)
+                || self.subagents.iter().any(|row| {
+                    row.id == running.id
+                        || (!running.task_id.is_empty() && row.task_id == running.task_id)
+                })
             {
                 continue;
             }
@@ -23226,9 +23254,9 @@ mod tests {
         assert_eq!(state.view().subagents[0].name, "Robie");
         assert_eq!(state.view().subagents[0].description, "explorer");
 
-        // 활동의 `/root/<task_name>` 경로는 이름을 덮지 않는다.
+        // 활동 경로의 마지막 작업 이름이 닉네임보다 먼저 표시된다.
         state.handle_notification("item/completed", &codex_activity(child, "started"));
-        assert_eq!(state.view().subagents[0].name, "Robie");
+        assert_eq!(state.view().subagents[0].name, "auth-explorer");
 
         let role_only = CodexSubagent {
             role: Some("explorer".to_owned()),
@@ -23271,6 +23299,39 @@ mod tests {
         );
         assert!(running_rows(&state).is_empty());
         assert!(state.codex_subagents[child].terminal);
+    }
+
+    #[test]
+    fn codex_task_name_survives_later_nickname_and_empty_paths() {
+        let mut state = test_state();
+        let child = "00000000-0000-0000-0000-000000000111";
+        spawn_codex_subagent(&mut state, child);
+        let mut activity = codex_activity(child, "started");
+        activity["item"]["agentPath"] = json!("/root/review/test_hold_one");
+        state.handle_notification("item/completed", &activity);
+        assert_eq!(state.view().subagents[0].name, "test_hold_one");
+
+        state.handle_notification(
+            "thread/started",
+            &json!({
+                "thread": {
+                    "id": child,
+                    "parentThreadId": "thread",
+                    "agentNickname": "Robie",
+                    "agentRole": "explorer",
+                    "status": { "type": "active", "activeFlags": [] }
+                }
+            }),
+        );
+        assert_eq!(state.view().subagents[0].name, "test_hold_one");
+        assert_eq!(state.view().subagents[0].description, "explorer");
+
+        activity["item"]["kind"] = json!("interacted");
+        for path in [Value::Null, json!(""), json!("   "), json!("/root/")] {
+            activity["item"]["agentPath"] = path;
+            state.handle_notification("item/completed", &activity);
+            assert_eq!(state.view().subagents[0].name, "test_hold_one");
+        }
     }
 
     /// Codex reports a subagent's turn on the parent stream too, sometimes under
@@ -23864,6 +23925,7 @@ mod tests {
     fn the_background_task_count_reads_like_the_cli_pill() {
         let task = |name: &str| RunningSubagent {
             id: name.to_owned(),
+            task_id: String::new(),
             name: name.to_owned(),
             is_background_task: true,
             description: String::new(),
@@ -23945,6 +24007,32 @@ mod tests {
     /// 끝나 잠시 남은 줄을 뺀, 지금 도는 하위 에이전트 줄.
     fn running_rows(state: &AppState) -> Vec<SubagentView> {
         state.view().subagents.into_iter().filter(|row| !row.finished).collect()
+    }
+
+    /// 접수 결과보다 먼저 온 스냅숏 자리표시자가 같은 작업의 Agent 행에 접혀 사라지면
+    /// 끝난 줄로 남지 않는다. 같은 작업이 없는 행만 끝난 줄로 남는다.
+    #[test]
+    fn a_placeholder_folded_into_its_agent_row_does_not_linger() {
+        let mut state = test_state();
+        let rows = |entries: Value| json!({ "subagents": entries });
+        state.handle_notification(
+            "turn/subagents/updated",
+            &rows(json!([
+                { "id": "toolu_1", "taskId": "", "name": "general-purpose" },
+                { "id": "task:a1", "taskId": "a1", "name": "local_agent" },
+            ])),
+        );
+        state.handle_notification(
+            "turn/subagents/updated",
+            &rows(json!([{ "id": "toolu_1", "taskId": "a1", "name": "general-purpose" }])),
+        );
+        let view = state.view();
+        assert_eq!(view.subagents.len(), 1);
+        assert!(!view.subagents[0].finished);
+
+        state.handle_notification("turn/subagents/updated", &rows(json!([])));
+        let view = state.view();
+        assert!(view.subagents.len() == 1 && view.subagents[0].finished);
     }
 
     fn state_with_a_running_subagent() -> AppState {

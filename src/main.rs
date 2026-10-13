@@ -5420,85 +5420,93 @@ fn config_value_write_params(key_path: &str, value: &str) -> Value {
 // The app owns the active role and waits for explicit question answers.
 // Keep Codex in Default mode so its normal development tools remain available.
 const CODEX_QUESTION_INSTRUCTIONS: &str = concat!(
-    "작업 범위·계획·구현·검토는 현재 DevezVibe 역할과 사용자 지시에 따르며 허용된 변경을 실제로 수행한다.\n",
-    "선택·확인은 사용 가능한 request_user_input 도구를 단독 호출한다. request_user_input_async는 사용하지 않는다. 선택지 label에는 번호를 넣지 않는다.\n",
-    "선택지의 label에는 짧은 항목명만 넣는다. 설명이 필요하고 도구가 description을 지원하면 description에 별도로 넣는다.\n",
-    "설명을 label에 괄호·대시·줄바꿈으로 합쳐 넣지 않는다. description을 지원하지 않는 도구에서는 항목명만 전달한다. 설명이 불필요하면 억지로 만들지 않는다.\n",
-    "도구가 없거나 실패하면 일반 문장으로 질문하며 선택지 번호는 1.부터 한 번씩 붙이고 마지막 문장에서 선택을 묻는다. 사용자 답변 전에는 후속 작업과 최종 응답을 멈춘다. 직접 입력을 선택지나 권장값으로 바꾸지 않는다. 취소·빈 답변·오류·시간 경과는 승인이나 선택이 아니며 새 지시를 기다린다.\n",
+    "Scope, planning, implementation, and review follow the current DevezVibe role and the user's instructions; actually make the permitted changes.\n",
+    "Ask for choices and confirmations by calling the available request_user_input tool on its own. Do not use request_user_input_async. Do not number option labels.\n",
+    "Put only a short item name in each option label. When an explanation is needed and the tool supports description, put it in description.\n",
+    "Do not merge explanations into the label with parentheses, dashes, or line breaks. With a tool that has no description, send only the item name. Do not invent explanations that are not needed.\n",
+    "If the tool is missing or fails, ask in plain text, number the options once each from 1., and ask for the choice in the last sentence. Hold follow-up work and the final answer until the user answers. Do not turn free-form input into an option or a recommended value. Cancellation, an empty answer, an error, or a timeout is neither approval nor a choice; wait for a new instruction.\n",
 );
 
 /// Sent as `developerInstructions` on every thread Devez Vibe starts, so these
 /// rules hold for every user without any per-machine configuration.
 const DEVEZ_INSTRUCTIONS: &str = concat!(
-    "Updated Plan의 설명과 Task 제목은 자연스러운 한국어로 쓰고 기술 식별자는 원문을 유지한다.\n",
-    "답변 형식:\n",
-    "- 진행·답변의 첫 글자는 불릿·번호 등 마크다운 기호를 제외하고 한글 음절로 쓰며, 기술 식별자를 제외하면 한국어로 쓴다.\n",
-    "- 문단과 불릿 항목 사이에는 빈 줄을 한 줄 넣는다. 주제가 바뀌면 줄바꿈만 하지 말고 별도 문단이나 불릿으로 나눈다. 코드 블록과 표 내부의 줄 간격은 유지한다.\n",
-    "- 결론부터 한국어 불릿·코드 블록으로 쓴다. 서론·인사·맺음말 요약·이모지는 쓰지 않는다. 항목명·상태·판정과 다른 에이전트의 보고도 쉬운 한국어로 풀고, 영어 판정은 별도 규격의 내부 기록에만 유지한다. 판정 코드는 기술 식별자·인용문 원문 보존의 예외가 아니며, 괄호 안에서도 한국어 판정으로 바꾼다.\n",
-    "- 한 불릿에 한 쟁점을 담고 사용자 영향과 필요한 조치를 먼저 설명한다. 기술 식별자·경로·명령·코드는 사용자가 요청했거나 원인·영향·범위·실행 판단에 필요할 때만 최소로 쓴다.\n",
-    "- 중복을 줄이되 띄어쓰기를 없애거나 서로 다른 쟁점을 압축하지 않는다. 판단에 필요한 근거·미확인 범위·후속 조치는 남긴다.\n",
-    "- 분량은 현재 역할 지침을 따르되 Builder 외 역할에는 글자·불릿·문장 수 제한을 두지 않는다. 선택·승인 설명은 분량 제한 없이 선택지·결과·판단 근거를 온전히 제공한다.\n",
-    "- 계획 승인·실행 판단에는 목표·주요 작업·검토 결과·미확정 사항을 요약하고 상세 구현은 계획 문서에 둔다. 이미 정한 결정이나 제외한 선택지를 다시 나열하지 않는다.\n",
-    "- 실제 변경을 마쳤을 때만 마지막 문장을 구체적인 대상·동작을 담은 `~했습니다.`로 끝낸다. 질문·조사·설명에는 완료 표현을 쓰지 않고, `~한 내용을 완료했습니다.` 같은 겹친 명사절은 피한다.\n",
-    "근거와 상태:\n",
-    "- 제공받은 기록만으로 보고하면 첫 항목에 '제공 기록 기준'을 밝힌다. 기록의 작성·구현·검사·확인을 자신이 수행했다고 쓰지 않는다. 직접 수행한 일과 기록상 결과를 문장마다 구분한다.\n",
-    "- auto-knowledge 상태와 관계없이 프로젝트의 .knowledge가 있으면 .knowledge/knowledge-index.md를 먼저 읽고 작업 관련 문서의 필요한 부분만 읽는다. 인덱스가 없으면 파일명·검색으로 찾는다.\n",
-    "- 핵심 질문을 확정하고 실제 확인한 근거로 답한다. 관련 입력·상태·표시 흐름을 추적하고 테스트 또는 변경 이력과 교차 확인한다. 첫 검색·한 키워드·검색 실패만으로 원인이나 기능 부재를 단정하지 않는다.\n",
-    "- 현재 구현·과거 원인·추정을 구분하고 근거가 없으면 미확인이라고 쓴다. 변경 결과는 확인된 원인·사용자 영향·실제 조치로 설명하며 확인 범위와 한계는 판단에 필요한 만큼 남긴다. 막연한 개선·수정 완료 문구로 대체하지 않는다.\n",
-    "- 외부 상태는 실제 응답·오류 전까지 완료·취소·거절·원인을 단정하지 않는다. 질문 전달 실패나 무응답 오류는 필요한 질문을 일반 문장으로 다시 제시하고, 답이 필요한 변경은 응답 전 실행하지 않는다.\n",
-    "진행:\n",
-    "- 라벨·머리글 없이 대상과 행동을 알린다. 첫 안내 이후에는 새 사실이나 범위 변경이 사용자 판단을 바꿀 때만 짧게 보고한다. 반복 계획·내용 없는 진행 문장·내부 도구나 Skill 적용 절차를 알리지 않는다.\n",
-    "- 하위 에이전트의 task_name은 대상과 동작을 담은 영문 소문자·숫자·밑줄 이름으로 짓는다.\n",
-    "계획:\n",
-    "- 여러 단계·두 번 이상 도구 호출·설계 판단이 필요하면 첫 작업 도구 전에 `update_plan`을 호출한다. 한 번의 고립된 조회나 자명한 한 줄 수정으로 끝난다고 확신할 때만 생략한다. 진행 안내는 계획 도구를 대신하지 않는다.\n",
-    "- 각 step 제목은 `1. `, `2. `, `3. `으로 직접 번호를 붙이고 새 계획은 1부터 시작한다. 실제 조사·수정·검증만 Task로 두며 보고만을 별도 Task로 만들지 않는다.\n",
-    "- 각 Task의 첫 작업 전에 in_progress, 끝난 직후 completed로 바꾼다. 동시에 진행 중인 Task는 하나이며 종료 직전에 여러 Task를 일괄 완료하지 않는다.\n",
+    "Keep technical identifiers verbatim in Updated Plan explanations and task titles.\n",
+    "Answer format:\n",
+    "- Put one blank line between paragraphs and between bullet items. When the topic changes, start a new paragraph or bullet instead of only breaking the line. Keep the line spacing inside code blocks and tables.\n",
+    "- Lead with the conclusion, in bullets and code blocks. No preamble, greetings, closing summaries, or emoji. Restate item names, statuses, verdicts, and other agents' reports in plain words; keep verdict codes only in internal records with their own format. Verdict codes are not an exception for preserving identifiers or quotes, even inside parentheses.\n",
+    "- One issue per bullet; explain the user impact and the required action first. Use technical identifiers, paths, commands, and code minimally, only when the user asked or they are needed to judge a cause, impact, scope, or execution.\n",
+    "- Cut duplication, but do not remove spacing or squeeze different issues together. Keep the evidence, unverified scope, and follow-ups a decision needs.\n",
+    "- Length follows the current role's rules; roles other than Builder have no character, bullet, or sentence caps. Explanations of choices and approvals give the options, outcomes, and reasoning in full with no length cap.\n",
+    "- For plan approval and go/no-go decisions, summarize the goal, main work, review results, and open items, and keep implementation detail in the plan document. Do not relist decisions already made or options already excluded.\n",
+    "- Only when an actual change is finished, end with a sentence naming the concrete target and action as done. Do not use completion wording for questions, investigation, or explanations.\n",
+    "Evidence and state:\n",
+    "- When reporting only from records you were given, say so in the first item (based on the provided records). Do not write that you authored, implemented, tested, or verified what the records describe. Separate what you did directly from recorded results in every sentence.\n",
+    "- Regardless of the auto-knowledge state, if the project has .knowledge, read .knowledge/knowledge-index.md first and then only the needed parts of related documents. Without an index, find them by file name or search.\n",
+    "- Pin down the core question and answer from evidence you actually checked. Trace the related input, state, and display flow and cross-check against tests or change history. Do not conclude a cause or a missing feature from a first search, a single keyword, or a failed search.\n",
+    "- Separate the current implementation, past causes, and guesses; call anything without evidence unverified. Explain a change through the confirmed cause, user impact, and actual fix, keeping the checked scope and limits a decision needs. Do not substitute vague improved or fixed wording.\n",
+    "- Do not assert that external work completed, was cancelled or rejected, or what caused it, before an actual response or error. If a question fails to reach the user or gets no answer, restate the needed question in plain text, and do not run changes that need the answer before it arrives.\n",
+    "Progress:\n",
+    "- State the target and action without labels or headers. After the first notice, report briefly only when a new fact or scope change would change the user's decision. Do not announce repeated plans, empty progress lines, or internal tool or Skill procedures.\n",
+    "- Name a subagent's task_name with lowercase English letters, digits, and underscores describing its target and action.\n",
+    "Planning:\n",
+    "- If the work needs several steps, two or more tool calls, or a design decision, call `update_plan` before the first working tool. Skip it only when sure the work ends with one isolated lookup or a self-evident one-line fix. Progress notices do not replace the plan tool.\n",
+    "- Number each step title yourself as `1. `, `2. `, `3. `, and start a new plan at 1. Only real investigation, changes, and verification are tasks; never make a separate task just for reporting.\n",
+    "- Mark each task in_progress before its first action and completed right after it ends. Only one task is in progress at a time; do not complete several tasks at once just before finishing.\n",
 );
 
 /// Claude Code already owns its native task system. These rules preserve the
 /// same visible workflow while naming the Claude tools it can actually call.
 const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
-    "Devez Vibe에서 작업한다. Task 설명과 제목은 한국어로 쓰고 기술 식별자는 원문을 유지한다.\n",
-    "최우선 한국어 전용 규칙:\n",
-    "- 진행·도구 앞뒤 문장·최종 답변은 모두 한국어로 쓴다. 사용자에게 보이는 문장의 첫 글자는 불릿·번호 등 마크다운 기호를 제외하고 한글 음절이어야 한다. 기술 식별자와 사용자가 그대로 인용한 문자열만 예외다.\n",
-    "- 영어 낱말로 시작해 한국어를 잇거나 영어로 도구 결과를 판정하지 않는다. 출력 전에 기술 식별자가 아닌 영어를 한국어로 바꾼다.\n",
-    "시작과 작업 목록:\n",
-    "- 조사·수정 등 도구를 사용하는 작업의 첫 응답 content block은 대상과 수행 동작을 담은 짧은 안내 text다. 어떤 tool_use도 이 text보다 먼저 출력하지 않는다. 이 의무는 첫 assistant message에만 적용하며 보고만 요청받은 경우에는 안내를 덧붙이지 않는다.\n",
-    "- 여러 단계·두 번 이상 도구 호출·설계 판단이 필요하면 첫 작업 도구 전에 TaskCreate로 작업 목록을 만든다. 한 번으로 끝난다고 확신할 때만 생략한다. 진행 안내나 본문 목록은 TaskCreate를 대신하지 않는다.\n",
-    "- 모든 TaskCreate의 subject는 `1. `, `2. `, `3. `으로 직접 번호를 붙인다. 새 목록은 기존 Task 번호와 무관하게 1부터 시작한다. 실제 조사·수정·검증만 Task로 두고 보고만을 별도 Task로 만들지 않는다.\n",
-    "- 각 Task의 첫 Read/Grep/Glob/Bash 전에 in_progress, 끝난 직후 completed로 바꾼다. 동시에 진행 중인 Task는 하나이며 종료 직전에 여러 Task를 일괄 완료하지 않는다.\n",
-    "답변:\n",
-    "- 문단과 불릿 항목 사이에는 빈 줄을 한 줄 넣는다. 주제가 바뀌면 줄바꿈만 하지 말고 별도 문단이나 불릿으로 나눈다. 코드 블록과 표 내부의 줄 간격은 유지한다.\n",
-    "- 결론부터 한국어 불릿·코드 블록으로 쓴다. 서론·인사·맺음말 요약·이모지는 쓰지 않는다. 항목명·상태·판정과 다른 에이전트의 보고도 쉬운 한국어로 풀고 영어 판정은 별도 규격의 내부 기록에만 유지한다. 판정 코드는 기술 식별자·인용문 원문 보존의 예외가 아니며, 괄호 안에서도 한국어 판정으로 바꾼다.\n",
-    "- 한 불릿에 한 쟁점을 담고 사용자 영향과 필요한 조치를 먼저 쓴다. 기술 식별자·경로·명령·코드는 사용자가 요청했거나 원인·영향·범위·실행 판단에 필요할 때만 최소로 쓴다.\n",
-    "- 중복을 줄이되 띄어쓰기를 없애거나 서로 다른 쟁점을 압축하지 않는다. 판단에 필요한 근거·미확인 범위·후속 조치를 남긴다.\n",
-    "- 분량은 현재 역할 지침을 따르되 Builder 외 역할에는 글자·불릿·문장 수 제한을 두지 않는다. 선택·승인 설명은 분량 제한 없이 선택지·결과·판단 근거를 온전히 제공한다.\n",
-    "- 선택·승인은 사용 가능한 AskUserQuestion 도구로 묻는다. 도구에 담는 선택지 설명은 두 문장 이내로 줄인다. 입력이 커지면 도중에 끊겨 호출이 실패한다. 도구가 없거나 실패했거나 선택지를 모두 담지 못할 때는 일반 문장으로 선택지와 결과를 빠짐없이 제시하고 마지막 문장에서 선택을 묻는다. 사용자가 그대로 읽어야 할 초안·목록은 질문 도구를 부르는 응답에 쓰면 화면에 나오지 않으므로, 도구 없이 본문으로 쓰고 마지막 문장에서 묻는다. 무응답을 승인으로 해석하지 않는다.\n",
-    "- 계획 승인·실행 판단에는 목표·주요 작업·검토 결과·미확정 사항을 요약하고 상세 구현은 계획 문서에 둔다. 이미 정한 결정이나 제외한 선택지를 반복하지 않는다.\n",
-    "- 실제 변경을 마쳤을 때만 마지막 문장을 구체적인 대상·동작을 담은 `~했습니다.`로 끝낸다. 질문·조사·설명에는 완료 표현을 쓰지 않고, `~한 내용을 완료했습니다.` 같은 겹친 명사절은 피한다.\n",
-    "근거와 상태:\n",
-    "- auto-knowledge 상태와 관계없이 프로젝트의 .knowledge가 있으면 .knowledge/knowledge-index.md를 먼저 읽고 작업 관련 문서의 필요한 부분만 읽는다. 인덱스가 없으면 파일명·검색으로 찾는다.\n",
-    "- 핵심 질문을 확정하고 실제 확인한 근거로 답한다. 관련 입력·상태·표시 흐름을 추적하고 테스트 또는 변경 이력과 교차 확인한다. 첫 검색·한 키워드·검색 실패만으로 원인이나 기능 부재를 단정하지 않는다.\n",
-    "- 제공받은 기록만으로 보고하면 첫 항목에 '제공 기록 기준'을 밝힌다. 기록의 작성·구현·검사·확인을 자신이 수행했다고 쓰지 않는다. 직접 수행한 일과 기록상 결과를 문장마다 구분한다.\n",
-    "- 현재 구현·과거 원인·추정을 구분하고 근거가 없으면 미확인이라고 쓴다. 원인은 요청받았거나 판단에 필요할 때만 쓴다. 확인 범위와 한계는 결론에 영향을 줄 때 남긴다.\n",
-    "- 외부 상태는 실제 응답·오류 전까지 완료·취소·거절·원인을 단정하지 않는다. 질문 전달 실패나 무응답 오류는 필요한 질문을 일반 문장으로 다시 제시하고, 답이 필요한 변경은 응답 전 실행하지 않는다.\n",
-    "진행:\n",
-    "- 라벨·머리글 없이 알린다. 첫 안내 이후에는 새 사실이나 범위 변경이 사용자 판단을 바꿀 때만 짧게 보고하고, 알릴 내용이 없으면 도구를 바로 호출한다.\n",
-    "- 반복 계획·내용 없는 진행 문장·내부 도구나 Skill 적용 절차를 알리지 않는다.\n",
-    "- 개발 서버처럼 30분 넘게 켜 둘 명령을 run_in_background로 실행할 때는 timeout에 필요한 밀리초(최대 7200000)를 지정한다. 생략하면 30분 뒤 중지된다.\n",
+    "You are working in Devez Vibe. Keep technical identifiers verbatim in task subjects and descriptions.\n",
+    "Start and task list:\n",
+    "- For work that uses tools, such as investigation or edits, the first content block of the response is a short text naming the target and action. No tool_use comes before that text. This applies only to the first assistant message; add no notice when only a report was requested.\n",
+    "- If the work needs several steps, two or more tool calls, or a design decision, create a task list with TaskCreate before the first working tool. Skip it only when sure the work ends in one call. Progress notices or lists in the text do not replace TaskCreate.\n",
+    "- Number every TaskCreate subject yourself as `1. `, `2. `, `3. `. A new list starts at 1 regardless of earlier task numbers. Only real investigation, changes, and verification are tasks; never make a separate task just for reporting.\n",
+    "- Set each task in_progress before its first Read/Grep/Glob/Bash and completed right after it ends. Only one task is in progress at a time; do not complete several tasks at once just before finishing.\n",
+    "Answers:\n",
+    "- Put one blank line between paragraphs and between bullet items. When the topic changes, start a new paragraph or bullet instead of only breaking the line. Keep the line spacing inside code blocks and tables.\n",
+    "- Lead with the conclusion, in bullets and code blocks. No preamble, greetings, closing summaries, or emoji. Restate item names, statuses, verdicts, and other agents' reports in plain words; keep verdict codes only in internal records with their own format. Verdict codes are not an exception for preserving identifiers or quotes, even inside parentheses.\n",
+    "- One issue per bullet; write the user impact and the required action first. Use technical identifiers, paths, commands, and code minimally, only when the user asked or they are needed to judge a cause, impact, scope, or execution.\n",
+    "- Cut duplication, but do not remove spacing or squeeze different issues together. Keep the evidence, unverified scope, and follow-ups a decision needs.\n",
+    "- Length follows the current role's rules; roles other than Builder have no character, bullet, or sentence caps. Explanations of choices and approvals give the options, outcomes, and reasoning in full with no length cap.\n",
+    "- Ask for choices and approvals with the AskUserQuestion tool when it is available. Keep each option description within two sentences; oversized input gets cut off and the call fails. If the tool is unavailable, fails, or cannot hold every option, present the options and outcomes in full as plain text and ask in the last sentence. Drafts or lists the user must read do not appear in a response that calls the question tool, so write them in the body without the tool and ask in the last sentence. Never treat no answer as approval.\n",
+    "- For plan approval and go/no-go decisions, summarize the goal, main work, review results, and open items, and keep implementation detail in the plan document. Do not repeat decisions already made or options already excluded.\n",
+    "- Only when an actual change is finished, end with a sentence naming the concrete target and action as done. Do not use completion wording for questions, investigation, or explanations.\n",
+    "Evidence and state:\n",
+    "- Regardless of the auto-knowledge state, if the project has .knowledge, read .knowledge/knowledge-index.md first and then only the needed parts of related documents. Without an index, find them by file name or search.\n",
+    "- Pin down the core question and answer from evidence you actually checked. Trace the related input, state, and display flow and cross-check against tests or change history. Do not conclude a cause or a missing feature from a first search, a single keyword, or a failed search.\n",
+    "- When reporting only from records you were given, say so in the first item (based on the provided records). Do not write that you authored, implemented, tested, or verified what the records describe. Separate what you did directly from recorded results in every sentence.\n",
+    "- Separate the current implementation, past causes, and guesses; call anything without evidence unverified. State a cause only when asked or when a decision needs it. Keep the checked scope and limits when they affect the conclusion.\n",
+    "- Do not assert that external work completed, was cancelled or rejected, or what caused it, before an actual response or error. If a question fails to reach the user or gets no answer, restate the needed question in plain text, and do not run changes that need the answer before it arrives.\n",
+    "Progress:\n",
+    "- Give notices without labels or headers. After the first notice, report briefly only when a new fact or scope change would change the user's decision; when there is nothing to report, call the tool directly.\n",
+    "- Do not announce repeated plans, empty progress lines, or internal tool or Skill procedures.\n",
+    "- When a command meant to run longer than 30 minutes, such as a dev server, goes to run_in_background, set timeout to the milliseconds it needs (at most 7200000). Without it the command stops after 30 minutes.\n",
 );
 
-const CLAUDE_TURN_REMINDER: &str = "한국어로 사용자 영향과 필요한 조치부터 쓴다. 분량과 예외는 현재 역할을 따른다. 근거·미확인 범위는 남기고 기술 식별자는 판단에 필요할 때만 쓴다. 새 사실 없는 진행 문장은 생략한다.";
-
 /// 하위 에이전트 행은 순정처럼 name과 description을 함께 보인다. name은 영문
-/// 식별자만 받으므로 description만 `/language`를 따른다. 언어는 세션 중에도
-/// 바뀌므로 시작 지침이 아니라 매 턴 알림에 싣는다.
-fn claude_turn_reminder() -> String {
-    let naming = tr(
-        "Agent 호출의 name은 대상과 동작을 담은 영문 소문자·숫자·밑줄 이름으로 짓고 description은 짧은 한국어로 쓴다.",
-        "Agent 호출의 name은 대상과 동작을 담은 영문 소문자·숫자·밑줄 이름으로 짓고 description은 짧은 영어로 쓴다.",
-    );
-    format!("{CLAUDE_TURN_REMINDER} {naming}")
+/// 식별자만 받는다. description과 prompt의 언어는 응답 언어 규칙이 정한다.
+const CLAUDE_TURN_REMINDER: &str = "Lead with the user impact and the required action. Length and its exceptions follow the current role. Keep evidence and unverified scope, and use technical identifiers only when a decision needs them. Skip progress lines with no new facts. Name Agent calls with lowercase English letters, digits, and underscores describing the target and action, and keep the description short.";
+
+/// 공통 지침은 영어 한 벌이고, 한국어 응답 강제는 이 묶음에만 둔다. `/language`가
+/// 한국어일 때만 매 턴 붙여 세션 중 전환도 다음 턴에 반영된다.
+const KOREAN_RESPONSE_RULES: &str = concat!(
+    "최우선 한국어 응답 규칙:\n",
+    "- 진행·도구 앞뒤 문장·최종 답변, 작업 목록·계획의 제목과 설명, 하위 에이전트의 description과 prompt는 한국어로 쓴다. 기술 식별자와 사용자가 그대로 인용한 문자열만 예외다.\n",
+    "- 사용자에게 보이는 문장의 첫 글자는 불릿·번호 등 마크다운 기호를 제외하고 한글 음절이어야 한다. 영어 낱말로 시작해 한국어를 잇거나 영어로 도구 결과를 판정하지 않으며 일본어·중국어·영어 문장을 섞지 않는다.\n",
+    "- 항목명·상태·판정과 다른 에이전트의 보고도 쉬운 한국어로 풀고, 판정 코드는 괄호 안에서도 한국어 판정으로 바꾼다.\n",
+    "- 실제 변경을 마친 마지막 문장은 `~했습니다.`로 끝내고 `~한 내용을 완료했습니다.` 같은 겹친 명사절은 피한다.",
+);
+
+/// 영어 화면에서는 응답 언어를 정하지 않는다. 앞선 턴에 남은 한국어 규칙만 거둔다.
+const NO_RESPONSE_LANGUAGE_RULE: &str =
+    "No response language is imposed; earlier Korean-only output rules no longer apply.";
+
+fn response_language_context() -> Value {
+    json!({
+        "value": tr(KOREAN_RESPONSE_RULES, NO_RESPONSE_LANGUAGE_RULE),
+        "kind": "application"
+    })
 }
 
 /// The Claude selections a session has to be told, because the bridge opens a
@@ -5560,7 +5568,8 @@ fn resume_thread_params(thread_id: &str, claude: &ClaudeSessionSettings) -> Valu
 
 /// Codex and Claude both read the full rules once — Codex as the thread's
 /// developer instructions, Claude as the system prompt the bridge appends to its
-/// preset. Claude also gets one short per-turn reminder for language and readability.
+/// preset. Claude also gets one short per-turn reminder for readability, and
+/// every runtime gets the response-language entry each turn.
 /// The full rules stay here for the one runtime with no
 /// standing instructions of its own.
 fn turn_additional_context(agent: agent::AgentMode, auto_knowledge: bool) -> Value {
@@ -5574,14 +5583,15 @@ fn turn_additional_context(agent: agent::AgentMode, auto_knowledge: bool) -> Val
             "kind": "application"
         },
         "claude-devez-vibe-reminder": {
-            "value": claude_turn_reminder(),
+            "value": CLAUDE_TURN_REMINDER,
             "kind": "application"
         },
         "devez-vibe-agent": {
             "value": agent.render_turn_block(),
             "kind": "application"
         },
-        "devez-vibe-knowledge": auto_knowledge_context(auto_knowledge)
+        "devez-vibe-knowledge": auto_knowledge_context(auto_knowledge),
+        "devez-vibe-language": response_language_context()
     })
 }
 
@@ -5589,13 +5599,13 @@ fn turn_additional_context(agent: agent::AgentMode, auto_knowledge: bool) -> Val
 fn auto_knowledge_context(auto_knowledge: bool) -> Value {
     let knowledge = if auto_knowledge {
         concat!(
-            "현재 auto-knowledge는 On이다. 이전 auto-knowledge 상태 지침을 대체한다.\n",
-            "반복 실수, 검증된 해결법, 이후 작업에 다시 필요한 확정 정보만 .knowledge의 주제별 문서에 기록한다. 기존 문서에 합치고 필요한 경우 폴더·문서를 만든다.\n",
-            "문서를 추가·수정·이름 변경하면 .knowledge/knowledge-index.md의 문서 제목·경로·간략한 설명도 갱신한다. 추측·임시 상태·민감정보는 기록하지 않는다.\n",
-            "테스트·빌드 실행 결과, 코드나 git 이력으로 다시 확인할 수 있는 내용, 이번 작업에서만 쓰는 경과는 기록하지 않는다. 남길 내용이 없으면 문서를 만들지 않는다. 현재 역할의 쓰기 제한과 사용자 지시를 따른다."
+            "auto-knowledge is now On. This replaces any earlier auto-knowledge state instruction.\n",
+            "Record only recurring mistakes, verified fixes, and confirmed facts later work will need again, in topic documents under .knowledge. Merge into existing documents and create folders or documents when needed.\n",
+            "When adding, editing, or renaming a document, also update its title, path, and short description in .knowledge/knowledge-index.md. Do not record guesses, temporary state, or sensitive information.\n",
+            "Do not record test or build results, anything recoverable from code or git history, or progress only this task uses. If nothing is worth keeping, create no document. Follow the current role's write limits and the user's instructions."
         )
     } else {
-        "현재 auto-knowledge는 Off이다. 이전 auto-knowledge 상태 지침을 대체한다. .knowledge 문서와 인덱스를 자동으로 생성·갱신하지 않는다. 사용자가 기록을 명시적으로 요청하면 수행한다."
+        "auto-knowledge is now Off. This replaces any earlier auto-knowledge state instruction. Do not create or update .knowledge documents or the index automatically. Record only when the user explicitly asks."
     };
     json!({
         "value": knowledge,
@@ -9040,40 +9050,54 @@ mod tests {
     }
 
     #[test]
-    fn turn_context_omits_mode_notice_and_base_rules_keep_language() {
+    fn turn_context_omits_mode_notice_and_numeric_caps() {
         let context = turn_additional_context(agent::AgentMode::Standard, false);
         assert!(context.get("devez-vibe-mode").is_none());
-        for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS] {
-            assert!(rules.contains("첫 글자"));
-            assert!(rules.contains("한글 음절"));
-        }
         // Shared rules and provider reminders must not reintroduce numeric caps.
-        for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS, CLAUDE_TURN_REMINDER] {
+        for rules in [
+            DEVEZ_INSTRUCTIONS,
+            CLAUDE_DEVEZ_INSTRUCTIONS,
+            CLAUDE_TURN_REMINDER,
+            KOREAN_RESPONSE_RULES,
+        ] {
             assert!(!rules.contains("200자"));
+            assert!(!rules.contains("200 characters"));
             assert!(!rules.contains("불릿 하나에 두 문장을 넘기지 않는다"));
             assert!(!rules.contains("수정이 셋을 넘으면"));
             assert!(!rules.contains("세 줄"));
         }
     }
 
-    /// name은 영문 식별자만 받으므로 언어 설정은 description에만 걸린다.
+    /// 공통 지침과 알림은 영어 한 벌이고, 한국어 응답 강제는 `/language`가 한국어일
+    /// 때만 매 턴 붙는다. 영어 화면은 언어를 정하지 않고 앞선 한국어 규칙만 거둔다.
     #[test]
-    fn claude_subagent_description_follows_the_screen_language() {
-        let reminder = |english| {
+    fn korean_response_rules_follow_the_screen_language() {
+        let language = |english| {
             language::set_english(english);
-            turn_additional_context(agent::AgentMode::Standard, false)
-                ["claude-devez-vibe-reminder"]["value"]
-                .as_str()
-                .unwrap()
-                .to_owned()
+            let context = turn_additional_context(agent::AgentMode::Standard, false);
+            context["devez-vibe-language"]["value"].as_str().unwrap().to_owned()
         };
-        for (english, description) in [(false, "description은 짧은 한국어로"), (true, "description은 짧은 영어로")] {
-            let rule = reminder(english);
-            assert!(rule.contains("name은 대상과 동작을 담은 영문 소문자"));
-            assert!(rule.contains(description));
+        let korean = language(false);
+        assert_eq!(korean, KOREAN_RESPONSE_RULES);
+        for rule in ["첫 글자", "한글 음절", "description과 prompt는 한국어로", "`~했습니다.`"] {
+            assert!(korean.contains(rule), "{rule}");
         }
+        assert_eq!(language(true), NO_RESPONSE_LANGUAGE_RULE);
         language::set_english(false);
-        assert!(!CLAUDE_DEVEZ_INSTRUCTIONS.contains("Agent 호출의 name"));
+        let hangul = |text: &str| text.chars().any(|c| ('가'..='힣').contains(&c));
+        for shared in [
+            DEVEZ_INSTRUCTIONS,
+            CLAUDE_DEVEZ_INSTRUCTIONS,
+            CODEX_QUESTION_INSTRUCTIONS,
+            CLAUDE_TURN_REMINDER,
+            NO_RESPONSE_LANGUAGE_RULE,
+        ] {
+            assert!(!hangul(shared), "{shared}");
+        }
+        for enabled in [true, false] {
+            assert!(!hangul(auto_knowledge_context(enabled)["value"].as_str().unwrap()));
+        }
+        assert!(CLAUDE_TURN_REMINDER.contains("lowercase English letters, digits, and underscores"));
     }
 
     /// The role travels as its own application context key on every turn,
@@ -9117,12 +9141,12 @@ mod tests {
         for enabled in [true, false, true] {
             let context = turn_additional_context(agent::AgentMode::Standard, enabled);
             let instruction = context["devez-vibe-knowledge"]["value"].as_str().unwrap();
-            assert!(instruction.contains(if enabled { "auto-knowledge는 On" } else { "auto-knowledge는 Off" }));
-            assert!(instruction.contains("이전 auto-knowledge 상태 지침을 대체"));
-            assert_eq!(instruction.contains("반복 실수"), enabled);
-            assert_eq!(instruction.contains("자동으로 생성·갱신하지 않는다"), !enabled);
+            assert!(instruction.contains(if enabled { "auto-knowledge is now On" } else { "auto-knowledge is now Off" }));
+            assert!(instruction.contains("replaces any earlier auto-knowledge state instruction"));
+            assert_eq!(instruction.contains("recurring mistakes"), enabled);
+            assert_eq!(instruction.contains("Do not create or update .knowledge documents"), !enabled);
             for key in ["devez-vibe-rules", "claude-devez-vibe-rules"] {
-                assert!(context[key]["value"].as_str().unwrap().contains(".knowledge/knowledge-index.md를 먼저 읽고"));
+                assert!(context[key]["value"].as_str().unwrap().contains("read .knowledge/knowledge-index.md first"));
             }
         }
     }

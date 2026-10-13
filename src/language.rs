@@ -1,6 +1,7 @@
 //! Screen language picked with `/language`. It switches descriptions, notices,
 //! and error text; titles, buttons, labels, and shortcut hints stay English, and
-//! text exchanged with a model never switches.
+//! text exchanged with a model never switches. The one exception is the per-turn
+//! response-language entry: Korean adds the Korean response rules.
 
 #[cfg(not(test))]
 use std::sync::atomic::{AtomicBool, Ordering};
