@@ -729,6 +729,20 @@ impl BackendServer {
                     )
                     .await
             }
+            // 작업 창이 보는 백그라운드 명령의 출력 끝부분. Claude만 SDK가 읽어 준다.
+            "task/output" => {
+                let visible = thread_id(&params)?;
+                if self.route_kind(visible) != RuntimeKind::Claude {
+                    return Ok(json!({}));
+                }
+                let backing = self.backing_id(visible, RuntimeKind::Claude)?;
+                self.claude
+                    .request(
+                        "session/taskOutput",
+                        json!({ "sessionId": backing, "id": params.get("id") }),
+                    )
+                    .await
+            }
             "thread/fork" => {
                 let visible = thread_id(&params)?;
                 let cwd = request_cwd(&params)

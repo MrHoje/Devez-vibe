@@ -436,6 +436,8 @@ pub struct StatusLineView {
     pub weekly_percent: Option<u8>,
     pub notice: Option<String>,
     pub update_notice: Option<String>,
+    /// 순정처럼 백그라운드 명령을 줄 대신 세는 말(`2 shells`). 누르면 작업 창이 열린다.
+    pub background_tasks: Option<String>,
 }
 
 /// Internal footer marker used when the user disables the status line entirely.
@@ -532,6 +534,8 @@ pub struct SubagentView {
     pub selected: bool,
     /// 눌러서 본문에 띄울 기록이 있는 행. 백그라운드 명령은 없다.
     pub viewable: bool,
+    /// 끝났지만 순정처럼 잠시 남겨 둔 행. 점을 완료 색으로 칠한다.
+    pub finished: bool,
 }
 
 /// 본문 대신 그릴 하위 에이전트 기록과, 기록이 바뀔 때마다 오르는 판.
@@ -539,6 +543,9 @@ pub struct SubagentTranscript<'a> {
     pub id: &'a str,
     pub revision: u64,
     pub blocks: &'a [Block],
+    /// 하단 줄과 같은 `이름 · 설명`을 웰컴 UI의 제목 자리에 세운다.
+    pub name: &'a str,
+    pub description: &'a str,
 }
 
 /// One page this session published as a claude.ai Artifact, listed under the
@@ -852,9 +859,9 @@ pub struct Renderer {
     diff_display_mode: DiffDisplayMode,
     chat_layout: bool,
     expanded_tools: HashSet<u64>,
-    /// 본문에 띄운 하위 에이전트 기록을 감싼 줄과, 그 줄을 만든 id·판·폭·펼친 도구 수.
+    /// 본문에 띄운 하위 에이전트 기록을 감싼 줄과, 그 줄을 만든 id·제목·판·폭·펼친 도구 수.
     subagent_view_lines: Option<Vec<PaintLine>>,
-    subagent_view_key: Option<(String, u64, u16, usize)>,
+    subagent_view_key: Option<(String, String, u64, u16, usize)>,
     response_collapse: Option<(u64, f32)>,
     fold_progress_groups: bool,
     /// Wrapped transcript rows owned by folded progress records. Double-click
@@ -3420,7 +3427,13 @@ impl Renderer {
     /// 하위 에이전트를 띄우거나 거두면 스크롤·선택을 새로 잡고, 그 기록을 본문 줄로 감싼다.
     fn update_subagent_view(&mut self, view: Option<&SubagentTranscript>, width: u16) {
         let key = view.map(|view| {
-            (view.id.to_owned(), view.revision, width, self.expanded_tools.len())
+            (
+                view.id.to_owned(),
+                format!("{} · {}", view.name, view.description),
+                view.revision,
+                width,
+                self.expanded_tools.len(),
+            )
         });
         if key.as_ref().map(|key| &key.0) != self.subagent_view_key.as_ref().map(|key| &key.0) {
             self.scroll_back = 0;
@@ -3433,7 +3446,15 @@ impl Renderer {
             return;
         }
         self.subagent_view_lines = view.map(|view| {
-            let mut lines = Vec::new();
+            // 웰컴 UI의 `DEVEZ VIBE` 자리에 이름·설명을 두고, `What's New`가 서는 줄부터
+            // 프롬프트가 시작되도록 경로 줄과 빈 줄 몫을 그대로 비운다.
+            let mut lines = vec![
+                PaintLine::blank(),
+                subagent_view_title(view.name, view.description, width),
+                PaintLine::blank(),
+                PaintLine::blank(),
+            ];
+            let header_rows = lines.len();
             // 계획(Updated Plan)은 메인 대화에서만 보인다.
             for block in visible_transcript_blocks(
                 view.blocks.iter().filter(|block| !matches!(block.kind, BlockKind::Plan)),
@@ -3442,7 +3463,7 @@ impl Renderer {
             ) {
                 lines.extend(self.history_block_lines(block, width));
             }
-            if lines.is_empty() {
+            if lines.len() == header_rows {
                 lines.push(PaintLine {
                     tone: Tone::Muted,
                     ..PaintLine::plain(format!(
@@ -6239,6 +6260,8 @@ pub enum Pick {
     SubagentSection,
     /// 하위 에이전트 줄이나 `main` 줄: 그 대화를 본문에 띄운다. None이 main이다.
     ViewSubagent(Option<String>),
+    /// 상태 줄의 백그라운드 작업 수: 작업 창을 연다.
+    BackgroundTasks,
     McpSection(String),
     PluginSection(String),
     /// 패널 머리글의 [▶]: 패널을 12칸 좁힌다.
@@ -6757,13 +6780,28 @@ fn subagent_lines(subagents: &[SubagentView], width: u16) -> Vec<PaintLine> {
     lines
 }
 
-/// 본문에 띄운 줄만 테마색으로 칠한다. 점과 이름의 색을 돌려준다.
-fn subagent_row_tones(selected: bool) -> (Tone, Tone) {
+/// 본문에 띄운 줄만 테마색으로 칠하고, 끝난 줄은 점을 완료 색으로 칠한다.
+/// 점과 이름의 색을 돌려준다.
+fn subagent_row_tones(selected: bool, finished: bool) -> (Tone, Tone) {
     if selected {
         (Tone::Accent, Tone::Accent)
+    } else if finished {
+        (Tone::Success, Tone::Plain)
     } else {
         (Tone::Muted, Tone::Plain)
     }
+}
+
+/// 하위 에이전트 보기의 제목 줄. 웰컴 UI 제목처럼 테마색 굵은 이름 뒤에 설명을 붙인다.
+fn subagent_view_title(name: &str, description: &str, width: u16) -> PaintLine {
+    let room = panel_span(width);
+    let name = compact_right(&subagent_display_name(name), room);
+    let mut line = plain_line(&name, Tone::Accent, true);
+    line.tail.extend(subagent_description_span(
+        description,
+        room.saturating_sub(UnicodeWidthStr::width(name.as_str())),
+    ));
+    line
 }
 
 /// 줄 전체를 하나의 클릭 대상으로 만든다.
@@ -6775,7 +6813,7 @@ fn with_row_pick(mut line: PaintLine, pick: Pick) -> PaintLine {
 /// 목록 맨 위의 `main`. 하위 에이전트를 보다가 눌러 메인 대화로 돌아온다.
 fn subagent_main_line(subagents: &[SubagentView], gutter: &str) -> PaintLine {
     let selected = !subagents.iter().any(|subagent| subagent.selected);
-    let (glyph_tone, name_tone) = subagent_row_tones(selected);
+    let (glyph_tone, name_tone) = subagent_row_tones(selected, false);
     with_row_pick(
         PaintLine {
             prefix: format!("{gutter}• "),
@@ -6867,7 +6905,7 @@ fn subagent_line(subagent: &SubagentView, right_edge: usize) -> PaintLine {
         available.saturating_sub(UnicodeWidthStr::width(name.as_str())),
     );
 
-    let (glyph_tone, name_tone) = subagent_row_tones(subagent.selected);
+    let (glyph_tone, name_tone) = subagent_row_tones(subagent.selected, subagent.finished);
     let mut tail = vec![PaintSpan {
         text: format!(" {label}{name}"),
         tone: name_tone,
@@ -9335,6 +9373,10 @@ fn status_line_row(
     if let Some(notice) = status.notice.filter(|notice| !notice.is_empty()) {
         push_status_span(&mut spans, notice, Tone::Muted);
     }
+    if let Some(tasks) = status.background_tasks.filter(|tasks| !tasks.is_empty()) {
+        let span = push_status_span(&mut spans, tasks, Tone::Accent);
+        picks.push((span, Pick::BackgroundTasks));
+    }
     // Align with the activity controls above by keeping two blank terminal
     // columns to the right of the status line.
     let max_width = width.saturating_sub(3) as usize;
@@ -10850,8 +10892,9 @@ fn side_panel_subagent_lines(
         return Vec::new();
     }
 
+    let running = subagents.iter().filter(|subagent| !subagent.finished).count();
     let heading = side_panel_section_heading(
-        &format!("Subagents {} Running", subagents.len()),
+        &format!("Subagents {running} Running"),
         expanded,
         content_width,
         Pick::SubagentSection,
@@ -10890,7 +10933,7 @@ fn side_panel_subagent_lines(
             tone: Tone::Muted,
             bold: false,
         });
-        let (glyph_tone, name_tone) = subagent_row_tones(subagent.selected);
+        let (glyph_tone, name_tone) = subagent_row_tones(subagent.selected, subagent.finished);
         let line = PaintLine {
             prefix,
             prefix_tone: glyph_tone,
@@ -16209,6 +16252,7 @@ mod tests {
                     weekly_percent: Some(43),
                     notice: None,
                     update_notice: None,
+                    background_tasks: None,
                 }),
                 "",
                 120,
@@ -17785,6 +17829,7 @@ mod tests {
                 weekly_percent: None,
                 notice: None,
                 update_notice: None,
+                background_tasks: None,
             }),
             "",
             80,
@@ -20133,6 +20178,92 @@ mod tests {
         assert_eq!(pick_on(&lines[3], "x"), Some(Pick::RemoveQueuedPrompt(3)));
     }
 
+    /// 상태 줄 끝의 작업 수는 순정의 알약처럼 눌러서 작업 창을 연다.
+    #[test]
+    fn the_status_line_counts_background_tasks_as_a_click_target() {
+        let line = status_line_row(
+            Some(StatusLineView {
+                agent: AgentMode::Standard,
+                shell_mode: false,
+                model: None,
+                effort: None,
+                fast: false,
+                context: None,
+                five_hour_percent: None,
+                five_hour_remaining: None,
+                weekly_percent: Some(37),
+                notice: None,
+                update_notice: None,
+                background_tasks: Some("2 shells".to_owned()),
+            }),
+            "",
+            100,
+            false,
+        );
+
+        assert!(painted(&line).contains("week: 37% | 2 shells"));
+        assert_eq!(pick_on(&line, "2 shells"), Some(Pick::BackgroundTasks));
+        assert_eq!(pick_on(&line, "week"), None);
+    }
+
+    /// 끝나 잠시 남은 줄은 점을 완료 색으로 칠하고, 보고 있으면 테마색이 이긴다.
+    #[test]
+    fn a_finished_subagent_row_wears_the_success_dot() {
+        let mut finished = test_subagent("Explore", "", "", 4);
+        finished.finished = true;
+        assert_eq!(subagent_line(&finished, 60).tone, Tone::Success);
+        let panel = side_panel_subagent_lines(&[finished.clone()], 44, true);
+        assert_eq!(panel[3].prefix_tone, Tone::Success);
+
+        finished.selected = true;
+        assert_eq!(subagent_line(&finished, 60).tone, Tone::Accent);
+    }
+
+    /// 하위 에이전트 보기는 웰컴 UI의 `DEVEZ VIBE` 자리에 하단 줄과 같은 이름·설명을
+    /// 세우고, `What's New`가 서는 줄부터 그 에이전트가 받은 프롬프트를 그린다.
+    #[test]
+    fn the_subagent_view_opens_like_the_welcome_masthead() {
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        let blocks = [Block::new(BlockKind::User, "claude:claude-opus-5-5", "Find auth code")];
+        renderer.update_subagent_view(
+            Some(&SubagentTranscript {
+                id: "toolu_1",
+                revision: 1,
+                blocks: &blocks,
+                name: "explore",
+                description: "Find auth code",
+            }),
+            80,
+        );
+        let lines = renderer.subagent_view_lines.clone().expect("body lines");
+        let welcome = welcome_lines(
+            WelcomeView {
+                provider: String::new(),
+                plan: String::new(),
+                credits: Vec::new(),
+                cwd: "D:/work".to_owned(),
+                account: String::new(),
+            },
+            80,
+            true,
+        );
+        let title_row = welcome
+            .iter()
+            .position(|line| painted(line).starts_with("DEVEZ VIBE"))
+            .expect("welcome title");
+        let news_row = welcome
+            .iter()
+            .position(|line| painted(line).contains("What's New"))
+            .expect("welcome news");
+
+        assert_eq!(painted(&lines[title_row]), "Explore · Find auth code");
+        assert!(lines[title_row].tone == Tone::Accent && lines[title_row].bold);
+        assert!(lines[..news_row].iter().enumerate().all(|(row, line)| {
+            row == title_row || paint_line_is_visually_blank(line)
+        }));
+        assert!(lines[news_row..] == renderer.history_block_lines(&blocks[0], 80)[..]);
+    }
+
     fn test_subagent(name: &str, description: &str, tool: &str, secs: u64) -> SubagentView {
         SubagentView {
             id: format!("toolu_{name}"),
@@ -20144,6 +20275,7 @@ mod tests {
             depth: 0,
             selected: false,
             viewable: false,
+            finished: false,
         }
     }
 
@@ -20401,7 +20533,7 @@ mod tests {
         };
 
         renderer.update_subagent_view(
-            Some(&SubagentTranscript { id: "toolu_1", revision: 1, blocks: &blocks }),
+            Some(&SubagentTranscript { id: "toolu_1", revision: 1, blocks: &blocks, name: "explore", description: "Find auth code" }),
             60,
         );
         assert_eq!(renderer.scroll_back, 0);
@@ -20412,7 +20544,7 @@ mod tests {
         );
 
         renderer.update_subagent_view(
-            Some(&SubagentTranscript { id: "toolu_1", revision: 1, blocks: &[] }),
+            Some(&SubagentTranscript { id: "toolu_1", revision: 1, blocks: &[], name: "explore", description: "Find auth code" }),
             60,
         );
         assert!(shown(&renderer));
@@ -20514,6 +20646,7 @@ mod tests {
                     weekly_percent: None,
                     notice: None,
                     update_notice: Some("Update available: 1.8.3 · dvz update or click here".to_owned()),
+                    background_tasks: None,
                 }),
                 diff_reference_lines: None,
                 side_panel_open: false,
@@ -24632,6 +24765,7 @@ mod tests {
                 weekly_percent: Some(34),
                 notice: Some("connected".to_owned()),
                 update_notice: None,
+                background_tasks: None,
             }),
             "",
             32,
@@ -24657,6 +24791,7 @@ mod tests {
                 weekly_percent: None,
                 notice: None,
                 update_notice: None,
+                background_tasks: None,
             }),
             "",
             80,
@@ -24684,6 +24819,7 @@ mod tests {
                 weekly_percent: None,
                 notice: None,
                 update_notice: None,
+                background_tasks: None,
             }),
             "",
             45,
@@ -24709,6 +24845,7 @@ mod tests {
                 weekly_percent: None,
                 notice: None,
                 update_notice: None,
+                background_tasks: None,
             }),
             "",
             100,
@@ -24735,6 +24872,7 @@ mod tests {
                 weekly_percent: None,
                 notice: None,
                 update_notice: None,
+                background_tasks: None,
             }),
             "",
             100,
@@ -24778,6 +24916,7 @@ mod tests {
                 weekly_percent: Some(34),
                 notice: None,
                 update_notice: None,
+                background_tasks: None,
             }),
             "",
             120,
@@ -24804,6 +24943,7 @@ mod tests {
                 weekly_percent: None,
                 notice: None,
                 update_notice: None,
+                background_tasks: None,
             })
         };
 
@@ -24834,6 +24974,7 @@ mod tests {
                 weekly_percent: None,
                 notice: None,
                 update_notice: None,
+                background_tasks: None,
             }),
             "",
             80,
@@ -24858,6 +24999,7 @@ mod tests {
                 weekly_percent: None,
                 notice: None,
                 update_notice: None,
+                background_tasks: None,
             }),
             "",
             80,
@@ -24886,6 +25028,7 @@ mod tests {
                 weekly_percent: Some(34),
                 notice: None,
                 update_notice: None,
+                background_tasks: None,
             }),
             "",
             80,
@@ -24933,6 +25076,7 @@ mod tests {
                 weekly_percent: None,
                 notice: None,
                 update_notice: None,
+                background_tasks: None,
             }),
             "",
             80,
@@ -27579,6 +27723,7 @@ mod tests {
                 weekly_percent: Some(34),
                 notice: None,
                 update_notice: None,
+                background_tasks: None,
             }),
             "",
             120,

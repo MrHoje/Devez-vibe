@@ -1657,6 +1657,12 @@ struct ApprovalChoice {
 }
 
 enum PendingInteraction {
+    /// 상태 줄의 작업 수를 눌러 연 순정의 Background tasks 창. `detail`이 있으면
+    /// 그 명령의 상태·명령문·출력을 보인다. 행은 명령이 끝나도 남도록 열 때 떠 둔다.
+    BackgroundTasks {
+        selected: usize,
+        detail: Option<SubagentView>,
+    },
     ModelPicker {
         model_index: usize,
         /// OpenCode exposes enough models to warrant live filtering. Other
@@ -3228,6 +3234,7 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
             | PendingInteraction::ClaudePermissionRuleInput { .. }
             | PendingInteraction::VibeModePicker { .. }
             | PendingInteraction::StatusLinePicker { .. }
+            | PendingInteraction::BackgroundTasks { .. }
             | PendingInteraction::SkillsPicker { .. }
             | PendingInteraction::SessionPicker(_)
             | PendingInteraction::HistoryPicker(_)
@@ -3735,6 +3742,10 @@ const SUBAGENT_LINGER_GRACE: Duration = Duration::from_secs(15);
 const CODEX_SUBAGENT_PROBE_FAILURE_LIMIT: u8 = 3;
 /// 오래 도는 Codex 하위 에이전트가 세션 내내 쌓지 않도록 본문용 항목은 이만큼만 둔다.
 const CODEX_SUBAGENT_ITEM_LIMIT: usize = 400;
+/// 순정 Claude Code가 끝난 에이전트 줄을 목록에 남겨 두는 시간.
+const SUBAGENT_FINISHED_LINGER: Duration = Duration::from_secs(30);
+/// 작업 창이 보여 줄 명령 출력의 마지막 줄 수.
+const BACKGROUND_TASK_OUTPUT_ROWS: usize = 8;
 
 #[derive(Clone)]
 struct ProviderIntegrationSnapshot {
@@ -4031,9 +4042,14 @@ pub struct AppState {
     side_panel_subagents_expanded: bool,
     /// 본문에 띄운 하위 에이전트 행 id. None이면 메인 대화를 본다.
     viewing_subagent: Option<String>,
-    /// 본문에 띄운 행의 마지막 모습. 그 하위 에이전트가 끝나 목록에서 빠져도
-    /// 이 행을 남겨 두어 무엇을 보고 있는지 알 수 있게 한다.
-    viewed_row: Option<SubagentView>,
+    /// 목록에서 빠진 에이전트 줄과 빠진 시각. 순정처럼 30초 더 보여 주고,
+    /// 본문에 띄운 줄은 보는 동안 남긴다.
+    finished_subagents: Vec<(SubagentView, Instant)>,
+    /// 작업 창에서 보는 명령의 마지막 출력과, 다시 물은 시각.
+    task_output: Option<(String, String)>,
+    task_output_requested_at: Option<Instant>,
+    /// 끝난 명령의 마지막 출력(종료 코드 포함)을 한 번 읽었는지.
+    task_output_settled: bool,
     /// 브리지가 기록을 지켜보는 하위 에이전트. 본문과 다르면 메인 루프가 맞춘다.
     watched_subagent: Option<String>,
     /// 띄운 하위 에이전트의 기록을 전사 블록으로 바꾼 것. 바뀔 때마다 판이 오른다.
@@ -4327,7 +4343,10 @@ impl AppState {
             side_panel_prompts_expanded: true,
             side_panel_subagents_expanded: true,
             viewing_subagent: None,
-            viewed_row: None,
+            finished_subagents: Vec::new(),
+            task_output: None,
+            task_output_requested_at: None,
+            task_output_settled: false,
             watched_subagent: None,
             subagent_view_blocks: Vec::new(),
             subagent_view_revision: 0,
@@ -7356,7 +7375,8 @@ impl AppState {
         self.codex_subagents.clear();
         self.codex_subagent_items.clear();
         self.viewing_subagent = None;
-        self.viewed_row = None;
+        self.finished_subagents.clear();
+        self.task_output = None;
         self.subagent_view_blocks.clear();
         self.subagents_settled_at = None;
         self.busy = false;
@@ -7614,18 +7634,42 @@ impl AppState {
             subagents: self
                 .subagents
                 .iter()
-                // 순정처럼 하위 에이전트가 띄운 백그라운드 작업은 줄로 그리지 않는다.
+                // 순정처럼 백그라운드 명령은 줄 대신 상태 줄의 작업 수로 센다.
                 // 바쁨 판정은 숨긴 행까지 센다.
-                .filter(|running| !(running.is_background_task && running.depth > 0))
+                .filter(|running| listed_subagent(running))
                 .map(|running| self.subagent_row(running))
-                .chain(self.viewed_row.clone().filter(|viewed| {
-                    !self.subagents.iter().any(|running| running.id == viewed.id)
-                }))
+                .chain(
+                    self.finished_subagents
+                        .iter()
+                        .filter(|(row, _)| {
+                            !self.subagents.iter().any(|running| running.id == row.id)
+                        })
+                        .map(|(row, _)| SubagentView {
+                            selected: self.viewing_subagent.as_deref() == Some(row.id.as_str()),
+                            ..row.clone()
+                        }),
+                )
                 .collect(),
-            subagent_view: self.viewing_subagent.as_deref().map(|id| SubagentTranscript {
-                id,
-                revision: self.subagent_view_revision,
-                blocks: &self.subagent_view_blocks,
+            subagent_view: self.viewing_subagent.as_deref().map(|id| {
+                let (name, description) = self
+                    .subagents
+                    .iter()
+                    .find(|running| running.id == id)
+                    .map(|running| (running.name.as_str(), running.description.as_str()))
+                    .or_else(|| {
+                        self.finished_subagents
+                            .iter()
+                            .find(|(row, _)| row.id == id)
+                            .map(|(row, _)| (row.name.as_str(), row.description.as_str()))
+                    })
+                    .unwrap_or_default();
+                SubagentTranscript {
+                    id,
+                    revision: self.subagent_view_revision,
+                    blocks: &self.subagent_view_blocks,
+                    name,
+                    description,
+                }
             }),
             artifacts: self
                 .artifacts
@@ -7739,7 +7783,8 @@ impl AppState {
                 metadata.terminal = true;
             }
         }
-        self.subagents.clear();
+        let before = std::mem::take(&mut self.subagents);
+        self.linger_finished_subagents(before);
         true
     }
 
@@ -7820,9 +7865,21 @@ impl AppState {
                 running.painted_elapsed_secs = elapsed;
                 subagent_elapsed_changed = true;
             }
-            if let Some(viewed) = self.viewed_row.as_mut().filter(|viewed| viewed.id == running.id) {
-                viewed.elapsed = running.started_at.elapsed();
-            }
+        }
+        let viewing = self.viewing_subagent.clone();
+        let lingering = self.finished_subagents.len();
+        self.finished_subagents.retain(|(row, finished_at)| {
+            viewing.as_deref() == Some(row.id.as_str())
+                || finished_at.elapsed() < SUBAGENT_FINISHED_LINGER
+        });
+        if self.finished_subagents.len() != lingering {
+            full_redraw = true;
+        }
+        // 작업 창이 보는 명령은 끝나도 마지막 실행 시간을 보이도록 도는 동안 따라간다.
+        if let Some(PendingInteraction::BackgroundTasks { detail: Some(row), .. }) = &mut self.pending
+            && let Some(running) = self.subagents.iter().find(|running| running.id == row.id)
+        {
+            row.elapsed = running.started_at.elapsed();
         }
         if self.sweep_settled_subagents() {
             full_redraw = true;
@@ -8904,9 +8961,12 @@ impl AppState {
             // so cancelling this question cannot target the preceding turn.
             self.flush_before_question();
         }
-        // 이력 창은 응답을 기다리며 열어 두는 창이고 초안을 건드리지 않으므로, 요청이
-        // 오면 닫고 그대로 처리한다.
-        if matches!(self.pending, Some(PendingInteraction::HistoryPicker(_))) {
+        // 이력 창과 작업 창은 응답을 기다리며 열어 두는 창이고 초안을 건드리지 않으므로,
+        // 요청이 오면 닫고 그대로 처리한다.
+        if matches!(
+            self.pending,
+            Some(PendingInteraction::HistoryPicker(_) | PendingInteraction::BackgroundTasks { .. })
+        ) {
             self.pending = None;
         }
         if self.pending.is_some() {
@@ -9507,7 +9567,12 @@ impl AppState {
             return;
         };
         metadata.terminal = true;
-        self.subagents.retain(|running| running.id != id);
+        let removed = self
+            .subagents
+            .iter()
+            .position(|running| running.id == id)
+            .map(|index| self.subagents.remove(index));
+        self.linger_finished_subagents(removed.into_iter().collect());
         self.subagents_settled_at = if self.subagents.is_empty() {
             None
         } else {
@@ -10153,6 +10218,7 @@ impl AppState {
                 }
             }
             "turn/subagents/updated" => {
+                let before = std::mem::take(&mut self.subagents);
                 self.subagents = params
                     .get("subagents")
                     .and_then(Value::as_array)
@@ -10160,7 +10226,7 @@ impl AppState {
                     .flatten()
                     .filter_map(|entry| {
                         let id = entry.get("id").and_then(Value::as_str)?;
-                        let previous = self.subagents.iter().find(|running| running.id == id);
+                        let previous = before.iter().find(|running| running.id == id);
                         let started_at = previous
                             .map(|running| running.started_at)
                             .unwrap_or_else(Instant::now);
@@ -10198,6 +10264,7 @@ impl AppState {
                         })
                     })
                     .collect();
+                self.linger_finished_subagents(before);
                 // 갱신이 온 순간부터 유예를 다시 센다. 턴이 도는 중에는 유예를
                 // 걸지 않고, 빈 목록이면 지울 것도 없다.
                 self.subagents_settled_at =
@@ -12056,6 +12123,35 @@ impl AppState {
                 });
                 Action::None
             }
+            PendingInteraction::BackgroundTasks { mut selected, detail } => {
+                // 목록이 줄어도 선택은 남은 명령 안에 둔다.
+                selected = selected.min(self.background_tasks().len().saturating_sub(1));
+                match (detail, key.code) {
+                    (_, KeyCode::Esc) => Action::None,
+                    (Some(_), KeyCode::Left | KeyCode::Backspace) => {
+                        self.pending =
+                            Some(PendingInteraction::BackgroundTasks { selected, detail: None });
+                        Action::None
+                    }
+                    (None, KeyCode::Enter) => self.open_background_task_detail(selected),
+                    (None, KeyCode::Up | KeyCode::Char('k')) if !ctrl && !alt => {
+                        selected = selected.saturating_sub(1);
+                        self.pending =
+                            Some(PendingInteraction::BackgroundTasks { selected, detail: None });
+                        Action::None
+                    }
+                    (None, KeyCode::Down | KeyCode::Char('j')) if !ctrl && !alt => {
+                        selected = (selected + 1).min(self.background_tasks().len().saturating_sub(1));
+                        self.pending =
+                            Some(PendingInteraction::BackgroundTasks { selected, detail: None });
+                        Action::None
+                    }
+                    (detail, _) => {
+                        self.pending = Some(PendingInteraction::BackgroundTasks { selected, detail });
+                        Action::None
+                    }
+                }
+            }
             PendingInteraction::StatusLinePicker { mut selected } => match key.code {
                 KeyCode::Esc => Action::None,
                 KeyCode::Enter => Action::None,
@@ -13193,6 +13289,9 @@ impl AppState {
                     input_label: "",
                     input_placeholder: "",
                 })
+            }
+            PendingInteraction::BackgroundTasks { selected, detail } => {
+                Some(self.background_tasks_overlay(*selected, detail.as_ref()))
             }
             PendingInteraction::StatusLinePicker { selected } => Some(OverlayView {
                 closable: true,
@@ -14478,6 +14577,7 @@ impl AppState {
                 .flatten(),
             notice: self.transient_status.clone(),
             update_notice: self.update_notice.clone(),
+            background_tasks: background_task_summary(&self.background_tasks()),
         }
     }
 
@@ -14488,6 +14588,8 @@ impl AppState {
             .any(|field| self.status_line_settings.enabled(*field))
             || self.transient_status.is_some()
             || self.update_notice.is_some()
+            // 백그라운드 명령은 줄 대신 상태 줄의 작업 수로만 보이므로 다른 항목을 다 꺼도 남긴다.
+            || !self.background_tasks().is_empty()
     }
 
     /// Second step of `/model`: the picked model's effort, on the `/effort`
@@ -15030,13 +15132,15 @@ impl AppState {
         if self.viewing_subagent == id {
             return Action::None;
         }
-        self.viewed_row = id.as_ref().and_then(|id| {
-            let running = self.subagents.iter().find(|running| &running.id == id)?;
-            Some(SubagentView {
-                selected: true,
-                ..self.subagent_row(running)
-            })
-        });
+        // 보다가 나온 끝난 줄은 순정처럼 그때부터 30초 뒤에 거둔다.
+        if let Some(previous) = self.viewing_subagent.as_deref()
+            && let Some((_, finished_at)) = self
+                .finished_subagents
+                .iter_mut()
+                .find(|(row, _)| row.id == previous)
+        {
+            *finished_at = Instant::now();
+        }
         self.viewing_subagent = id;
         self.subagent_view_blocks.clear();
         self.subagent_view_revision += 1;
@@ -15057,6 +15161,218 @@ impl AppState {
             // OpenCode 하위 에이전트는 띄울 기록을 받지 못한다.
             viewable: !running.is_background_task
                 && !crate::open_code::is_open_code_model(self.selected_model_name()),
+            finished: false,
+        }
+    }
+
+    /// 목록에서 빠진 줄을 순정처럼 끝난 줄로 30초 더 남긴다.
+    fn linger_finished_subagents(&mut self, before: Vec<RunningSubagent>) {
+        for running in before {
+            if !listed_subagent(&running)
+                || self.subagents.iter().any(|row| row.id == running.id)
+            {
+                continue;
+            }
+            let row = SubagentView {
+                finished: true,
+                ..self.subagent_row(&running)
+            };
+            self.finished_subagents.retain(|(old, _)| old.id != row.id);
+            self.finished_subagents.push((row, Instant::now()));
+        }
+    }
+
+    /// 상태 줄의 작업 수와 작업 창이 세는 백그라운드 명령. 하위 에이전트가 띄운 것도 센다.
+    fn background_tasks(&self) -> Vec<&RunningSubagent> {
+        self.subagents
+            .iter()
+            .filter(|running| !listed_subagent(running))
+            .collect()
+    }
+
+    /// 상태 줄의 작업 수를 눌렀을 때 순정의 Background tasks 창을 연다. 답을
+    /// 기다리는 창이 떠 있으면 그 창을 덮지 않는다.
+    pub fn open_background_tasks(&mut self) -> Action {
+        if self.pending.is_some() {
+            return Action::None;
+        }
+        self.pending = Some(PendingInteraction::BackgroundTasks {
+            selected: 0,
+            detail: None,
+        });
+        Action::Tick(true)
+    }
+
+    fn open_background_task_detail(&mut self, selected: usize) -> Action {
+        let detail = self
+            .background_tasks()
+            .get(selected)
+            .map(|running| self.subagent_row(running));
+        if detail.is_some() {
+            self.task_output = None;
+            self.task_output_requested_at = None;
+            self.task_output_settled = false;
+        }
+        self.pending = Some(PendingInteraction::BackgroundTasks { selected, detail });
+        Action::None
+    }
+
+    /// 작업 창이 명령 출력을 보이는 동안 1초마다 다시 물을 명령 id.
+    pub fn take_task_output_request(&mut self) -> Option<String> {
+        let Some(PendingInteraction::BackgroundTasks {
+            detail: Some(row), ..
+        }) = &self.pending
+        else {
+            return None;
+        };
+        if self
+            .task_output_requested_at
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(1))
+        {
+            return None;
+        }
+        // 끝난 명령은 종료 코드가 붙은 마지막 출력을 한 번만 더 읽는다.
+        if !self.subagents.iter().any(|running| running.id == row.id) {
+            if self.task_output_settled {
+                return None;
+            }
+            self.task_output_settled = true;
+        }
+        let id = row.id.clone();
+        self.task_output_requested_at = Some(Instant::now());
+        Some(id)
+    }
+
+    /// 받은 출력을 상세 화면에 둔다. 출력 파일이 사라져 빈 글이 와도 이미 받은 출력은 덮지 않는다.
+    pub fn set_task_output(&mut self, id: &str, output: String) {
+        let viewing = matches!(
+            &self.pending,
+            Some(PendingInteraction::BackgroundTasks { detail: Some(row), .. }) if row.id == id
+        );
+        let keeps_previous = output.is_empty()
+            && self
+                .task_output
+                .as_ref()
+                .is_some_and(|(previous, text)| previous == id && !text.is_empty());
+        if viewing && !keeps_previous {
+            self.task_output = Some((id.to_owned(), output));
+        }
+    }
+
+    /// 끝난 명령의 작업 id를 몰라 출력이 오지 않았을 때. 기다릴 출력이 더 없으므로 빈 출력으로
+    /// 둔다. 도는 명령은 작업 id가 곧 오므로 그대로 기다린다. 다시 그릴지 알린다.
+    pub fn task_output_missing(&mut self, id: &str) -> bool {
+        if self.subagents.iter().any(|running| running.id == id)
+            || self.task_output.as_ref().is_some_and(|(previous, _)| previous == id)
+        {
+            return false;
+        }
+        self.set_task_output(id, String::new());
+        self.task_output.is_some()
+    }
+
+    /// 출력을 읽지 못했을 때. 응답 없는 브리지를 매초 기다리지 않도록 5초 뒤에 다시 묻고,
+    /// 아직 받은 출력이 없을 때만 그 사실을 보인다. 다시 그릴지 알린다.
+    pub fn task_output_failed(&mut self, id: &str) -> bool {
+        self.task_output_requested_at = Some(Instant::now() + Duration::from_secs(4));
+        if self.task_output.as_ref().is_some_and(|(previous, _)| previous == id) {
+            return false;
+        }
+        self.set_task_output(
+            id,
+            tr("출력을 읽지 못했습니다.", "Couldn't read the output.").to_owned(),
+        );
+        self.task_output.is_some()
+    }
+
+    fn background_tasks_overlay(&self, selected: usize, detail: Option<&SubagentView>) -> OverlayView<'_> {
+        let line = |text: String, muted: bool| OverlayLine {
+            text,
+            selected: false,
+            muted,
+        };
+        let Some(row) = detail else {
+            let selected = selected.min(self.background_tasks().len().saturating_sub(1));
+            let mut lines = self
+                .background_tasks()
+                .iter()
+                .enumerate()
+                .map(|(index, running)| OverlayLine {
+                    text: format!(
+                        "{} · {}",
+                        background_task_command(&running.name, &running.description),
+                        format_elapsed(running.started_at.elapsed().as_secs())
+                    ),
+                    selected: index == selected,
+                    muted: false,
+                })
+                .collect::<Vec<_>>();
+            if lines.is_empty() {
+                lines.push(line(
+                    tr("실행 중인 작업이 없습니다", "No tasks currently running").to_owned(),
+                    true,
+                ));
+            }
+            return OverlayView {
+                closable: true,
+                title: "Background tasks".to_owned(),
+                lines,
+                slider: None,
+                hint: "↑↓ select  ·  Enter view  ·  Esc close".to_owned(),
+                style: OverlayStyle::Picker,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            };
+        };
+        let monitor = row.name == "Monitor";
+        let output = self
+            .task_output
+            .as_ref()
+            .filter(|(id, _)| *id == row.id)
+            .map(|(_, output)| output.as_str());
+        // 끝난 명령은 순정처럼 출력 끝의 종료 코드로 성공·실패를 가른다.
+        let status = if self.subagents.iter().any(|running| running.id == row.id) {
+            "running".to_owned()
+        } else {
+            match output.and_then(background_task_exit_code) {
+                Some(0) => "completed (exit code: 0)".to_owned(),
+                Some(code) => format!("failed (exit code: {code})"),
+                None => "finished".to_owned(),
+            }
+        };
+        let mut lines = vec![
+            line(format!("Status: {status}"), false),
+            line(format!("Runtime: {}", format_elapsed(row.elapsed.as_secs())), false),
+            line(
+                format!(
+                    "{} {}",
+                    if monitor { "Script:" } else { "Command:" },
+                    background_task_command(&row.name, &row.description)
+                ),
+                false,
+            ),
+            line(String::new(), false),
+            line("Output:".to_owned(), false),
+        ];
+        match output {
+            None => lines.push(line(tr("출력을 불러오는 중…", "Loading output…").to_owned(), true)),
+            Some(output) => lines.extend(
+                background_task_output_lines(output)
+                    .into_iter()
+                    .map(|text| line(text, true)),
+            ),
+        }
+        OverlayView {
+            closable: true,
+            title: if monitor { "Monitor details" } else { "Shell details" }.to_owned(),
+            lines,
+            slider: None,
+            hint: "← back  ·  Esc close".to_owned(),
+            style: OverlayStyle::Picker,
+            input: None,
+            input_label: "",
+            input_placeholder: "",
         }
     }
 
@@ -15330,6 +15646,11 @@ impl AppState {
                         Action::Tick(false)
                     }
                 }
+            }
+            Some(PendingInteraction::BackgroundTasks { detail: None, .. })
+                if row < self.background_tasks().len() =>
+            {
+                self.open_background_task_detail(row)
             }
             Some(PendingInteraction::StatusLinePicker { .. })
                 if row < StatusLineField::ALL.len() =>
@@ -18209,6 +18530,79 @@ fn append_capped(target: &mut String, delta: &str) {
             .unwrap_or(keep_from);
         target.replace_range(..boundary, "…\n");
     }
+}
+
+/// 하단 목록에 서는 행. 순정처럼 백그라운드 명령은 줄 대신 상태 줄의 작업 수로 세고,
+/// 워크플로는 줄로 둔다.
+fn listed_subagent(running: &RunningSubagent) -> bool {
+    !running.is_background_task || running.name == "Workflow"
+}
+
+/// 순정 Claude Code가 상태 줄에 백그라운드 작업을 세는 말. 셸과 모니터만 있으면
+/// `2 shells, 1 monitor`처럼 나눠 세고, 다른 종류가 섞이면 `3 background tasks`로 센다.
+fn background_task_summary(tasks: &[&RunningSubagent]) -> Option<String> {
+    let count = tasks.len();
+    if count == 0 {
+        return None;
+    }
+    let monitors = tasks.iter().filter(|task| task.name == "Monitor").count();
+    let shells = tasks.iter().filter(|task| task.name == "Bash").count();
+    if shells + monitors < count {
+        return Some(format!(
+            "{count} background {}",
+            if count == 1 { "task" } else { "tasks" }
+        ));
+    }
+    let mut parts = Vec::new();
+    if shells > 0 {
+        parts.push(if shells == 1 { "1 shell".to_owned() } else { format!("{shells} shells") });
+    }
+    if monitors > 0 {
+        parts.push(if monitors == 1 { "1 monitor".to_owned() } else { format!("{monitors} monitors") });
+    }
+    Some(parts.join(", "))
+}
+
+/// 명령이 끝나면 출력 끝에 붙는 `[exited with code N]`의 N.
+fn background_task_exit_code(output: &str) -> Option<i64> {
+    output
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())?
+        .trim()
+        .strip_prefix("[exited with code ")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+
+/// 작업 창이 명령 줄에 보일 글. 설명이 없으면 종류 이름을 쓴다.
+fn background_task_command(name: &str, description: &str) -> String {
+    let description = description.trim();
+    if description.is_empty() { name.to_owned() } else { description.to_owned() }
+}
+
+/// 작업 창에 보일 출력의 끝부분. 제어 문자를 빼고, 터미널처럼 `\r` 뒤의 글자만 남긴다.
+fn background_task_output_lines(output: &str) -> Vec<String> {
+    let mut lines = strip_ansi(output)
+        .lines()
+        .map(|line| {
+            line.rsplit('\r')
+                .next()
+                .unwrap_or_default()
+                .replace('\t', "    ")
+                .chars()
+                .filter(|ch| !ch.is_control())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        return vec![tr("(출력 없음)", "(no output)").to_owned()];
+    }
+    lines.split_off(lines.len().saturating_sub(BACKGROUND_TASK_OUTPUT_ROWS))
 }
 
 /// Removes ANSI escape sequences from captured command output. Codex runs the
@@ -22589,11 +22983,16 @@ mod tests {
                 { "id": "legacy", "name": "Workflow" }
             ]
         }));
+        // 순정처럼 백그라운드 명령은 줄 대신 상태 줄의 작업 수로 센다.
         let rows = state.view().subagents;
-        assert!(rows[0].is_background_task);
-        assert_eq!(rows[0].description, "npm test");
-        assert!(!rows[1].is_background_task);
-        assert!(!rows[2].is_background_task);
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["agent", "legacy"]
+        );
+        assert!(rows.iter().all(|row| !row.is_background_task));
+        assert!(state.subagents[0].is_background_task);
+        assert_eq!(state.subagents[0].description, "npm test");
+        assert_eq!(state.status_line().background_tasks.as_deref(), Some("1 shell"));
         // Rows from a bridge without parent links all sit at the top level.
         assert!(rows.iter().all(|row| row.depth == 0));
         state.handle_notification("turn/subagents/updated", &json!({
@@ -22603,11 +23002,13 @@ mod tests {
                 { "id": "shell", "name": "Bash", "backgroundTask": true, "depth": 1 }
             ]
         }));
-        // A subagent's own background task gets no row, but still keeps the host busy.
+        // A subagent's own background task gets no row, but still keeps the host busy
+        // and counts in the status line like the CLI's own pill.
         assert_eq!(
-            state.view().subagents.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            running_rows(&state).iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
             ["agent", "nested"]
         );
+        assert_eq!(state.status_line().background_tasks.as_deref(), Some("1 shell"));
         assert_eq!(state.subagents.len(), 3);
         assert!(state.host_children_busy());
         state.handle_notification("turn/subagents/updated", &json!({
@@ -22622,7 +23023,7 @@ mod tests {
         state.handle_notification("turn/subagents/updated", &json!({
             "subagents": [{ "id": "shell", "name": "review changes", "backgroundTask": false }]
         }));
-        assert!(!state.view().subagents[0].is_background_task);
+        assert!(!running_rows(&state)[0].is_background_task);
         assert_eq!(state.subagents[0].started_at, started_at);
     }
 
@@ -22657,7 +23058,7 @@ mod tests {
 
         state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
 
-        assert!(state.view().subagents.is_empty());
+        assert!(running_rows(&state).is_empty());
         assert!(!state.host_children_busy());
     }
 
@@ -22680,7 +23081,7 @@ mod tests {
 
         state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
 
-        assert!(state.view().subagents.is_empty());
+        assert!(running_rows(&state).is_empty());
         assert!(state.subagents_settled_at.is_none());
     }
 
@@ -22868,7 +23269,7 @@ mod tests {
                 "turn": { "id": "child-turn", "status": "completed" }
             }),
         );
-        assert!(state.view().subagents.is_empty());
+        assert!(running_rows(&state).is_empty());
         assert!(state.codex_subagents[child].terminal);
     }
 
@@ -22911,7 +23312,7 @@ mod tests {
             );
 
             assert!(
-                state.view().subagents.is_empty(),
+                running_rows(&state).is_empty(),
                 "terminal event {method} must remove the row"
             );
         }
@@ -22919,7 +23320,7 @@ mod tests {
         let mut state = test_state();
         spawn_codex_subagent(&mut state, child);
         state.handle_notification("item/completed", &codex_activity(child, "interrupted"));
-        assert!(state.view().subagents.is_empty());
+        assert!(running_rows(&state).is_empty());
     }
 
     #[test]
@@ -22940,7 +23341,7 @@ mod tests {
                 "status": { "type": "active", "activeFlags": [] }
             }),
         );
-        assert!(state.view().subagents.is_empty());
+        assert!(running_rows(&state).is_empty());
 
         state.handle_notification(
             "turn/started",
@@ -22980,7 +23381,7 @@ mod tests {
             );
 
             assert!(
-                state.view().subagents.is_empty(),
+                running_rows(&state).is_empty(),
                 "terminal state {terminal} must remove the row"
             );
         }
@@ -23028,7 +23429,7 @@ mod tests {
                 }
             }),
         );
-        assert!(state.view().subagents.is_empty());
+        assert!(running_rows(&state).is_empty());
     }
 
     #[test]
@@ -23042,7 +23443,7 @@ mod tests {
                 &json!({ "threadId": child, "status": { "type": status } }),
             );
             assert!(
-                state.view().subagents.is_empty(),
+                running_rows(&state).is_empty(),
                 "terminal status {status} must remove the row"
             );
         }
@@ -23050,7 +23451,7 @@ mod tests {
         spawn_codex_subagent(&mut state, child);
         assert_eq!(state.view().subagents.len(), 1);
         state.handle_notification("thread/closed", &json!({ "threadId": child }));
-        assert!(state.view().subagents.is_empty());
+        assert!(running_rows(&state).is_empty());
     }
 
     #[test]
@@ -23076,11 +23477,11 @@ mod tests {
         state.subagents_settled_at = Some(Instant::now() - SUBAGENT_LINGER_GRACE);
         assert_eq!(state.take_codex_subagent_probes(), [child]);
         assert!(state.resolve_codex_subagent_probe(child, Some(false)));
-        assert!(state.view().subagents.is_empty());
+        assert!(running_rows(&state).is_empty());
         assert!(state.codex_subagents[child].terminal);
 
         state.handle_notification("item/completed", &codex_activity(child, "started"));
-        assert!(state.view().subagents.is_empty());
+        assert!(running_rows(&state).is_empty());
     }
 
     #[test]
@@ -23097,7 +23498,7 @@ mod tests {
             assert_eq!(removed, attempt == CODEX_SUBAGENT_PROBE_FAILURE_LIMIT);
         }
 
-        assert!(state.view().subagents.is_empty());
+        assert!(running_rows(&state).is_empty());
         assert!(state.codex_subagents[child].terminal);
     }
 
@@ -23187,8 +23588,13 @@ mod tests {
         state.editor.set_text("next");
         state.handle_key(KeyEvent::from(KeyCode::Enter));
         assert!(state.view().subagent_view.is_none());
-        assert!(state.view().subagents.is_empty());
         assert_eq!(state.take_subagent_watch_change(), Some(None));
+        // 보다가 나온 끝난 줄은 순정처럼 30초 더 남았다가 사라진다.
+        let rows = state.view().subagents;
+        assert!(rows.len() == 1 && rows[0].finished && !rows[0].selected);
+        state.finished_subagents[0].1 -= SUBAGENT_FINISHED_LINGER;
+        assert!(state.render_tick().redraw);
+        assert!(state.view().subagents.is_empty());
     }
 
     /// 보는 중 Esc는 순정처럼 메인으로 돌아올 뿐 진행 중인 턴을 멈추지 않는다.
@@ -23223,6 +23629,322 @@ mod tests {
         let view = state.view();
         let blocks = view.subagent_view.expect("the child is in the body").blocks;
         assert!(blocks.iter().any(|block| block.body.contains("child says hi")));
+    }
+
+    /// 순정처럼 백그라운드 명령은 상태 줄의 작업 수로 세고, 그 수를 누르면 명령 목록이,
+    /// 명령을 고르면 상태·명령문·출력이 뜬다. ←는 목록으로, Esc는 창을 닫는다.
+    #[test]
+    fn the_background_task_count_opens_a_task_window_with_the_command_output() {
+        let mut state = test_state();
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({
+                "subagents": [
+                    { "id": "shell", "name": "Bash", "backgroundTask": true, "description": "npm run dev" },
+                    { "id": "watch", "name": "Monitor", "backgroundTask": true, "description": "tail log" },
+                ]
+            }),
+        );
+        assert!(state.view().subagents.is_empty(), "no rows and so no `main` either");
+        assert_eq!(
+            state.status_line().background_tasks.as_deref(),
+            Some("1 shell, 1 monitor")
+        );
+
+        assert!(matches!(state.open_background_tasks(), Action::Tick(true)));
+        let overlay = state.view().overlay.expect("the task window is open");
+        assert_eq!(overlay.title, "Background tasks");
+        assert!(overlay.lines[0].text.starts_with("npm run dev · ") && overlay.lines[0].selected);
+        assert!(overlay.lines[1].text.starts_with("tail log · "));
+
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(state.take_task_output_request().as_deref(), Some("shell"));
+        assert_eq!(state.take_task_output_request(), None, "asked again only after a second");
+        let overlay = state.view().overlay.expect("the shell details");
+        assert_eq!(overlay.title, "Shell details");
+        assert_eq!(overlay.lines[0].text, "Status: running");
+        assert_eq!(overlay.lines[2].text, "Command: npm run dev");
+        assert_eq!(overlay.lines.last().map(|line| line.text.as_str()), Some("출력을 불러오는 중…"));
+
+        state.set_task_output("watch", "not this one".to_owned());
+        state.set_task_output("shell", "ready\r\n\u{1b}[32mlistening\u{1b}[0m on 3000\n".to_owned());
+        let texts = state
+            .view()
+            .overlay
+            .expect("the shell details")
+            .lines
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+        assert_eq!(texts[texts.len() - 2..], ["ready", "listening on 3000"]);
+
+        // 끝나 목록에서 빠져도 보던 명령은 마지막 출력과 함께 남는다.
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
+        assert_eq!(state.status_line().background_tasks, None);
+        let overlay = state.view().overlay.expect("the shell details stay");
+        assert_eq!(overlay.lines[0].text, "Status: finished");
+        assert!(overlay.lines.iter().any(|line| line.text == "listening on 3000"));
+
+        state.handle_key(KeyEvent::from(KeyCode::Left));
+        let overlay = state.view().overlay.expect("back on the list");
+        assert_eq!(overlay.lines[0].text, "실행 중인 작업이 없습니다");
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(state.view().overlay.is_none());
+    }
+
+    /// 작업 창은 지켜보려고 열어 두는 창이라, 승인이나 질문이 오면 닫고 그 요청을 띄운다.
+    #[test]
+    fn a_server_request_closes_the_task_window_instead_of_being_refused() {
+        let mut state = test_state();
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({ "subagents": [{ "id": "shell", "name": "Bash", "backgroundTask": true }] }),
+        );
+        state.open_background_tasks();
+
+        state.begin_server_request(
+            json!(1),
+            "item/tool/requestUserInput",
+            &json!({
+                "questions": [{
+                    "id": "q1",
+                    "question": "어느 것인가요?",
+                    "header": "대상",
+                    "options": [{ "label": "첫째", "description": "설명" }]
+                }]
+            }),
+        );
+
+        assert!(matches!(state.pending, Some(PendingInteraction::UserInput { .. })));
+    }
+
+    /// 상태 줄 항목을 모두 꺼도 백그라운드 명령이 돌면 작업 수가 보인다.
+    #[test]
+    fn the_task_count_keeps_the_status_line_when_every_field_is_off() {
+        let mut state = test_state();
+        for field in StatusLineField::ALL {
+            if state.status_line_settings.enabled(field) {
+                state.toggle_status_line_field(field);
+            }
+        }
+        assert!(!state.status_line_has_content());
+
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({ "subagents": [{ "id": "shell", "name": "Bash", "backgroundTask": true }] }),
+        );
+
+        assert!(state.status_line_has_content());
+        let line = state.status_line();
+        assert_eq!(line.background_tasks.as_deref(), Some("1 shell"));
+        assert!(line.model.is_none() && line.context.is_none());
+    }
+
+    /// 목록이 줄면 선택은 남은 명령으로 옮기고, 읽지 못한 출력과 끝난 뒤의 빈 출력은
+    /// 화면을 비우지 않으며, 끝난 명령은 마지막 출력을 한 번만 더 읽는다.
+    #[test]
+    fn the_task_window_survives_a_shrinking_list_and_an_ended_command() {
+        let mut state = test_state();
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({
+                "subagents": [
+                    { "id": "a", "name": "Bash", "backgroundTask": true, "description": "first" },
+                    { "id": "b", "name": "Bash", "backgroundTask": true, "description": "second" },
+                ]
+            }),
+        );
+        state.open_background_tasks();
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({ "subagents": [{ "id": "a", "name": "Bash", "backgroundTask": true, "description": "first" }] }),
+        );
+        assert!(state.view().overlay.expect("the list").lines[0].selected);
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(state.take_task_output_request().as_deref(), Some("a"));
+
+        assert!(state.task_output_failed("a"));
+        assert_eq!(
+            state.view().overlay.expect("details").lines.last().map(|line| line.text.clone()),
+            Some("출력을 읽지 못했습니다.".to_owned())
+        );
+        assert_eq!(state.take_task_output_request(), None, "a failed read waits longer");
+        state.set_task_output("a", "built".to_owned());
+        assert!(!state.task_output_failed("a"), "output already shown stays");
+
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
+        state.task_output_requested_at = None;
+        assert_eq!(state.take_task_output_request().as_deref(), Some("a"));
+        state.set_task_output("a", String::new());
+        let lines = state.view().overlay.expect("details").lines;
+        assert_eq!(lines.last().map(|line| line.text.as_str()), Some("built"));
+        state.task_output_requested_at = None;
+        assert_eq!(state.take_task_output_request(), None, "an ended command is read once");
+    }
+
+    /// 작업 id를 모르는 끝난 명령은 불러오는 중에 머물지 않고 출력 없음으로 끝난다.
+    #[test]
+    fn an_ended_command_without_output_stops_loading() {
+        let mut state = test_state();
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({ "subagents": [{ "id": "shell", "name": "Bash", "backgroundTask": true }] }),
+        );
+        state.open_background_tasks();
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(!state.task_output_missing("shell"), "a running command keeps waiting");
+
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
+
+        assert!(state.task_output_missing("shell"));
+        let lines = state.view().overlay.expect("details").lines;
+        assert_eq!(lines.last().map(|line| line.text.as_str()), Some("(출력 없음)"));
+    }
+
+    /// 끝난 명령은 순정처럼 출력 끝의 종료 코드로 completed·failed를 가른다.
+    #[test]
+    fn a_finished_background_task_reports_its_exit_code() {
+        let mut state = test_state();
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({ "subagents": [{ "id": "shell", "name": "Bash", "backgroundTask": true }] }),
+        );
+        state.open_background_tasks();
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
+        let status = |state: &AppState| state.view().overlay.expect("details").lines[0].text.clone();
+        assert_eq!(status(&state), "Status: finished");
+
+        state.set_task_output("shell", "built\n\n[exited with code 2]\n".to_owned());
+        assert_eq!(status(&state), "Status: failed (exit code: 2)");
+        state.set_task_output("shell", "built\n[exited with code 0]\n".to_owned());
+        assert_eq!(status(&state), "Status: completed (exit code: 0)");
+        assert_eq!(background_task_exit_code("[exited with code x]"), None);
+    }
+
+    /// 작업 창의 명령 줄은 마우스로도 눌러 연다. 모니터는 Script로 보인다.
+    #[test]
+    fn a_click_on_a_background_task_opens_its_details() {
+        let mut state = test_state();
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({
+                "subagents": [
+                    { "id": "shell", "name": "Bash", "backgroundTask": true, "description": "npm run dev" },
+                    { "id": "watch", "name": "Monitor", "backgroundTask": true, "description": "tail log" },
+                ]
+            }),
+        );
+        state.open_background_tasks();
+
+        state.click_overlay_row(1);
+
+        let overlay = state.view().overlay.expect("the monitor details");
+        assert_eq!(overlay.title, "Monitor details");
+        assert_eq!(overlay.lines[2].text, "Script: tail log");
+        assert_eq!(state.take_task_output_request().as_deref(), Some("watch"));
+    }
+
+    /// 답을 기다리는 창이 떠 있으면 작업 수를 눌러도 그 창을 덮지 않는다.
+    #[test]
+    fn the_task_window_never_covers_a_pending_panel() {
+        let mut state = test_state();
+        state.pending = Some(PendingInteraction::StatusLinePicker { selected: 0 });
+
+        assert!(matches!(state.open_background_tasks(), Action::None));
+        assert!(matches!(
+            state.pending,
+            Some(PendingInteraction::StatusLinePicker { .. })
+        ));
+    }
+
+    /// 상태 줄의 작업 수는 순정 Claude Code와 같은 말로 센다.
+    #[test]
+    fn the_background_task_count_reads_like_the_cli_pill() {
+        let task = |name: &str| RunningSubagent {
+            id: name.to_owned(),
+            name: name.to_owned(),
+            is_background_task: true,
+            description: String::new(),
+            tool: String::new(),
+            started_at: Instant::now(),
+            painted_elapsed_secs: 0,
+            depth: 0,
+        };
+        let (shell, monitor, other) = (task("Bash"), task("Monitor"), task("mcp_task"));
+
+        assert_eq!(background_task_summary(&[]), None);
+        assert_eq!(background_task_summary(&[&shell]).as_deref(), Some("1 shell"));
+        assert_eq!(background_task_summary(&[&shell, &shell]).as_deref(), Some("2 shells"));
+        assert_eq!(
+            background_task_summary(&[&shell, &monitor]).as_deref(),
+            Some("1 shell, 1 monitor")
+        );
+        assert_eq!(
+            background_task_summary(&[&monitor, &monitor]).as_deref(),
+            Some("2 monitors")
+        );
+        assert_eq!(
+            background_task_summary(&[&shell, &other]).as_deref(),
+            Some("2 background tasks")
+        );
+        assert_eq!(
+            background_task_summary(&[&other]).as_deref(),
+            Some("1 background task")
+        );
+    }
+
+    /// 출력 끝부분은 색 코드와 제어 문자를 빼고, `\r`로 덮어쓴 줄은 마지막 글자만 남긴다.
+    #[test]
+    fn background_task_output_keeps_the_last_plain_lines() {
+        assert_eq!(background_task_output_lines(""), ["(출력 없음)"]);
+        assert_eq!(
+            background_task_output_lines("a\r\n50%\r100%\u{1b}[0m\tok\n\n"),
+            ["a", "100%    ok"]
+        );
+        let long = (0..20).map(|n| n.to_string()).collect::<Vec<_>>().join("\n");
+        let tail = background_task_output_lines(&long);
+        assert_eq!(tail.len(), BACKGROUND_TASK_OUTPUT_ROWS);
+        assert_eq!(tail.last().map(String::as_str), Some("19"));
+    }
+
+    /// 보고 있는 끝난 줄은 보는 동안 남고, 나온 뒤 30초가 지나야 사라진다.
+    #[test]
+    fn a_viewed_finished_subagent_stays_until_thirty_seconds_after_leaving() {
+        let mut state = state_with_a_running_subagent();
+        state.view_subagent(Some("toolu_1".to_owned()));
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
+        let rows = state.view().subagents;
+        assert!(rows.len() == 1 && rows[0].finished && rows[0].selected);
+
+        state.finished_subagents[0].1 -= SUBAGENT_FINISHED_LINGER;
+        state.render_tick();
+        assert_eq!(state.view().subagents.len(), 1, "kept while it is viewed");
+
+        state.view_subagent(None);
+        state.render_tick();
+        assert_eq!(state.view().subagents.len(), 1, "the 30 seconds start on leaving");
+
+        state.finished_subagents[0].1 -= SUBAGENT_FINISHED_LINGER;
+        state.render_tick();
+        assert!(state.view().subagents.is_empty());
+    }
+
+    /// 보기 머리줄은 하단 줄과 같은 이름·설명을 쓴다.
+    #[test]
+    fn the_subagent_view_names_the_agent_it_shows() {
+        let mut state = state_with_a_running_subagent();
+        state.view_subagent(Some("toolu_1".to_owned()));
+
+        let view = state.view();
+        let transcript = view.subagent_view.expect("the body shows the subagent");
+        assert_eq!((transcript.name, transcript.description), ("Explore", "Find auth code"));
+    }
+
+    /// 끝나 잠시 남은 줄을 뺀, 지금 도는 하위 에이전트 줄.
+    fn running_rows(state: &AppState) -> Vec<SubagentView> {
+        state.view().subagents.into_iter().filter(|row| !row.finished).collect()
     }
 
     fn state_with_a_running_subagent() -> AppState {

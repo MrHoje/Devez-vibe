@@ -2398,6 +2398,10 @@ async fn event_loop(
             action => execute_action(server, state, renderer, &management_tx, action).await?,
         };
         sync_subagent_watch(server, state).await;
+        // 새 출력은 조용한 회차에 와도 다시 그리고, 부분 갱신으로 넘기지 않는다.
+        let output_arrived = sync_task_output(server, state).await;
+        animation_tick &= !output_arrived;
+        let redraw = redraw || output_arrived;
         if returning_from_side {
             side_exit_key_guard = Some(Instant::now() + SIDE_EXIT_KEY_SETTLE);
         }
@@ -2697,6 +2701,7 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
             Action::Tick(true)
         }
         Pick::ViewSubagent(id) => state.view_subagent(id),
+        Pick::BackgroundTasks => state.open_background_tasks(),
         Pick::SubagentSection => {
             state.toggle_side_panel_subagents();
             Action::Tick(true)
@@ -7260,6 +7265,27 @@ async fn sync_subagent_watch(server: &BackendServer, state: &mut AppState) {
             .await
     {
         state.push_notice(BlockKind::Error, "Subagent view failed", error.to_string());
+    }
+}
+
+/// 작업 창이 명령 출력을 보이는 동안 그 출력 끝부분을 다시 읽어 온다. 읽지 못한
+/// 회차는 넘기고 다음 회차에 다시 묻는다. 출력을 받았으면 true다.
+async fn sync_task_output(server: &BackendServer, state: &mut AppState) -> bool {
+    let Some(id) = state.take_task_output_request() else {
+        return false;
+    };
+    const TASK_OUTPUT_TIMEOUT: Duration = Duration::from_secs(2);
+    let request = server.request("task/output", json!({ "threadId": state.thread_id, "id": id }));
+    match timeout(TASK_OUTPUT_TIMEOUT, request).await {
+        Ok(Ok(response)) => match response.get("output").and_then(Value::as_str) {
+            Some(output) => {
+                state.set_task_output(&id, output.to_owned());
+                true
+            }
+            None => state.task_output_missing(&id),
+        },
+        // 응답이 늦거나 거부되면 화면을 멈추지 않고 읽지 못했다고만 보인다.
+        _ => state.task_output_failed(&id),
     }
 }
 

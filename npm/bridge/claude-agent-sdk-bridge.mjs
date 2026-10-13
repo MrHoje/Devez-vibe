@@ -3050,6 +3050,10 @@ function emitSubagents(session) {
     clearInterval(session.subagentPulse);
     session.subagentPulse = null;
   }
+  // 작업 창은 명령이 끝난 뒤에도 그 출력과 종료 코드를 읽으므로 행 id의 작업 id를 남겨 둔다.
+  for (const agent of session.subagents.values()) {
+    if (agent.taskId) (session.rowTaskIds ??= new Map()).set(agent.id, agent.taskId);
+  }
   notify("turn/subagents/updated", {
     threadId: session.id,
     turnId: session.turn?.id,
@@ -4464,6 +4468,17 @@ async function dispatch(method, params = {}) {
       nextCursor: null,
     };
   }
+  // 작업 창이 보는 백그라운드 명령의 출력 끝부분(최대 8KiB). 끝난 명령도 남겨 둔 작업 id로
+  // 마지막 출력을 읽는다. 작업 id를 모르면 출력 없이 답해, 화면이 받은 출력을 그대로 두게 한다.
+  if (method === "session/taskOutput") {
+    const session = lookupSession(params.sessionId);
+    const id = String(params.id || "");
+    const taskId = (session && (findSubagent(session, id)?.taskId || session.rowTaskIds?.get(id)))
+      || (id.startsWith("task:") ? id.slice(5) : "");
+    if (!session || !taskId || typeof session.query.getTaskOutput !== "function") return {};
+    const result = await session.query.getTaskOutput(taskId);
+    return { output: String(result?.output ?? "") };
+  }
   if (method === "session/watchSubagent") {
     const session = lookupSession(params.sessionId);
     if (session) watchSubagent(session, params.id ? String(params.id) : null);
@@ -4919,6 +4934,27 @@ async function runSelfTest() {
     .flatMap((turn) => turn.items)
     .some((item) => item.type === "userMessage" && item.content?.[0]?.text === "subagent");
   if (!subagentPrompt) throw new Error("Claude subagent transcript self-test failed");
+  // 작업 창의 출력은 행 id가 아니라 SDK 작업 id로 읽는다. 작업 id를 모르면 출력 없이 답한다.
+  const outputReads = [];
+  const outputSession = {
+    id: "task-output-self-test",
+    query: { async getTaskOutput(taskId) { outputReads.push(taskId); return { output: "tick 3\n" }; } },
+    subagents: new Map([
+      ["toolu_shell", { id: "toolu_shell", toolUseId: "toolu_shell", taskId: "bash-1" }],
+      ["toolu_pending", { id: "toolu_pending", toolUseId: "toolu_pending", taskId: "" }],
+    ]),
+    rowTaskIds: new Map([["toolu_done", "bash-3"]]),
+  };
+  sessions.set(outputSession.id, outputSession);
+  const shellOutput = await dispatch("session/taskOutput", { sessionId: outputSession.id, id: "toolu_shell" });
+  const placeholderOutput = await dispatch("session/taskOutput", { sessionId: outputSession.id, id: "task:bash-2" });
+  const unknownOutput = await dispatch("session/taskOutput", { sessionId: outputSession.id, id: "toolu_pending" });
+  await dispatch("session/taskOutput", { sessionId: outputSession.id, id: "toolu_done" });
+  sessions.delete(outputSession.id);
+  if (shellOutput.output !== "tick 3\n" || outputReads.join() !== "bash-1,bash-2,bash-3" || "output" in unknownOutput
+    || placeholderOutput.output !== "tick 3\n") {
+    throw new Error(`Claude task output self-test failed: ${outputReads}`);
+  }
   // 끝나서 작업 id를 모르는 행도 meta 파일의 toolUseId로 그 기록을 찾는다.
   const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
   const configDir = join(tmpdir(), `devez-subagent-self-test-${randomUUID()}`);
