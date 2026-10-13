@@ -2686,8 +2686,9 @@ function resumeBackgroundSubagent(session, toolUseId, pending, result) {
   if (existing) return true;
   const known = session.knownSubagents.get(taskId);
   const input = pending?.input || {};
+  // 끝난 줄과 같은 id로 돌아와야 호스트가 같은 작업의 idle 줄과 실행 줄을 함께 세우지 않는다.
   const running = {
-    id: toolUseId,
+    id: known?.rowId || toolUseId,
     toolUseId,
     taskId,
     background: true,
@@ -2697,8 +2698,9 @@ function resumeBackgroundSubagent(session, toolUseId, pending, result) {
     startedAt: Date.now(),
     lastSeenAt: Date.now(),
   };
-  session.subagents.set(toolUseId, running);
+  session.subagents.set(running.id, running);
   session.knownSubagents.set(taskId, {
+    rowId: running.id,
     name: running.name,
     description: running.description,
     backgroundTask: false,
@@ -2777,6 +2779,8 @@ function upsertStructuredSubagent(session, message) {
   }
   if (toolUseId) running.toolUseId = toolUseId;
   if (taskId) running.taskId = taskId;
+  const runId = firstLine(message.run_id || "", 80);
+  if (runId && !isLateRun(running, runId)) running.runId = runId;
   // 스크립트 Monitor는 local_bash 작업으로 와서 스냅숏 이름이 Bash가 된다.
   if (session.tools?.get(toolUseId)?.name === "Monitor") running.name = "Monitor";
   const parentTaskId = firstLine(message.parent_task_id || "", 80);
@@ -2786,10 +2790,12 @@ function upsertStructuredSubagent(session, message) {
   if (subagentType || isSubagentTaskType(message.task_type)) running.backgroundTask = false;
   running.lastSeenAt = Date.now();
   if (running.taskId) {
+    const known = session.knownSubagents.get(running.taskId);
     session.knownSubagents.set(running.taskId, {
       rowId: running.id,
       name: running.name,
-      description: running.description,
+      // 진행 요약으로 바뀐 설명이 아니라 호출 설명을 기억해, 다시 실행된 줄이 그 설명으로 돌아오게 한다.
+      description: known?.description || running.description,
       backgroundTask: running.backgroundTask === true,
     });
   }
@@ -2798,6 +2804,12 @@ function upsertStructuredSubagent(session, message) {
 
 function hasLiveChildren(session, taskId) {
   return !!taskId && [...session.subagents.values()].some((agent) => agent.parentTaskId === taskId);
+}
+
+// 같은 작업의 실행 id는 열린 순서대로 문자열 정렬된다. 지금 행보다 앞선 실행의
+// 통지는 늦게 도착한 것이라 새 실행의 행을 지우면 안 된다.
+function isLateRun(running, runId) {
+  return Boolean(runId && running.runId && runId < running.runId);
 }
 
 function finishStructuredSubagent(session, message) {
@@ -2814,7 +2826,8 @@ function finishStructuredSubagent(session, message) {
     || (taskId && findSubagent(session, taskId));
   if (!running) return wasHidden;
   // 자기 백그라운드 명령을 기다리며 멈춘 에이전트는 그 명령이 끝나면 다시 돌므로 행을 남긴다.
-  if (hasLiveChildren(session, running.taskId)) return true;
+  if (hasLiveChildren(session, running.taskId)
+    || isLateRun(running, firstLine(message.run_id || "", 80))) return true;
   session.subagents.delete(running.id);
   emitSubagents(session);
   return true;
@@ -3129,6 +3142,7 @@ function taskNotifications(message) {
       toolUseId: notificationTag(body, "tool-use-id"),
       status: notificationTag(body, "status"),
       summary: notificationTag(body, "summary"),
+      runId: firstLine(message.origin?.runId || "", 80),
     });
   }
   return notifications;
@@ -3156,7 +3170,8 @@ function finishNotifiedSubagents(session, notifications) {
           .find((agent) => agent.background && agent.name === name);
       }
     }
-    if (!running) continue;
+    if (!running || isLateRun(running, notification.runId)
+      || hasLiveChildren(session, running.taskId)) continue;
     session.subagents.delete(running.id);
     emitSubagents(session);
   }
@@ -6010,8 +6025,10 @@ async function runSelfTest() {
       message: { content: [{ type: "tool_result", tool_use_id: "toolu_2", content: "resumed" }] },
       tool_use_result: { success: true, resumedAgentId: "agent-1" },
     });
-    const resumed = lifecycleSession.subagents.get("toolu_2");
-    if (!resumed?.background || resumed.taskId !== "agent-1" || resumed.name !== "Explore") {
+    // 재개된 줄은 끝난 줄과 같은 id(처음 Agent 호출 id)로 돌아오고, SendMessage 호출 id로도 찾힌다.
+    const resumed = lifecycleSession.subagents.get("toolu_1");
+    if (!resumed?.background || resumed.taskId !== "agent-1" || resumed.name !== "Explore"
+      || findSubagent(lifecycleSession, "toolu_2") !== resumed) {
       throw new Error(`Claude resumed subagent self-test failed: ${JSON.stringify(resumed)}`);
     }
     finishTurn(lifecycleSession, null, 1);
@@ -6161,36 +6178,56 @@ async function runSelfTest() {
     }
     clearSubagents(nestedSession);
     // 자기 백그라운드 명령을 기다리며 멈춘 에이전트는 그 명령이 도는 동안 행을 지킨다.
-    processSubagentSystemMessage(nestedSession, {
-      type: "system",
-      subtype: "task_started",
-      task_id: "agent-wait",
-      tool_use_id: "toolu_wait",
-      task_type: "local_agent",
-      subagent_type: "general-purpose",
-    });
-    nestedSession.subagents.get("toolu_wait").background = true;
+    // SDK 순서(접수 결과, task_started, 스냅숏, task_updated·task_notification, 스냅숏,
+    // XML 통지)를 그대로 재생하고, 다시 실행된 뒤 늦게 온 첫 실행 통지도 무시한다.
     const waitSnapshot = (tasks) => processSubagentSystemMessage(nestedSession, {
       type: "system",
       subtype: "background_tasks_changed",
       tasks,
     });
-    waitSnapshot([{ task_id: "shell-wait", task_type: "local_bash", description: "sleep 300", parent_task_id: "agent-wait" }]);
-    processSubagentSystemMessage(nestedSession, {
+    const waitStructured = (subtype, extra) => processSubagentSystemMessage(nestedSession, {
       type: "system",
-      subtype: "task_notification",
+      subtype,
       task_id: "agent-wait",
-      status: "completed",
+      ...extra,
     });
+    const waitXml = (runId) => finishNotifiedSubagents(nestedSession, taskNotifications({
+      origin: { kind: "task-notification", runId },
+      message: { content: [{ type: "text", text: "<task-notification><task-id>agent-wait</task-id><status>completed</status><summary>Agent \"general-purpose\" finished</summary></task-notification>" }] },
+    }));
+    const agentRow = { task_id: "agent-wait", task_type: "local_agent", description: "wait" };
+    const shellRow = { task_id: "shell-wait", task_type: "local_bash", description: "sleep 300", parent_task_id: "agent-wait" };
+    startSubagent(nestedSession, { id: "toolu_wait", input: { description: "대기", subagent_type: "general-purpose" } });
+    keepBackgroundSubagent(nestedSession, "toolu_wait", { isAsync: true, agentId: "agent-wait" });
+    waitStructured("task_started", { tool_use_id: "toolu_wait", task_type: "local_agent", is_backgrounded: true, run_id: "r1" });
+    waitSnapshot([agentRow, shellRow]);
+    waitStructured("task_updated", { patch: { status: "completed" } });
+    waitStructured("task_notification", { status: "completed", run_id: "r1" });
+    waitSnapshot([shellRow]);
+    waitXml("r1");
     const waitingKept = nestedSession.subagents.has("toolu_wait");
     waitSnapshot([]);
-    if (!waitingKept || nestedSession.subagents.size !== 0) {
-      throw new Error(`Claude waiting subagent self-test failed: ${waitingKept} ${nestedSession.subagents.size}`);
+    const settledAfterChild = !nestedSession.subagents.has("toolu_wait");
+    waitStructured("task_started", { task_type: "local_agent", is_backgrounded: true, run_id: "r2" });
+    waitXml("r1");
+    const keptAgainstLate = nestedSession.subagents.has("toolu_wait");
+    waitStructured("task_notification", { status: "completed", run_id: "r2" });
+    if (!waitingKept || !settledAfterChild || !keptAgainstLate || nestedSession.subagents.size !== 0) {
+      throw new Error(`Claude waiting subagent self-test failed: ${waitingKept} ${settledAfterChild} ${keptAgainstLate} ${nestedSession.subagents.size}`);
     }
     clearSubagents(nestedSession);
     // 끝난 뒤 SDK가 같은 작업을 다시 돌리면 설명 없는 새 줄이 아니라 같은 줄로 돌아온다.
     startSubagent(nestedSession, { id: "toolu_again", input: { description: "3분 대기", subagent_type: "general-purpose" } });
     keepBackgroundSubagent(nestedSession, "toolu_again", { isAsync: true, agentId: "agent-again" });
+    // 진행 요약이 설명을 바꿔도 다시 실행된 줄은 호출 설명으로 돌아온다.
+    for (let tick = 0; tick < 2; tick += 1) {
+      processSubagentSystemMessage(nestedSession, {
+        type: "system",
+        subtype: "task_progress",
+        task_id: "agent-again",
+        summary: "로그를 살피는 중",
+      });
+    }
     waitSnapshot([]);
     processSubagentSystemMessage(nestedSession, {
       type: "system",

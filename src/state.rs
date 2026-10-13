@@ -5670,6 +5670,9 @@ impl AppState {
     }
 
     pub fn attach_local_image(&mut self, path: String) {
+        if self.viewing_subagent.is_some() {
+            return;
+        }
         let before = self.composer_snapshot();
         if !self
             .composer_images
@@ -7708,7 +7711,8 @@ impl AppState {
             },
             cwd: self.cwd.clone(),
             welcome: self.show_welcome.then(|| self.welcome_view()),
-            suggestions: if self.pending.is_none() && !self.shell_mode {
+            // 하위 에이전트를 보는 동안에는 컴포저와 함께 제안 목록도 숨긴다.
+            suggestions: if self.pending.is_none() && !self.shell_mode && self.viewing_subagent.is_none() {
                 self.completion_suggestion_views().unwrap_or_else(|| {
                     let agents = self.agent_suggestion_views();
                     if agents.is_empty() {
@@ -7864,12 +7868,15 @@ impl AppState {
         let animating = self.busy || self.compacting() || self.host_loading;
         // A background Claude agent outlives its parent turn. Its elapsed label
         // changes once a second, so only that boundary asks for a full frame.
+        // 목록에서 숨긴 백그라운드 명령은 작업 창이 열려 있을 때만 경과 초가 보이므로,
+        // 그 밖에는 쉬는 동안 화면 전체를 다시 그리지 않는다.
+        let tasks_open = matches!(self.pending, Some(PendingInteraction::BackgroundTasks { .. }));
         let mut subagent_elapsed_changed = false;
         for running in &mut self.subagents {
             let elapsed = running.started_at.elapsed().as_secs();
             if running.painted_elapsed_secs != elapsed {
                 running.painted_elapsed_secs = elapsed;
-                subagent_elapsed_changed = true;
+                subagent_elapsed_changed |= tasks_open || listed_subagent(running);
             }
         }
         let viewing = self.viewing_subagent.clone();
@@ -8042,6 +8049,9 @@ impl AppState {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
+        if self.viewing_subagent.is_some() {
+            return;
+        }
         let before = self.composer_snapshot();
         self.handle_inserted_text(text, true);
         self.record_composer_edit(before);
@@ -8064,6 +8074,9 @@ impl AppState {
     /// Buffered composer text belongs to the draft that owned its key even if a
     /// server prompt opened before the short classification delay expired.
     pub fn handle_buffered_composer_text(&mut self, text: &str, pasted: bool) {
+        if self.viewing_subagent.is_some() {
+            return;
+        }
         let before = self.composer_snapshot();
         self.disarm_quit();
         let old_text = self.editor.text();
@@ -8506,9 +8519,13 @@ impl AppState {
                 || (self.suggestions_dismissed_text.as_deref() != Some(self.editor.text().as_str())
                     && self.matching_slash_commands().len() + self.matching_slash_skills().len() > 0));
         // 하위 에이전트를 보는 중 Esc는 순정처럼 메인 대화로 돌아올 뿐, 입력을 지우거나
-        // 진행 중인 턴을 멈추지 않는다.
-        if key.code == KeyCode::Esc && !suggestions_open && self.viewing_subagent.is_some() {
+        // 진행 중인 턴을 멈추지 않는다. 보는 동안 제안 목록은 숨으므로 목록보다 먼저 받는다.
+        if key.code == KeyCode::Esc && self.viewing_subagent.is_some() {
             return self.view_subagent(None);
+        }
+        // 보는 동안에는 컴포저가 숨어 있으므로 중단·종료(Ctrl+C) 말고는 입력을 받지 않는다.
+        if self.viewing_subagent.is_some() && !(ctrl && key.code == KeyCode::Char('c')) {
+            return Action::None;
         }
         if key.code == KeyCode::Esc && !self.busy && !suggestions_open {
             if !self.editor.is_empty() || !self.composer_images.is_empty() {
@@ -23622,7 +23639,8 @@ mod tests {
     }
 
     /// 줄을 누르면 그 하위 에이전트 기록이 본문에 뜨고, 끝나 목록에서 빠져도 보고 있는
-    /// 행은 남는다. 입력을 보내면 메인 대화로 돌아오고 브리지도 그만 지켜본다.
+    /// 행은 남는다. 보는 동안은 컴포저가 숨어 입력·전송을 받지 않고, Esc로 메인에
+    /// 돌아오면 브리지도 그만 지켜본다.
     #[test]
     fn clicking_a_subagent_row_shows_its_transcript_until_main_is_back() {
         let mut state = state_with_a_running_subagent();
@@ -23653,8 +23671,12 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(rows[0].selected);
 
-        state.editor.set_text("next");
+        state.handle_key(KeyEvent::from(KeyCode::Char('x')));
+        state.handle_paste("pasted");
         state.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(state.editor.is_empty() && state.view().subagent_view.is_some());
+
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
         assert!(state.view().subagent_view.is_none());
         assert_eq!(state.take_subagent_watch_change(), Some(None));
         // 보다가 나온 끝난 줄은 순정처럼 30초 더 남았다가 사라진다.
@@ -23663,6 +23685,19 @@ mod tests {
         state.finished_subagents[0].1 -= SUBAGENT_FINISHED_LINGER;
         assert!(state.render_tick().redraw);
         assert!(state.view().subagents.is_empty());
+    }
+
+    /// 제안 목록이 열린 채로 하위 에이전트를 보아도 목록은 숨고, Esc 한 번에 메인으로 돌아온다.
+    #[test]
+    fn esc_leaves_a_subagent_view_even_with_suggestions_open() {
+        let mut state = state_with_a_running_subagent();
+        state.editor.set_text("/");
+        assert!(!state.view().suggestions.is_empty());
+        state.view_subagent(Some("toolu_1".to_owned()));
+        assert!(state.view().suggestions.is_empty());
+
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(state.view().subagent_view.is_none());
     }
 
     /// 보는 중 Esc는 순정처럼 메인으로 돌아올 뿐 진행 중인 턴을 멈추지 않는다.
@@ -24040,6 +24075,8 @@ mod tests {
         state.handle_notification("turn/subagents/updated", &rows(json!([])));
         let view = state.view();
         assert!(view.subagents.len() == 1 && view.subagents[0].finished);
+        // 30초 남는 끝난 줄은 DevezCode 방 상태를 바쁨으로 붙잡지 않는다.
+        assert!(!state.host_children_busy());
 
         // 같은 작업이 다시 돌면 끝난 줄이 그 자리로 돌아오고 경과 시간을 이어 센다.
         state.finished_subagents[0].0.elapsed = Duration::from_secs(190);
@@ -24081,6 +24118,25 @@ mod tests {
         assert!(!tick.animation_only);
         // The row's dot is static, so it waits for the next elapsed second.
         assert!(!state.render_tick().redraw);
+    }
+
+    /// 목록에서 숨긴 백그라운드 명령만 돌 때는 쉬는 동안 초마다 다시 그리지 않고,
+    /// 경과 시간을 보이는 작업 창이 열려 있을 때만 다시 그린다.
+    #[test]
+    fn a_hidden_background_command_redraws_only_while_the_tasks_window_is_open() {
+        let mut state = test_state();
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({ "subagents": [{ "id": "task:b1", "name": "Bash", "backgroundTask": true }] }),
+        );
+        state.busy = false;
+        state.subagents_settled_at = None;
+        state.subagents[0].started_at = Instant::now() - Duration::from_secs(5);
+        assert!(!state.render_tick().redraw);
+
+        state.open_background_tasks();
+        state.subagents[0].started_at = Instant::now() - Duration::from_secs(9);
+        assert!(state.render_tick().redraw);
     }
 
     #[test]

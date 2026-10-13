@@ -483,7 +483,11 @@ mod tests {
         assert!(builder.contains("replaces the previous role's response-length rules"));
         // 한국어 강제는 `/language`를 따르는 응답 언어 묶음에만 둔다.
         for mode in choices() {
-            assert!(!mode.render_turn_block().contains("한국어"), "{}", mode.id());
+            let block = mode.render_turn_block();
+            assert!(!block.contains("한국어") && !block.contains("Korean"), "{}", mode.id());
+            for guide in mode.guides() {
+                assert!(!guide.body.contains("Korean"), "{}", guide.name);
+            }
         }
         assert!(builder.contains("Answer simple questions and completion reports briefly"));
         assert!(builder.contains("Answer only what was asked"));

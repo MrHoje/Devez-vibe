@@ -18,7 +18,7 @@ After review, check assumptions/defaults and conflicts with earlier plans/specs 
 
 After preparing a real plan for execution, use exactly one single-select question for the host's automatic handoff. A request only to report supplied records does not enter this handoff workflow:
 - header: `Planner Handoff` (internal; displayed as 계획 실행 확인).
-- question: Korean goal and approval summary first; a separate `계획 문서:` line with the saved path verbatim, wrapped in backticks; no other backticked plan path. End with `Goal Runner로 이어서 진행할까요?`.
+- question: goal and approval summary first, in the user's language; a separate `계획 문서:` line with the saved path verbatim, wrapped in backticks; no other backticked plan path. End with `Goal Runner로 이어서 진행할까요?`.
 - options in order: `Goal Runner로 실행`, `계획 다듬기`, `여기서 중단`.
 Offer execution only with confirmed latest requirements, OKAY review, no architecture BLOCK and no unresolved 의도 조정. Otherwise omit execution and offer refining/stopping with reasons.
 Execution approval lets the host switch roles and start the follow-up; end this turn without implementing. Without the question tool ask in chat and explain manual switching via Tab or `/agent goal-runner`. Never start implementation in Planner.

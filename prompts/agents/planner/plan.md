@@ -6,7 +6,7 @@ Split independent subsystems into independently verifiable plans; identify the c
 
 ## Plan document
 
-Write in Korean; keep technical identifiers, exact values, code and commands verbatim. Use the following sections; mark an inapplicable section with its reason rather than invent content.
+Write in the user's language; keep technical identifiers, exact values, code and commands verbatim. Use the following sections; mark an inapplicable section with its reason rather than invent content.
 
 ```markdown
 # <기능명> 구현 계획

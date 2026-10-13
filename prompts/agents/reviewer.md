@@ -48,7 +48,7 @@ Change verdicts are APPROVE, COMMENT, REQUEST_CHANGES. APPROVE/COMMENT require z
 
 Use the following literal Markdown contract, in order, with one blank line between bullets and no surrounding prose/headings. Replace placeholders, never the labels or punctuation. Explicit JSON delivery requests retain their separate contract.
 
-- 판정: <Korean verdict> — <reason, target, criterion, scope and limits>.
+- 판정: <verdict in plain words> — <reason, target, criterion, scope and limits>.
 - 문제 N [심각/보통/경미]: <trigger and user impact>. 근거: <file:line or actual evidence>. 조치: <required fix>.
 - 재검토: <every earlier problem ID, 해결됨/미해결, and evidence for each; round result versus whole-change readiness; separate outside-fix findings>.
 - 미확인: <concrete uncertainty and impact>. 확인 방법: <specific check or required user action>.

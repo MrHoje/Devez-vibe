@@ -1,6 +1,6 @@
 ## Classify and investigate
 
-Before questioning, announce one classification and its reason in Korean:
+Before questioning, announce one classification and its reason in the user's language:
 - 가능성 조사 (Spike): the intended output is feasibility evidence, not retained code. Investigate read-only, answer in two or three sentences with what a throwaway probe would test; write no plan.
 - 기존 기능 개선 (Bounded): a scoped change to an existing flow you can inspect. The requirements interview is mandatory; only the design gate is skipped.
 - 구조 설계 (Architectural): a new subsystem/project, restructuring, or shared interface change. Requires interview and approved design.

@@ -2583,12 +2583,6 @@ fn renderer_mouse_action(
     on_click: impl FnOnce(MouseClick) -> Action,
 ) -> Action {
     let request = mouse_request(mouse);
-    // 이동 이벤트 없이 클릭만 전달하는 터미널에서도 같은 강조를 적용한다.
-    let hovered = if let MouseRequest::SelectionStart(column, row) = request {
-        renderer.hover_at(column, row)
-    } else {
-        false
-    };
     // Some embedded terminals deliver the press but swallow the matching
     // release.  Chrome controls must not depend on that release: activate a
     // known pick as soon as it is pressed, while plain text keeps the normal
@@ -2601,7 +2595,7 @@ fn renderer_mouse_action(
     {
         let cleared = renderer.clear_selection();
         return match on_click(MouseClick::Pick(pick)) {
-            Action::Tick(changed) => Action::Tick(changed || cleared || hovered),
+            Action::Tick(changed) => Action::Tick(changed || cleared),
             action => action,
         };
     }
@@ -5439,7 +5433,7 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "Keep technical identifiers verbatim in Updated Plan explanations and task titles.\n",
     "Answer format:\n",
     "- Put one blank line between paragraphs and between bullet items. When the topic changes, start a new paragraph or bullet instead of only breaking the line. Keep the line spacing inside code blocks and tables.\n",
-    "- Lead with the conclusion, in bullets and code blocks. No preamble, greetings, closing summaries, or emoji. Restate item names, statuses, verdicts, and other agents' reports in plain words; keep verdict codes only in internal records with their own format. Verdict codes are not an exception for preserving identifiers or quotes, even inside parentheses.\n",
+    "- Lead with the conclusion, in bullets and code blocks. No preamble, greetings, closing summaries, or emoji. Restate item names, statuses, verdicts, and other agents' reports in plain words; keep verdict codes only in internal records with their own format. Verdict codes are not identifiers or quotes to keep verbatim; restate them in plain words even inside parentheses.\n",
     "- One issue per bullet; explain the user impact and the required action first. Use technical identifiers, paths, commands, and code minimally, only when the user asked or they are needed to judge a cause, impact, scope, or execution.\n",
     "- Cut duplication, but do not remove spacing or squeeze different issues together. Keep the evidence, unverified scope, and follow-ups a decision needs.\n",
     "- Length follows the current role's rules; roles other than Builder have no character, bullet, or sentence caps. Explanations of choices and approvals give the options, outcomes, and reasoning in full with no length cap.\n",
@@ -5471,7 +5465,7 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- Set each task in_progress before its first Read/Grep/Glob/Bash and completed right after it ends. Only one task is in progress at a time; do not complete several tasks at once just before finishing.\n",
     "Answers:\n",
     "- Put one blank line between paragraphs and between bullet items. When the topic changes, start a new paragraph or bullet instead of only breaking the line. Keep the line spacing inside code blocks and tables.\n",
-    "- Lead with the conclusion, in bullets and code blocks. No preamble, greetings, closing summaries, or emoji. Restate item names, statuses, verdicts, and other agents' reports in plain words; keep verdict codes only in internal records with their own format. Verdict codes are not an exception for preserving identifiers or quotes, even inside parentheses.\n",
+    "- Lead with the conclusion, in bullets and code blocks. No preamble, greetings, closing summaries, or emoji. Restate item names, statuses, verdicts, and other agents' reports in plain words; keep verdict codes only in internal records with their own format. Verdict codes are not identifiers or quotes to keep verbatim; restate them in plain words even inside parentheses.\n",
     "- One issue per bullet; write the user impact and the required action first. Use technical identifiers, paths, commands, and code minimally, only when the user asked or they are needed to judge a cause, impact, scope, or execution.\n",
     "- Cut duplication, but do not remove spacing or squeeze different issues together. Keep the evidence, unverified scope, and follow-ups a decision needs.\n",
     "- Length follows the current role's rules; roles other than Builder have no character, bullet, or sentence caps. Explanations of choices and approvals give the options, outcomes, and reasoning in full with no length cap.\n",
@@ -5499,7 +5493,7 @@ const CLAUDE_TURN_REMINDER: &str = "Lead with the user impact and the required a
 const KOREAN_RESPONSE_RULES: &str = concat!(
     "최우선 한국어 응답 규칙:\n",
     "- 진행·도구 앞뒤 문장·최종 답변, 작업 목록·계획의 제목과 설명, 하위 에이전트의 description과 prompt는 한국어로 쓴다. 기술 식별자와 사용자가 그대로 인용한 문자열만 예외다.\n",
-    "- 사용자에게 보이는 문장의 첫 글자는 불릿·번호 등 마크다운 기호를 제외하고 한글 음절이어야 한다. 영어 낱말로 시작해 한국어를 잇거나 영어로 도구 결과를 판정하지 않으며 일본어·중국어·영어 문장을 섞지 않는다.\n",
+    "- 사용자에게 보이는 문장의 첫 글자는 불릿·번호 등 마크다운 기호를 제외하고 한글 음절이어야 한다. 영어 낱말로 시작해 한국어를 잇거나 영어로 도구 결과를 판정하지 않으며 일본어·중국어·영어 문장을 섞지 않는다. 출력 전에 기술 식별자가 아닌 영어를 한국어로 바꾼다.\n",
     "- 항목명·상태·판정과 다른 에이전트의 보고도 쉬운 한국어로 풀고, 판정 코드는 괄호 안에서도 한국어 판정으로 바꾼다.\n",
     "- 실제 변경을 마친 마지막 문장은 `~했습니다.`로 끝내고 `~한 내용을 완료했습니다.` 같은 겹친 명사절은 피한다.",
 );
