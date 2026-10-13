@@ -473,12 +473,12 @@ fn codex_invocation(resolved: &Path, args: &[&str]) -> Command {
 
 const TITLE_INSTRUCTIONS: &str =
     "Write a title for a conversation that begins with the user request below.
-Use the language of the request, about 20 characters including spaces, no quotes or trailing punctuation.
+Use the language of the request, about 15 characters including spaces, no quotes or trailing punctuation.
 Reply with the title only. Do not run commands or use tools.";
 /// Enough of a long first prompt to say what it is about.
 const TITLE_PROMPT_CHARS: usize = 2_000;
-/// Titles aim at about 20 characters; this only stops a reply that ignored it.
-const TITLE_CHARS: usize = 30;
+/// Titles aim at about 15 characters; this only stops a reply that ignored it.
+const TITLE_CHARS: usize = 20;
 
 /// What both runtimes are asked to title a new session from.
 pub(crate) fn title_request(prompt: &str) -> String {
@@ -1270,14 +1270,14 @@ mod tests {
             clean_title(&"가".repeat(80)).map(|title| title.chars().count()),
             Some(TITLE_CHARS)
         );
-        // About 20 is asked for; only a reply far past it is cut, at a space.
+        // About 15 is asked for; only a reply far past it is cut, at a space.
         assert_eq!(
-            clean_title("세션 자동 이름 및 rename 기능 추가").as_deref(),
-            Some("세션 자동 이름 및 rename 기능 추가")
+            clean_title("세션 자동 이름과 rename 추가").as_deref(),
+            Some("세션 자동 이름과 rename 추가")
         );
         assert_eq!(
             clean_title("Fix the login flow for OAuth users on Windows").as_deref(),
-            Some("Fix the login flow for OAuth")
+            Some("Fix the login flow")
         );
     }
 

@@ -7135,6 +7135,12 @@ async fn start_or_resume_thread(
         // `--effort` is the one effort that outranks the thread's own record.
         if let Some(effort) = effort.filter(|effort| !effort.is_empty()) {
             params["effort"] = json!(effort);
+            // Codex reads a resume's effort only from `config`, and any override
+            // reopens the thread on config.toml for the rest: `--model` alone
+            // drops the recorded effort, `config` alone the recorded model.
+            if model.is_some() {
+                params["config"] = json!({ "model_reasoning_effort": effort });
+            }
         }
         if let Some(cwd) = resume_cwd {
             params["cwd"] = json!(cwd.to_string_lossy());
