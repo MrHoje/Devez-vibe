@@ -209,6 +209,39 @@ impl SessionStreams {
         (self.subagents.len() != before).then(|| self.subagents_notification(session_id))
     }
 
+    /// OpenCode 2 starts the subagent call with empty input and names the agent
+    /// in a later update, so the row takes its name from there.
+    fn subagent_described(&mut self, session_id: &str, update: &Value) -> Option<Notification> {
+        if update.get("name").and_then(Value::as_str) != Some("subagent") {
+            return None;
+        }
+        let described = subagent_entry(update)?;
+        let entry = self
+            .subagents
+            .iter_mut()
+            .find(|entry| entry.get("id") == described.get("id"))?;
+        if entry.get("name") == described.get("name")
+            && entry.get("description") == described.get("description")
+        {
+            return None;
+        }
+        entry["name"] = described["name"].clone();
+        entry["description"] = described["description"].clone();
+        Some(self.subagents_notification(session_id))
+    }
+
+    /// OpenCode 2 reports a background child's end instead of answering status polls.
+    fn background_subagent_ended(
+        &mut self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Option<Notification> {
+        let before = self.subagents.len();
+        self.subagents
+            .retain(|entry| entry.get("taskId").and_then(Value::as_str) != Some(task_id));
+        (self.subagents.len() != before).then(|| self.subagents_notification(session_id))
+    }
+
     /// OpenCode의 background task는 바깥 tool call이 끝나도 자식 세션이 계속
     /// 돈다. 순정 tool metadata의 sessionId를 붙여 status API와 대조한다.
     fn subagent_tool_completed(
@@ -317,14 +350,16 @@ impl SessionStreams {
 /// task 도구 호출에서 하위 에이전트 행 하나를 만든다. task가 아니면 None.
 fn subagent_entry(update: &Value) -> Option<Value> {
     let input = update.get("rawInput");
+    // OpenCode 2 names the tool `subagent` and its agent input `agent`.
+    let v2 = update.get("name").and_then(Value::as_str) == Some("subagent");
     let subagent_type = input
-        .and_then(|input| input.get("subagent_type"))
+        .and_then(|input| input.get(if v2 { "agent" } else { "subagent_type" }))
         .and_then(Value::as_str);
     let title = update
         .get("title")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if subagent_type.is_none() && !title.eq_ignore_ascii_case("task") {
+    if !v2 && subagent_type.is_none() && !title.eq_ignore_ascii_case("task") {
         return None;
     }
     let id = update.get("toolCallId").and_then(Value::as_str)?;
@@ -343,6 +378,13 @@ fn subagent_entry(update: &Value) -> Option<Value> {
 
 fn background_subagent_task_id(update: &Value) -> Option<&str> {
     let metadata = update.pointer("/rawOutput/metadata")?;
+    // OpenCode 2 reports a subagent that keeps running as `status: "running"`.
+    if metadata.get("status").and_then(Value::as_str) == Some("running") {
+        return metadata
+            .get("sessionID")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+    }
     (metadata.get("background").and_then(Value::as_bool) == Some(true))
         .then_some(())
         .and_then(|()| {
@@ -518,6 +560,9 @@ pub struct OpenCodeServer {
     _job: Option<crate::child_process::BackendJob>,
     client: OpenCodeClient,
     provider_auth: ProviderAuthServer,
+    /// 2.x provider API server, which ends when its stdin closes.
+    helper: Option<Child>,
+    _helper_job: Option<crate::child_process::BackendJob>,
     /// session/load가 진행 중인 세션의 재생 조각 버퍼.
     loading: LoadingMap,
     /// 마지막 session/load가 재생해 준 과거 대화 페이지.
@@ -533,6 +578,10 @@ pub struct OpenCodeServer {
 pub struct ProviderAuthServer {
     client: reqwest::Client,
     base_url: reqwest::Url,
+    /// Only the OpenCode 2 server has one, and every 2.x route requires it.
+    password: Option<String>,
+    /// OpenCode 2 OAuth attempts by provider, from authorize until callback.
+    oauth_attempts: Arc<StdMutex<HashMap<String, String>>>,
 }
 
 impl ProviderAuthServer {
@@ -540,14 +589,81 @@ impl ProviderAuthServer {
         Ok(Self {
             client: reqwest::Client::new(),
             base_url: reqwest::Url::parse(&format!("http://127.0.0.1:{port}/"))?,
+            password: None,
+            oauth_attempts: Arc::default(),
         })
+    }
+
+    /// OpenCode 2's `acp` keeps its own server's address and password private,
+    /// so provider, model, and skill requests go to a second server on the same
+    /// database. It runs until its stdin closes.
+    async fn spawn_v2(
+        command: &Path,
+        cwd: &Path,
+    ) -> Result<(Self, Child, Option<crate::child_process::BackendJob>)> {
+        let password = random_password();
+        let mut server = command_for(command);
+        crate::child_process::isolate_backend(&mut server);
+        server
+            .args(["serve", "--stdio", "--port", "0"])
+            .current_dir(cwd)
+            .env("OPENCODE_PASSWORD", &password)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = server.spawn().context(tr(
+            "OpenCode provider API 서버를 시작하지 못했습니다.",
+            "Couldn't start the OpenCode provider API server.",
+        ))?;
+        let job = crate::child_process::adopt_backend(&child);
+        let stdout = child.stdout.take().context(tr(
+            "OpenCode provider API 서버 stdout 연결 실패",
+            "OpenCode provider API server stdout connection failed",
+        ))?;
+        let mut lines = BufReader::new(stdout).lines();
+        let url = timeout(Duration::from_secs(30), async {
+            while let Ok(Some(line)) = lines.next_line().await {
+                let url = serde_json::from_str::<Value>(&line)
+                    .ok()
+                    .and_then(|line| line.get("url")?.as_str().map(ToOwned::to_owned));
+                if url.is_some() {
+                    return url;
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+        .context(tr(
+            "OpenCode provider API 서버 주소를 받지 못했습니다.",
+            "Didn't receive the OpenCode provider API server address.",
+        ))?;
+        // Reading on keeps later output from filling the pipe and stalling the server.
+        tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+        let server = Self {
+            client: reqwest::Client::new(),
+            base_url: reqwest::Url::parse(&format!("{url}/"))?,
+            password: Some(password),
+            oauth_attempts: Arc::default(),
+        };
+        Ok((server, child, job))
+    }
+
+    fn is_v2(&self) -> bool {
+        self.password.is_some()
     }
 
     async fn wait_until_ready(&self) -> Result<()> {
         for _ in 0..60 {
-            if self
-                .client
-                .get(self.url(&["global", "health"])?)
+            let request = if self.is_v2() {
+                self.v2_request(reqwest::Method::GET, &["api", "info"])?
+                    .timeout(Duration::from_secs(2))
+            } else {
+                self.client.get(self.url(&["global", "health"])?)
+            };
+            if request
                 .send()
                 .await
                 .is_ok_and(|response| response.status().is_success())
@@ -563,6 +679,9 @@ impl ProviderAuthServer {
     }
 
     pub async fn catalog(&self) -> Result<Value> {
+        if self.is_v2() {
+            return self.v2_catalog().await;
+        }
         self.wait_until_ready().await?;
         let (providers, auth) =
             tokio::try_join!(self.get(&["provider"]), self.get(&["provider", "auth"]))?;
@@ -582,6 +701,10 @@ impl ProviderAuthServer {
     }
 
     pub async fn skills(&self) -> Result<Value> {
+        if self.is_v2() {
+            let skills = self.v2_list(&["api", "skill"], &[]).await?;
+            return Ok(normalize_skill_catalog(Value::Array(skills)));
+        }
         self.wait_until_ready().await?;
         Ok(normalize_skill_catalog(self.get(&["skill"]).await?))
     }
@@ -596,6 +719,16 @@ impl ProviderAuthServer {
         key: &str,
         inputs: &std::collections::BTreeMap<String, String>,
     ) -> Result<()> {
+        if self.is_v2() {
+            let mut body = json!({ "key": key });
+            if !inputs.is_empty() {
+                body["answer"] = serde_json::to_value(inputs)?;
+            }
+            let path = ["api", "integration", provider_id, "connect", "key"];
+            self.send_json(self.v2_request(reqwest::Method::POST, &path)?.json(&body))
+                .await?;
+            return Ok(());
+        }
         let mut body = json!({ "type": "api", "key": key });
         if !inputs.is_empty() {
             body["metadata"] = serde_json::to_value(inputs)?;
@@ -616,6 +749,9 @@ impl ProviderAuthServer {
         method: usize,
         inputs: &std::collections::BTreeMap<String, String>,
     ) -> Result<Value> {
+        if self.is_v2() {
+            return self.v2_oauth_authorize(provider_id, method, inputs).await;
+        }
         self.send_json(
             self.client
                 .post(self.url(&["provider", provider_id, "oauth", "authorize"])?)
@@ -634,6 +770,9 @@ impl ProviderAuthServer {
         method: usize,
         code: Option<&str>,
     ) -> Result<()> {
+        if self.is_v2() {
+            return self.v2_oauth_callback(provider_id, code).await;
+        }
         self.send_json(
             self.client
                 .post(self.url(&["provider", provider_id, "oauth", "callback"])?)
@@ -691,6 +830,318 @@ impl ProviderAuthServer {
             .extend(segments);
         Ok(url)
     }
+
+    fn v2_request(
+        &self,
+        method: reqwest::Method,
+        segments: &[&str],
+    ) -> Result<reqwest::RequestBuilder> {
+        Ok(self
+            .client
+            .request(method, self.url(segments)?)
+            .basic_auth("opencode", self.password.as_deref())
+            .timeout(Duration::from_secs(30)))
+    }
+
+    /// 2.x lists arrive as `{ location, data }`.
+    async fn v2_list(&self, segments: &[&str], query: &[(&str, &str)]) -> Result<Vec<Value>> {
+        self.wait_until_ready().await?;
+        let response = self
+            .send_json(
+                self.v2_request(reqwest::Method::GET, segments)?
+                    .query(query),
+            )
+            .await?;
+        Ok(response
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// 2.x integrations are the connectable providers, and their methods take
+    /// the place of the 1.x `/provider/auth` entries.
+    async fn v2_catalog(&self) -> Result<Value> {
+        let mut all = Vec::new();
+        let mut connected = Vec::new();
+        let mut auth = Map::new();
+        for integration in self.v2_list(&["api", "integration"], &[]).await? {
+            let Some(id) = integration.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let name = integration
+                .get("name")
+                .cloned()
+                .unwrap_or_else(|| json!(id));
+            all.push(json!({ "id": id, "name": name }));
+            if integration
+                .get("connections")
+                .and_then(Value::as_array)
+                .is_some_and(|connections| !connections.is_empty())
+            {
+                connected.push(json!(id));
+            }
+            let methods = integration
+                .get("methods")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(v2_auth_method)
+                .collect();
+            auth.insert(id.to_owned(), Value::Array(methods));
+        }
+        Ok(json!({ "all": all, "connected": connected, "auth": auth }))
+    }
+
+    /// 2.x keeps the model list current on its server, while the running `acp`
+    /// only reloads its own copy for changes made through its private server.
+    async fn v2_models(&self) -> Result<Value> {
+        let mut models = self.v2_list(&["api", "model"], &[]).await?;
+        models.retain(|model| {
+            model.get("enabled").and_then(Value::as_bool) == Some(true)
+                && model.get("providerID").and_then(Value::as_str) != Some("openai")
+        });
+        let field = |model: &Value, key: &str| {
+            model
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        models.sort_by_cached_key(|model| {
+            (
+                field(model, "providerID"),
+                field(model, "name").to_lowercase(),
+            )
+        });
+        let data = models
+            .iter()
+            .map(|model| {
+                let provider = field(model, "providerID");
+                let mut efforts = model
+                    .get("variants")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|variant| variant.get("id")?.as_str().map(ToOwned::to_owned))
+                    .collect::<Vec<_>>();
+                efforts.sort_by_key(|effort| effort_rank(effort));
+                open_code_model(
+                    &format!("{provider}/{}", field(model, "id")),
+                    &format!("{provider}/{}", field(model, "name")),
+                    &efforts,
+                )
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({ "data": data }))
+    }
+
+    /// 2.x `session/list` also returns subagent sessions; the server can tell
+    /// the top-level ones apart.
+    async fn v2_root_sessions(&self, cwd: Option<&Path>) -> Result<Vec<String>> {
+        let directory = cwd.map(|cwd| cwd.to_string_lossy().into_owned());
+        let mut query = vec![("parentID", "null"), ("order", "desc"), ("limit", "100")];
+        if let Some(directory) = &directory {
+            query.push(("directory", directory));
+        }
+        Ok(self
+            .v2_list(&["api", "session"], &query)
+            .await?
+            .iter()
+            .filter_map(|session| session.get("id")?.as_str().map(ToOwned::to_owned))
+            .collect())
+    }
+
+    /// The picker sends a method's position, but 2.x addresses OAuth methods
+    /// by id and keeps the attempt on this server until it completes.
+    async fn v2_oauth_authorize(
+        &self,
+        provider_id: &str,
+        method: usize,
+        inputs: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Value> {
+        let integrations = self.v2_list(&["api", "integration"], &[]).await?;
+        let method_id = integrations
+            .iter()
+            .find(|integration| integration.get("id").and_then(Value::as_str) == Some(provider_id))
+            .and_then(|integration| integration.pointer(&format!("/methods/{method}/id")))
+            .and_then(Value::as_str)
+            .context(tr(
+                "OpenCode 인증 방식을 찾지 못했습니다.",
+                "Couldn't find the OpenCode sign-in method.",
+            ))?;
+        let mut body = json!({ "methodID": method_id });
+        if !inputs.is_empty() {
+            body["answer"] = serde_json::to_value(inputs)?;
+        }
+        let path = ["api", "integration", provider_id, "connect", "oauth"];
+        let response = self
+            .send_json(
+                self.v2_request(reqwest::Method::POST, &path)?
+                    .timeout(Duration::from_secs(60))
+                    .json(&body),
+            )
+            .await?;
+        let attempt = response
+            .pointer("/data/attemptID")
+            .and_then(Value::as_str)
+            .context(tr(
+                "OpenCode 인증 시도 id가 없습니다.",
+                "The OpenCode sign-in attempt has no id.",
+            ))?;
+        self.oauth_attempts
+            .lock()
+            .expect("OpenCode OAuth attempts")
+            .insert(provider_id.to_owned(), attempt.to_owned());
+        Ok(json!({
+            "url": response.pointer("/data/url"),
+            "method": response.pointer("/data/mode"),
+            "instructions": response.pointer("/data/instructions")
+        }))
+    }
+
+    /// A pasted code completes the attempt; a browser sign-in finishes on the
+    /// server's side, so the attempt is polled until it settles.
+    async fn v2_oauth_callback(&self, provider_id: &str, code: Option<&str>) -> Result<()> {
+        let attempt = self
+            .oauth_attempts
+            .lock()
+            .expect("OpenCode OAuth attempts")
+            .get(provider_id)
+            .cloned()
+            .context(tr(
+                "진행 중인 OpenCode 인증이 없습니다.",
+                "There's no OpenCode sign-in in progress.",
+            ))?;
+        let path = [
+            "api",
+            "integration",
+            provider_id,
+            "connect",
+            "oauth",
+            &attempt,
+        ];
+        if let Some(code) = code {
+            let complete = [&path[..], &["complete"]].concat();
+            self.send_json(
+                self.v2_request(reqwest::Method::POST, &complete)?
+                    .json(&json!({ "code": code })),
+            )
+            .await?;
+            return Ok(());
+        }
+        for _ in 0..600 {
+            let state = self
+                .send_json(self.v2_request(reqwest::Method::GET, &path)?)
+                .await?;
+            match state.pointer("/data/status").and_then(Value::as_str) {
+                Some("complete") => return Ok(()),
+                Some("pending") => sleep(Duration::from_secs(1)).await,
+                status => bail!(
+                    state
+                        .pointer("/data/message")
+                        .and_then(Value::as_str)
+                        .or(status)
+                        .unwrap_or("failed")
+                        .to_owned()
+                ),
+            }
+        }
+        bail!(tr(
+            "OpenCode 인증이 제한 시간 안에 끝나지 않았습니다.",
+            "The OpenCode sign-in didn't finish within the time limit.",
+        ))
+    }
+}
+
+/// 2.x auth methods in the 1.x picker shape. `env`, `command`, and `external`
+/// keep their own types, which the picker skips, so positions stay aligned.
+fn v2_auth_method(method: &Value) -> Value {
+    let kind = match method.get("type").and_then(Value::as_str) {
+        Some("key") => "api",
+        other => other.unwrap_or_default(),
+    };
+    let label = method
+        .get("label")
+        .cloned()
+        .unwrap_or_else(|| json!("API key"));
+    let prompts = method
+        .get("form")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|field| field.get("hidden").and_then(Value::as_bool) != Some(true))
+        .filter_map(|field| {
+            let key = field.get("key")?.as_str()?;
+            let message = field
+                .get("title")
+                .or_else(|| field.get("description"))
+                .and_then(Value::as_str)
+                .unwrap_or(key);
+            // The picker shows one condition; 2.x forms use one in practice.
+            let when = field.pointer("/when/0").map(|when| {
+                let value = when.get("value").map(|value| match value {
+                    Value::String(value) => value.clone(),
+                    value => value.to_string(),
+                });
+                json!({ "key": when.get("key"), "op": when.get("op"), "value": value })
+            });
+            Some(match field.get("options").and_then(Value::as_array) {
+                Some(options) if !options.is_empty() => json!({
+                    "type": "select",
+                    "key": key,
+                    "message": message,
+                    "when": when,
+                    "options": options
+                        .iter()
+                        .map(|option| json!({
+                            "label": option.get("label"),
+                            "value": option.get("value"),
+                            "hint": option.get("description")
+                        }))
+                        .collect::<Vec<_>>()
+                }),
+                _ => json!({
+                    "type": "text",
+                    "key": key,
+                    "message": message,
+                    "placeholder": field.get("placeholder"),
+                    "when": when
+                }),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({ "type": kind, "label": label, "prompts": prompts })
+}
+
+/// The 2.x server listens on loopback only; its password keeps other local
+/// programs from using it. `RandomState` keys come from the OS generator.
+fn random_password() -> String {
+    use std::hash::{BuildHasher, RandomState};
+    (0..4)
+        .map(|part| format!("{:016x}", RandomState::new().hash_one(part)))
+        .collect()
+}
+
+/// OpenCode 2 dropped the 1.x `acp` flags and HTTP routes. `--version` prints
+/// `1.19.0` on 1.x and `opencode v2.0.27` on 2.x.
+async fn is_open_code_v2(command: &Path) -> bool {
+    let mut probe = command_for(command);
+    crate::child_process::isolate_backend(&mut probe);
+    probe
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let Ok(Ok(output)) = timeout(Duration::from_secs(10), probe.output()).await else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .split(|character: char| !character.is_ascii_digit())
+        .find(|part| !part.is_empty())
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major >= 2)
 }
 
 fn normalize_skill_catalog(response: Value) -> Value {
@@ -702,7 +1153,11 @@ fn normalize_skill_catalog(response: Value) -> Value {
         .iter()
         .filter_map(|skill| {
             let name = skill.get("name").and_then(Value::as_str)?;
-            let location = skill.get("location").and_then(Value::as_str);
+            // 2.x names the field `path`.
+            let location = skill
+                .get("location")
+                .or_else(|| skill.get("path"))
+                .and_then(Value::as_str);
             let path = location
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| format!("opencode://skill/{name}"));
@@ -746,23 +1201,32 @@ fn open_code_skill_scope(location: Option<&str>) -> &'static str {
 
 impl OpenCodeServer {
     pub async fn spawn(open_code_path: &Path, cwd: &Path) -> Result<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .context(tr("OpenCode provider API 포트를 확보하지 못했습니다.", "Couldn't reserve a port for the OpenCode provider API."))?;
-        let port = listener.local_addr()?.port();
-        drop(listener);
         let resolved = resolve_command(open_code_path);
+        let v2 = is_open_code_v2(&resolved).await;
         let mut command = command_for(&resolved);
         crate::child_process::isolate_backend(&mut command);
+        let port = if v2 {
+            // 2.x `acp` takes no flags; each session request names its directory.
+            command.arg("acp").current_dir(cwd);
+            None
+        } else {
+            let listener = TcpListener::bind(("127.0.0.1", 0))
+                .context(tr("OpenCode provider API 포트를 확보하지 못했습니다.", "Couldn't reserve a port for the OpenCode provider API."))?;
+            let port = listener.local_addr()?.port();
+            drop(listener);
+            command
+                .args([
+                    "acp",
+                    "--hostname",
+                    "127.0.0.1",
+                    "--port",
+                    &port.to_string(),
+                    "--cwd",
+                ])
+                .arg(cwd);
+            Some(port)
+        };
         command
-            .args([
-                "acp",
-                "--hostname",
-                "127.0.0.1",
-                "--port",
-                &port.to_string(),
-                "--cwd",
-            ])
-            .arg(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -792,7 +1256,13 @@ impl OpenCodeServer {
         let loading: LoadingMap = Arc::new(Mutex::new(HashMap::new()));
         let tools: ToolMap = Arc::new(Mutex::new(HashMap::new()));
         let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
-        let provider_auth = ProviderAuthServer::new(port)?;
+        let (provider_auth, helper, helper_job) = match port {
+            Some(port) => (ProviderAuthServer::new(port)?, None, None),
+            None => {
+                let (server, helper, job) = ProviderAuthServer::spawn_v2(&resolved, cwd).await?;
+                (server, Some(helper), job)
+            }
+        };
 
         let writer_task = tokio::spawn(async move {
             let mut stdin = stdin;
@@ -903,6 +1373,10 @@ impl OpenCodeServer {
         let subagent_streams = Arc::clone(&streams);
         let subagent_events = event_tx.clone();
         let subagent_task = tokio::spawn(async move {
+            // 2.x reports a child's end over ACP instead; see `route_message`.
+            if subagent_auth.is_v2() {
+                return;
+            }
             loop {
                 sleep(BACKGROUND_SUBAGENT_STATUS_POLL).await;
                 if subagent_events.is_closed() {
@@ -951,6 +1425,8 @@ impl OpenCodeServer {
             _job: job,
             client,
             provider_auth,
+            helper,
+            _helper_job: helper_job,
             loading,
             history: Arc::new(Mutex::new(HashMap::new())),
             events,
@@ -962,6 +1438,11 @@ impl OpenCodeServer {
     }
 
     pub async fn initialize(&self) -> Result<Value> {
+        let mut meta = json!({ "terminal-auth": true });
+        if self.provider_auth.is_v2() {
+            // Without this, 2.x streams subagent text into the parent's answer.
+            meta["opencode/child-session-updates"] = Value::Bool(true);
+        }
         self.client
             .request(
                 "initialize",
@@ -970,7 +1451,7 @@ impl OpenCodeServer {
                     "clientCapabilities": {
                         "fs": { "readTextFile": false, "writeTextFile": false },
                         "terminal": false,
-                        "_meta": { "terminal-auth": true }
+                        "_meta": meta
                     },
                     "clientInfo": {
                         "name": "devez-vibe",
@@ -987,6 +1468,9 @@ impl OpenCodeServer {
     }
 
     pub async fn model_catalog(&self, cwd: &Path) -> Result<Value> {
+        if self.provider_auth.is_v2() {
+            return self.provider_auth.v2_models().await;
+        }
         let response = self
             .client
             .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
@@ -1026,6 +1510,18 @@ impl OpenCodeServer {
 
     pub async fn provider_catalog(&self) -> Result<Value> {
         self.provider_auth.catalog().await
+    }
+
+    /// 2.x keeps credentials in its database, so `auth.json` may be stale or missing.
+    pub async fn provider_connected(&self) -> bool {
+        if !self.provider_auth.is_v2() {
+            return has_connected_provider();
+        }
+        self.provider_auth.catalog().await.is_ok_and(|catalog| {
+            catalog["connected"]
+                .as_array()
+                .is_some_and(|connected| !connected.is_empty())
+        })
     }
 
     pub async fn set_provider_api_key(
@@ -1139,11 +1635,22 @@ impl OpenCodeServer {
             params["cwd"] = json!(cwd);
         }
         let response = self.client.request("session/list", params).await?;
+        let roots = if self.provider_auth.is_v2() {
+            self.provider_auth.v2_root_sessions(cwd).await.ok()
+        } else {
+            None
+        };
         let data = response
             .get("sessions")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
+            .filter(|session| {
+                roots.as_ref().is_none_or(|roots| {
+                    let id = session.get("sessionId").and_then(Value::as_str);
+                    roots.iter().any(|root| Some(root.as_str()) == id)
+                })
+            })
             .map(|session| {
                 json!({
                     "id": session.get("sessionId").cloned().unwrap_or(Value::Null),
@@ -1317,6 +1824,12 @@ impl OpenCodeServer {
         self.reader_task.abort();
         self.stderr_task.abort();
         self.subagent_task.abort();
+        if let Some(mut helper) = self.helper.take() {
+            drop(helper.stdin.take());
+            if timeout(Duration::from_secs(3), helper.wait()).await.is_err() {
+                let _ = helper.kill().await;
+            }
+        }
     }
 }
 
@@ -1440,6 +1953,27 @@ async fn route_message(
         return;
     }
 
+    // 2.x sends subagent sessions here once initialize opts in. Only a child's
+    // end matters, since the parent's subagent tool call carries its row.
+    if message.get("method").and_then(Value::as_str) == Some("opencode/session/child_update") {
+        let params = message.get("params").unwrap_or(&Value::Null);
+        if let (Some(root), Some(child), Some("completed" | "failed" | "interrupted")) = (
+            params.get("rootSessionId").and_then(Value::as_str),
+            params.get("childSessionId").and_then(Value::as_str),
+            params.get("status").and_then(Value::as_str),
+        ) {
+            let ended = streams
+                .lock()
+                .await
+                .get_mut(root)
+                .and_then(|stream| stream.background_subagent_ended(root, child));
+            if let Some((method, params)) = ended {
+                notify(events, &method, params);
+            }
+        }
+        return;
+    }
+
     if let (Some(id), Some(method)) = (
         message.get("id").cloned(),
         message.get("method").and_then(Value::as_str),
@@ -1557,7 +2091,16 @@ async fn route_session_update(
                     }
                 }
                 _ => {
+                    let described = streams
+                        .lock()
+                        .await
+                        .entry(session_id.to_owned())
+                        .or_default()
+                        .subagent_described(session_id, &merged);
                     tools.lock().await.insert(id.to_owned(), merged);
+                    if let Some((method, params)) = described {
+                        notify(events, &method, params);
+                    }
                 }
             }
         }
@@ -1940,7 +2483,6 @@ fn model_reasoning_efforts(catalog: &Value, model: &str) -> Vec<String> {
     else {
         return Vec::new();
     };
-    const ORDER: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
     let mut efforts = variants
         .iter()
         .filter_map(|(name, variant)| {
@@ -1948,17 +2490,21 @@ fn model_reasoning_efforts(catalog: &Value, model: &str) -> Vec<String> {
                 .get("reasoningEffort")
                 .and_then(Value::as_str)
                 .map(|effort| effort.to_owned())
-                .or_else(|| ORDER.contains(&name.as_str()).then(|| name.clone()))
+                .or_else(|| EFFORT_ORDER.contains(&name.as_str()).then(|| name.clone()))
         })
         .collect::<Vec<_>>();
-    efforts.sort_by_key(|effort| {
-        ORDER
-            .iter()
-            .position(|candidate| candidate == effort)
-            .unwrap_or(ORDER.len())
-    });
+    efforts.sort_by_key(|effort| effort_rank(effort));
     efforts.dedup();
     efforts
+}
+
+const EFFORT_ORDER: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+fn effort_rank(effort: &str) -> usize {
+    EFFORT_ORDER
+        .iter()
+        .position(|candidate| *candidate == effort)
+        .unwrap_or(EFFORT_ORDER.len())
 }
 
 fn open_code_model(model: &str, display_name: &str, efforts: &[String]) -> Value {
@@ -3120,6 +3666,144 @@ mod tests {
                 .pointer("/subagents/0/background")
                 .and_then(Value::as_bool),
             Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn open_code_2_subagent_rows_follow_child_session_updates() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let detached: DetachedMap = Arc::new(Mutex::new(HashMap::new()));
+        let active: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
+        let loading: LoadingMap = Arc::new(Mutex::new(HashMap::new()));
+        let tools: ToolMap = Arc::new(Mutex::new(HashMap::new()));
+        let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+        let route = |message: Value| {
+            route_message(
+                message, &pending, &detached, &active, &loading, &tools, &streams, &event_tx,
+            )
+        };
+        let update = |update: Value| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": { "sessionId": "ses_1", "update": update }
+            })
+        };
+        let rows = |events: &[(String, Value)]| {
+            events
+                .iter()
+                .rev()
+                .find(|(method, _)| method == "turn/subagents/updated")
+                .map(|(_, params)| params["subagents"].clone())
+        };
+
+        // 2.x는 빈 입력으로 시작하고 다음 갱신에서 에이전트를 알린다.
+        route(update(json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call_1",
+            "name": "subagent",
+            "title": "subagent",
+            "kind": "think",
+            "status": "pending",
+            "rawInput": {}
+        })))
+        .await;
+        assert_eq!(
+            rows(&drain_notifications(&mut event_rx)).unwrap()[0]["name"],
+            "agent"
+        );
+        route(update(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_1",
+            "status": "in_progress",
+            "rawInput": { "agent": "explore", "description": "코드 조사", "background": true }
+        })))
+        .await;
+        let described = rows(&drain_notifications(&mut event_rx)).expect("에이전트 이름 갱신");
+        assert_eq!(described[0]["name"], "explore");
+        assert_eq!(described[0]["description"], "코드 조사");
+
+        route(update(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_1",
+            "status": "completed",
+            "rawOutput": { "metadata": { "sessionID": "ses_child", "status": "running" } }
+        })))
+        .await;
+        let kept = rows(&drain_notifications(&mut event_rx)).expect("백그라운드 행 유지");
+        assert_eq!(kept[0]["taskId"], "ses_child");
+
+        // 자식의 본문은 부모 답변으로 나오지 않고, 끝나면 행만 지운다.
+        let child = |event: Value| {
+            let mut params = json!({
+                "rootSessionId": "ses_1",
+                "childSessionId": "ses_child",
+                "parentSessionId": "ses_1",
+                "depth": 1
+            });
+            params
+                .as_object_mut()
+                .unwrap()
+                .extend(event.as_object().unwrap().clone());
+            json!({ "jsonrpc": "2.0", "method": "opencode/session/child_update", "params": params })
+        };
+        route(child(json!({
+            "type": "update",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "msg_child",
+                "content": { "type": "text", "text": "자식 답변" }
+            }
+        })))
+        .await;
+        assert!(drain_notifications(&mut event_rx).is_empty());
+        route(child(json!({ "type": "status", "status": "completed" }))).await;
+        let ended = rows(&drain_notifications(&mut event_rx)).expect("자식 종료 시 행 제거");
+        assert_eq!(ended.as_array().map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn open_code_2_auth_methods_take_the_picker_shape() {
+        let methods = [
+            json!({ "type": "env", "names": ["AZURE_API_KEY"] }),
+            json!({ "type": "key", "form": [{
+                "key": "resourceName",
+                "title": "Enter Azure Resource Name",
+                "type": "string",
+                "placeholder": "e.g. my-models"
+            }] }),
+            json!({ "id": "device", "type": "oauth", "label": "Login", "form": [
+                { "key": "deploymentType", "type": "string", "options": [
+                    { "value": "github.com", "label": "GitHub.com" },
+                    { "value": "enterprise", "label": "Enterprise", "description": "Self-hosted" }
+                ] },
+                { "key": "enterpriseUrl", "title": "URL", "type": "string",
+                  "when": [{ "key": "deploymentType", "op": "eq", "value": "enterprise" }] },
+                { "key": "token", "type": "string", "hidden": true }
+            ] }),
+        ];
+        let translated = methods.iter().map(v2_auth_method).collect::<Vec<_>>();
+
+        // 피커가 건너뛰는 유형도 남겨 두어야 방식 위치가 2.x 목록과 같다.
+        assert_eq!(translated[0]["type"], "env");
+        assert_eq!(
+            translated[1],
+            json!({ "type": "api", "label": "API key", "prompts": [{
+                "type": "text",
+                "key": "resourceName",
+                "message": "Enter Azure Resource Name",
+                "placeholder": "e.g. my-models",
+                "when": null
+            }] })
+        );
+        let prompts = translated[2]["prompts"].as_array().expect("OAuth 입력");
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0]["type"], "select");
+        assert_eq!(prompts[0]["options"][1]["hint"], "Self-hosted");
+        assert_eq!(
+            prompts[1]["when"],
+            json!({ "key": "deploymentType", "op": "eq", "value": "enterprise" })
         );
     }
 

@@ -35,7 +35,7 @@ use crate::{
         OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS, PanelFileDiff, PlanStep, PlanStepStatus,
         PlanSummary,
         ProviderHandoffBlock, ProviderIntegrationView, StatusLineView,
-        SteeredPromptView, SubagentView, SuggestionView, VibeTone, View, WelcomeView,
+        SteeredPromptView, SubagentTranscript, SubagentView, SuggestionView, VibeTone, View, WelcomeView,
         format_clock_time, format_elapsed, visible_window,
     },
     rollout::{PlanSnapshot, Rollout, RolloutEvent, RolloutKind},
@@ -1191,12 +1191,6 @@ pub enum Action {
     /// 업데이트 알림을 눌렀을 때 백그라운드로 도는 `dvz update`.
     RunUpdate,
     Interrupt,
-    /// 하위 에이전트 행의 x: 그 행 하나만 멈춘다. Codex는 자식 스레드의 턴을
-    /// 중단하므로 그 턴 id가 함께 간다.
-    StopSubagent {
-        id: String,
-        turn: Option<String>,
-    },
     NewThread,
     Worktree(Option<String>),
     OpenResume,
@@ -1285,9 +1279,8 @@ pub enum Action {
     AddMarketplace(String),
     ConfirmMarketplaceRemove(String),
     RemoveMarketplace(String),
-    /// Refreshes every configured git marketplace; see
-    /// `MarketplacePickerResult::UpgradeAll` for why it is not per-marketplace.
-    UpgradeMarketplaces,
+    /// Refreshes the named marketplace, or every configured git marketplace.
+    UpgradeMarketplaces(Option<String>),
     /// Re-reads skills, plugins and apps and restarts the MCP servers, so a
     /// plugin installed this session takes effect without relaunching.
     ReloadPlugins,
@@ -3674,9 +3667,6 @@ fn submission_display(source: &str, image_count: usize) -> String {
 pub struct TickResult {
     pub redraw: bool,
     pub animation_only: bool,
-    /// Only an idle running row's spinner moved. Worth the narrow patch, never
-    /// a full frame: the next elapsed second repaints the rows anyway.
-    pub spinner_only: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3714,44 +3704,23 @@ struct ArtifactLink {
 /// cannot revive work that a turn-completed or thread-closed event already ended.
 #[derive(Clone, Debug, Default)]
 struct CodexSubagent {
-    agent_path: Option<String>,
     nickname: Option<String>,
     role: Option<String>,
     tool: String,
     has_run: bool,
     terminal: bool,
     probe_failures: u8,
-    /// 자식 스레드의 마지막 `turn/started`. 행의 x는 이 턴을 중단한다. 임시
-    /// 스레드는 `thread/turns/list`를 거부하므로 알림에서 받아 둔다.
-    turn_id: Option<String>,
 }
 
 impl CodexSubagent {
+    /// Claude 줄처럼 `닉네임 · 역할`로 보이도록 역할은 설명 칸에 둔다.
+    /// `/root/<task_name>` 경로는 쓰지 않는다. 저장 값은 이미 다듬어져 있다.
     fn display_name(&self) -> String {
-        if let Some(path) = self
-            .agent_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-        {
-            return path.to_owned();
-        }
-        let nickname = self
-            .nickname
-            .as_deref()
-            .map(str::trim)
-            .filter(|nickname| !nickname.is_empty());
-        let role = self
-            .role
-            .as_deref()
-            .map(str::trim)
-            .filter(|role| !role.is_empty());
-        match (nickname, role) {
-            (Some(nickname), Some(role)) => format!("{nickname} [{role}]"),
-            (Some(nickname), None) => nickname.to_owned(),
-            (None, Some(role)) => format!("[{role}]"),
-            (None, None) => "Agent".to_owned(),
-        }
+        self.nickname.clone().unwrap_or_else(|| "Agent".to_owned())
+    }
+
+    fn description(&self) -> String {
+        self.role.clone().unwrap_or_default()
     }
 }
 
@@ -3764,6 +3733,8 @@ const SUBAGENT_LINGER_GRACE: Duration = Duration::from_secs(15);
 /// removed. Three unknown replies bound a broken probe without cutting off one
 /// transient failure.
 const CODEX_SUBAGENT_PROBE_FAILURE_LIMIT: u8 = 3;
+/// 오래 도는 Codex 하위 에이전트가 세션 내내 쌓지 않도록 본문용 항목은 이만큼만 둔다.
+const CODEX_SUBAGENT_ITEM_LIMIT: usize = 400;
 
 #[derive(Clone)]
 struct ProviderIntegrationSnapshot {
@@ -3898,9 +3869,12 @@ pub struct AppState {
     quit_armed_at: Option<Instant>,
     pub busy: bool,
     host_loading: bool,
-    /// Names the runtime a swap is heading for, so the wait says where the
-    /// session is going instead of reading as a plain session load.
-    provider_changing: Option<&'static str>,
+    /// Names a wait that is not a session load — a provider swap or a plugin
+    /// reload — so the activity row says what the screen is waiting for.
+    host_loading_label: Option<String>,
+    /// The activity dots step from here: a wait whose request borrows the state
+    /// repaints without ticking the frame counter.
+    host_loading_since: Instant,
     pub cwd: String,
     account: String,
     models: Vec<ModelInfo>,
@@ -3994,7 +3968,6 @@ pub struct AppState {
     /// Idle rows spin between full frames only where dvz draws the IME preedit
     /// itself (DevezCode). An external terminal paints its own preedit and loses
     /// it whenever the cursor hides, so there idle rows wait for the next second.
-    idle_row_spinner: bool,
     command_selection: usize,
     spinner_frame: usize,
     turn_started_at: Option<Instant>,
@@ -4055,6 +4028,19 @@ pub struct AppState {
     side_panel_open: bool,
     side_panel_width: usize,
     side_panel_prompts_expanded: bool,
+    side_panel_subagents_expanded: bool,
+    /// 본문에 띄운 하위 에이전트 행 id. None이면 메인 대화를 본다.
+    viewing_subagent: Option<String>,
+    /// 본문에 띄운 행의 마지막 모습. 그 하위 에이전트가 끝나 목록에서 빠져도
+    /// 이 행을 남겨 두어 무엇을 보고 있는지 알 수 있게 한다.
+    viewed_row: Option<SubagentView>,
+    /// 브리지가 기록을 지켜보는 하위 에이전트. 본문과 다르면 메인 루프가 맞춘다.
+    watched_subagent: Option<String>,
+    /// 띄운 하위 에이전트의 기록을 전사 블록으로 바꾼 것. 바뀔 때마다 판이 오른다.
+    subagent_view_blocks: Vec<Block>,
+    subagent_view_revision: u64,
+    /// Codex 자식 스레드가 끝낸 항목. 그 하위 에이전트를 띄우면 이것으로 그린다.
+    codex_subagent_items: HashMap<String, Vec<Value>>,
     /// 패널의 변경 섹션이 그리는 미커밋 diff. 파일 변경 블록과 같은 모양으로
     /// 만들어 두고 전사의 렌더를 그대로 쓴다.
     side_panel_diff: Vec<PanelFileDiff>,
@@ -4249,7 +4235,8 @@ impl AppState {
             quit_armed_at: None,
             busy: false,
             host_loading: false,
-            provider_changing: None,
+            host_loading_label: None,
+            host_loading_since: Instant::now(),
             cwd,
             account,
             models,
@@ -4300,7 +4287,6 @@ impl AppState {
             dismissed_artifacts: read_dismissed_artifacts(),
             codex_subagents: HashMap::new(),
             subagents_settled_at: None,
-            idle_row_spinner: crate::devezcode::room_id().is_some(),
             command_selection: 0,
             spinner_frame: 0,
             compacting_started_at: None,
@@ -4339,6 +4325,13 @@ impl AppState {
             side_panel_open: false,
             side_panel_width: read_default_side_panel_width(),
             side_panel_prompts_expanded: true,
+            side_panel_subagents_expanded: true,
+            viewing_subagent: None,
+            viewed_row: None,
+            watched_subagent: None,
+            subagent_view_blocks: Vec::new(),
+            subagent_view_revision: 0,
+            codex_subagent_items: HashMap::new(),
             side_panel_diff: Vec::new(),
             side_panel_diff_path: None,
             side_panel_diff_job: None,
@@ -5138,14 +5131,22 @@ impl AppState {
     /// Keeps DevezCode's tab spinner visible while a resumed transcript is
     /// being rebuilt, without treating the composer as an active turn.
     pub fn set_host_loading(&mut self, loading: bool) {
+        if loading && !self.host_loading {
+            self.host_loading_since = Instant::now();
+        }
         self.host_loading = loading;
     }
 
     /// Switching runtimes waits on a backend launch, so the screen leaves the
     /// picker at once and names what it is waiting for.
     pub fn set_provider_changing(&mut self, provider: Option<&'static str>) {
-        self.provider_changing = provider;
-        self.host_loading = provider.is_some();
+        self.set_host_activity(provider.map(|provider| format!("Changing provider to {provider}")));
+    }
+
+    /// Holds the activity row on `label` while a host-side wait runs.
+    pub fn set_host_activity(&mut self, label: Option<String>) {
+        self.set_host_loading(label.is_some());
+        self.host_loading_label = label;
     }
 
     /// Compaction counts as work for the host tab too: the session is unavailable
@@ -7353,6 +7354,10 @@ impl AppState {
         self.subagents.clear();
         self.artifacts.clear();
         self.codex_subagents.clear();
+        self.codex_subagent_items.clear();
+        self.viewing_subagent = None;
+        self.viewed_row = None;
+        self.subagent_view_blocks.clear();
         self.subagents_settled_at = None;
         self.busy = false;
         self.turn_id = None;
@@ -7431,6 +7436,33 @@ impl AppState {
         let id = block.id();
         self.committed.push(block);
         id
+    }
+
+    /// 순정 Claude Code처럼 `!` 명령과 그 출력을 모델에 넘겨 답을 받는다.
+    pub fn submit_shell_result(&mut self, command: &str, exit_code: i32, stdout: &str, stderr: &str) -> Action {
+        if self.provider_choice_pending && !self.any_provider_connected() {
+            return Action::None;
+        }
+        // 순정의 기본 출력 상한과 같은 길이에서 자른다.
+        fn clip(text: &str) -> String {
+            let text = text.trim_end_matches(['\r', '\n']);
+            match text.char_indices().nth(30_000) {
+                Some((cut, _)) => format!("{}\n... (truncated)", &text[..cut]),
+                None => text.to_owned(),
+            }
+        }
+        let mut stderr = clip(stderr);
+        if exit_code != 0 {
+            if !stderr.is_empty() {
+                stderr.push('\n');
+            }
+            stderr.push_str(&format!("Exit code {exit_code}"));
+        }
+        let text = format!(
+            "<bash-input>{command}</bash-input>\n<bash-stdout>{}</bash-stdout><bash-stderr>{stderr}</bash-stderr>",
+            clip(stdout)
+        );
+        self.submit_text(text, format!("! {command}"))
     }
 
     /// Keep the release notice visible without adding it to the conversation.
@@ -7582,18 +7614,19 @@ impl AppState {
             subagents: self
                 .subagents
                 .iter()
-                .map(|running| SubagentView {
-                    id: running.id.clone(),
-                    name: running.name.clone(),
-                    is_background_task: running.is_background_task,
-                    description: running.description.clone(),
-                    tool: running.tool.clone(),
-                    elapsed: running.started_at.elapsed(),
-                    depth: running.depth,
-                    // OpenCode는 행 하나만 멈추는 요청이 없다.
-                    stoppable: !crate::open_code::is_open_code_model(self.selected_model_name()),
-                })
+                // 순정처럼 하위 에이전트가 띄운 백그라운드 작업은 줄로 그리지 않는다.
+                // 바쁨 판정은 숨긴 행까지 센다.
+                .filter(|running| !(running.is_background_task && running.depth > 0))
+                .map(|running| self.subagent_row(running))
+                .chain(self.viewed_row.clone().filter(|viewed| {
+                    !self.subagents.iter().any(|running| running.id == viewed.id)
+                }))
                 .collect(),
+            subagent_view: self.viewing_subagent.as_deref().map(|id| SubagentTranscript {
+                id,
+                revision: self.subagent_view_revision,
+                blocks: &self.subagent_view_blocks,
+            }),
             artifacts: self
                 .artifacts
                 .iter()
@@ -7660,6 +7693,7 @@ impl AppState {
             diff_display_mode: self.diff_display_mode(),
             side_panel_width: self.side_panel_open.then_some(self.side_panel_width),
             side_panel_prompts_expanded: self.side_panel_prompts_expanded,
+            side_panel_subagents_expanded: self.side_panel_subagents_expanded,
             side_panel_diff: &self.side_panel_diff,
             side_panel_diff_selected: self.side_panel_diff_path.as_deref(),
             side_panel_diff_expanded: self.side_panel_diff_expanded,
@@ -7778,8 +7812,7 @@ impl AppState {
         // loop alive even on a runtime that reports no turn while it runs.
         let animating = self.busy || self.compacting() || self.host_loading;
         // A background Claude agent outlives its parent turn. Its elapsed label
-        // changes once a second, and the narrow animation path repaints only the
-        // rows' spinners, so only that boundary asks for a full frame.
+        // changes once a second, so only that boundary asks for a full frame.
         let mut subagent_elapsed_changed = false;
         for running in &mut self.subagents {
             let elapsed = running.started_at.elapsed().as_secs();
@@ -7787,11 +7820,13 @@ impl AppState {
                 running.painted_elapsed_secs = elapsed;
                 subagent_elapsed_changed = true;
             }
+            if let Some(viewed) = self.viewed_row.as_mut().filter(|viewed| viewed.id == running.id) {
+                viewed.elapsed = running.started_at.elapsed();
+            }
         }
         if self.sweep_settled_subagents() {
             full_redraw = true;
         }
-        let subagents_spinning = !self.subagents.is_empty() && self.idle_row_spinner;
         if self.refresh_side_panel_diff() {
             full_redraw = true;
         }
@@ -7865,19 +7900,12 @@ impl AppState {
         TickResult {
             redraw: !inline_answer_active
                 && (animating
-                    || subagents_spinning
                     || subagent_elapsed_changed
                     || plan_shimmer_active
                     || response_collapse_active
                     || full_redraw),
             animation_only: !inline_answer_active
-                && (animating || subagents_spinning || plan_shimmer_active)
-                && !response_collapse_active
-                && !subagent_elapsed_changed
-                && !full_redraw,
-            spinner_only: subagents_spinning
-                && !animating
-                && !plan_shimmer_active
+                && (animating || plan_shimmer_active)
                 && !response_collapse_active
                 && !subagent_elapsed_changed
                 && !full_redraw,
@@ -8414,6 +8442,11 @@ impl AppState {
                 || !self.matching_agent_arguments().is_empty()
                 || (self.suggestions_dismissed_text.as_deref() != Some(self.editor.text().as_str())
                     && self.matching_slash_commands().len() + self.matching_slash_skills().len() > 0));
+        // 하위 에이전트를 보는 중 Esc는 순정처럼 메인 대화로 돌아올 뿐, 입력을 지우거나
+        // 진행 중인 턴을 멈추지 않는다.
+        if key.code == KeyCode::Esc && !suggestions_open && self.viewing_subagent.is_some() {
+            return self.view_subagent(None);
+        }
         if key.code == KeyCode::Esc && !self.busy && !suggestions_open {
             if !self.editor.is_empty() || !self.composer_images.is_empty() {
                 self.set_composer_notice(
@@ -9396,7 +9429,6 @@ impl AppState {
     fn update_codex_subagent_identity(
         &mut self,
         id: &str,
-        agent_path: Option<&str>,
         nickname: Option<&str>,
         role: Option<&str>,
     ) {
@@ -9404,9 +9436,6 @@ impl AppState {
         let Some(metadata) = self.codex_subagents.get_mut(id) else {
             return;
         };
-        if let Some(path) = agent_path.map(str::trim).filter(|path| !path.is_empty()) {
-            metadata.agent_path = Some(path.to_owned());
-        }
         if let Some(nickname) = nickname
             .map(str::trim)
             .filter(|nickname| !nickname.is_empty())
@@ -9424,9 +9453,11 @@ impl AppState {
             return;
         };
         let name = metadata.display_name();
+        let description = metadata.description();
         let tool = metadata.tool.clone();
         if let Some(running) = self.subagents.iter_mut().find(|running| running.id == id) {
             running.name = name;
+            running.description = description;
             running.tool = tool;
         }
     }
@@ -9447,17 +9478,19 @@ impl AppState {
         metadata.probe_failures = 0;
         metadata.has_run = true;
         let name = metadata.display_name();
+        let description = metadata.description();
         let tool = metadata.tool.clone();
         if let Some(running) = self.subagents.iter_mut().find(|running| running.id == id) {
             running.name = name;
+            running.description = description;
             running.tool = tool;
         } else {
             self.subagents.push(RunningSubagent {
                 id: id.to_owned(),
                 name,
                 is_background_task: false,
-                // Codex 행은 이름과 경과 시간만 보인다. 무엇을 시켰는지는 task_name이 말한다.
-                description: String::new(),
+                // v2 지시문은 암호문이라 요약할 수 없어 역할을 설명 칸에 둔다.
+                description,
                 tool,
                 started_at: Instant::now(),
                 painted_elapsed_secs: 0,
@@ -9518,7 +9551,6 @@ impl AppState {
                 }
                 self.update_codex_subagent_identity(
                     id,
-                    None,
                     thread.get("agentNickname").and_then(Value::as_str),
                     thread.get("agentRole").and_then(Value::as_str),
                 );
@@ -9551,12 +9583,8 @@ impl AppState {
             }
             "turn/started" => {
                 if let Some(id) = params.get("threadId").and_then(Value::as_str)
-                    && let Some(metadata) = self.codex_subagents.get_mut(id)
+                    && self.codex_subagents.contains_key(id)
                 {
-                    metadata.turn_id = params
-                        .pointer("/turn/id")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned);
                     self.start_codex_subagent(id, true);
                 }
             }
@@ -9590,12 +9618,7 @@ impl AppState {
                 let Some(id) = item.get("agentThreadId").and_then(Value::as_str) else {
                     return;
                 };
-                self.update_codex_subagent_identity(
-                    id,
-                    item.get("agentPath").and_then(Value::as_str),
-                    None,
-                    None,
-                );
+                self.remember_codex_subagent(id);
                 match item.get("kind").and_then(Value::as_str) {
                     Some("started") => self.start_codex_subagent(id, false),
                     // Matches Codex's own TUI: interaction is activity copy, not
@@ -9667,6 +9690,16 @@ impl AppState {
     }
 
     fn record_codex_subagent_item(&mut self, id: &str, method: &str, item: &Value) {
+        if method == "item/completed" {
+            let items = self.codex_subagent_items.entry(id.to_owned()).or_default();
+            items.push(item.clone());
+            if items.len() > CODEX_SUBAGENT_ITEM_LIMIT {
+                items.remove(0);
+            }
+            if self.viewing_subagent.as_deref() == Some(id) {
+                self.refresh_codex_subagent_view();
+            }
+        }
         if method == "item/started" {
             let tool = match item.get("type").and_then(Value::as_str) {
                 Some("commandExecution") => {
@@ -10110,6 +10143,14 @@ impl AppState {
                 self.plan_turn_id = self.turn_id.clone();
                 self.plan_shimmer_started_at = Some(Instant::now());
                 self.commit_welcome_card();
+            }
+            "turn/subagent/history" => {
+                if self.viewing_subagent.is_some()
+                    && params.get("id").and_then(Value::as_str) == self.viewing_subagent.as_deref()
+                    && let Some(turns) = params.get("turns").and_then(Value::as_array)
+                {
+                    self.show_subagent_turns(turns);
+                }
             }
             "turn/subagents/updated" => {
                 self.subagents = params
@@ -10571,6 +10612,8 @@ impl AppState {
         if text.is_empty() && self.composer_images.is_empty() && self.queued_images.is_empty() {
             return Action::None;
         }
+        // 입력은 메인 대화로 가므로 본문도 메인으로 돌아온다.
+        self.view_subagent(None);
         let text = self.slash_skill_prompt(&text).unwrap_or(text);
         if text.starts_with('/') && !text.contains('\n') {
             let action = self.run_slash_command(&text);
@@ -11124,7 +11167,7 @@ impl AppState {
                     && parts[1].eq_ignore_ascii_case("marketplace")
                     && parts[2].eq_ignore_ascii_case("upgrade") =>
             {
-                Action::UpgradeMarketplaces
+                Action::UpgradeMarketplaces(None)
             }
             "/plugins" if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("install") => {
                 Action::PreparePluginInstall(parts[2..].join(" "))
@@ -12208,7 +12251,11 @@ impl AppState {
                 },
                 MarketplacePickerResult::Add(source) => Action::ConfirmMarketplaceAdd(source),
                 MarketplacePickerResult::Remove(name) => Action::ConfirmMarketplaceRemove(name),
-                MarketplacePickerResult::UpgradeAll => Action::UpgradeMarketplaces,
+                MarketplacePickerResult::Browse(name) => Action::OpenPlugins {
+                    scope: Some(PluginScope::Marketplace(name)),
+                    notice: None,
+                },
+                MarketplacePickerResult::Upgrade(name) => Action::UpgradeMarketplaces(name),
             },
             loading @ (PendingInteraction::ProviderLoading
             | PendingInteraction::IntegrationLoading { .. }) => {
@@ -14246,13 +14293,10 @@ impl AppState {
             return Some(notice.to_owned());
         }
         if self.host_loading {
-            let label = match self.provider_changing {
-                Some(provider) => format!("Changing provider to {provider}"),
-                None => "Loading session".to_owned(),
-            };
-            // The frame counter runs at 120ms; two frames per dot keeps the
-            // cycle readable at roughly one step per quarter second.
-            return Some(format!("{label}{}", ".".repeat(self.spinner_frame / 2)));
+            let label = self.host_loading_label.as_deref().unwrap_or("Loading session");
+            // One step per quarter second, the same pace as the panels' `Loading`.
+            let dots = (self.host_loading_since.elapsed().as_millis() / 250 % 4) as usize;
+            return Some(format!("{label}{}", ".".repeat(dots)));
         }
         if self.busy && !self.turn_interrupted {
             if let Some(reset) = self.claude_usage_limit_reset {
@@ -14333,17 +14377,7 @@ impl AppState {
     /// Activity text animation runs from the wall clock rather than counted ticks,
     /// so its pace stays stable even when frames are delayed.
     fn activity_phase(&self) -> f32 {
-        // Background rows outlive the turn, so their spinners keep their own clock.
-        let Some(started) = self
-            .compacting_started_at
-            .or(self.turn_started_at)
-            .or_else(|| {
-                self.subagents
-                    .iter()
-                    .map(|running| running.started_at)
-                    .min()
-            })
-        else {
+        let Some(started) = self.compacting_started_at.or(self.turn_started_at) else {
             return 0.0;
         };
         let position = started.elapsed().as_millis() % SHIMMER_PERIOD.as_millis();
@@ -14987,6 +15021,82 @@ impl AppState {
         self.side_panel_prompts_expanded = !self.side_panel_prompts_expanded;
     }
 
+    pub fn toggle_side_panel_subagents(&mut self) {
+        self.side_panel_subagents_expanded = !self.side_panel_subagents_expanded;
+    }
+
+    /// 하위 에이전트 줄이나 `main` 줄을 눌렀을 때 그쪽을 본문에 띄운다.
+    pub fn view_subagent(&mut self, id: Option<String>) -> Action {
+        if self.viewing_subagent == id {
+            return Action::None;
+        }
+        self.viewed_row = id.as_ref().and_then(|id| {
+            let running = self.subagents.iter().find(|running| &running.id == id)?;
+            Some(SubagentView {
+                selected: true,
+                ..self.subagent_row(running)
+            })
+        });
+        self.viewing_subagent = id;
+        self.subagent_view_blocks.clear();
+        self.subagent_view_revision += 1;
+        self.refresh_codex_subagent_view();
+        Action::Tick(true)
+    }
+
+    fn subagent_row(&self, running: &RunningSubagent) -> SubagentView {
+        SubagentView {
+            id: running.id.clone(),
+            name: running.name.clone(),
+            is_background_task: running.is_background_task,
+            description: running.description.clone(),
+            tool: running.tool.clone(),
+            elapsed: running.started_at.elapsed(),
+            depth: running.depth,
+            selected: self.viewing_subagent.as_deref() == Some(running.id.as_str()),
+            // OpenCode 하위 에이전트는 띄울 기록을 받지 못한다.
+            viewable: !running.is_background_task
+                && !crate::open_code::is_open_code_model(self.selected_model_name()),
+        }
+    }
+
+    /// 브리지가 지켜볼 하위 에이전트가 바뀌었으면 그 id를 넘긴다. None은 그만 보기다.
+    pub fn take_subagent_watch_change(&mut self) -> Option<Option<String>> {
+        (self.watched_subagent != self.viewing_subagent).then(|| {
+            self.watched_subagent = self.viewing_subagent.clone();
+            self.watched_subagent.clone()
+        })
+    }
+
+    /// 재개 때와 같은 turns를 받아 본문에 띄울 블록으로 바꾼다.
+    fn show_subagent_turns(&mut self, turns: &[Value]) {
+        let blocks = turns
+            .iter()
+            .flat_map(|turn| {
+                let items = turn
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                merged_turn_blocks(&self.cwd, turn, items, None)
+            })
+            .collect();
+        self.subagent_view_blocks = blocks;
+        self.subagent_view_revision += 1;
+    }
+
+    fn refresh_codex_subagent_view(&mut self) {
+        let Some(items) = self
+            .viewing_subagent
+            .as_ref()
+            .and_then(|id| self.codex_subagent_items.get(id))
+        else {
+            return;
+        };
+        let turn = json!({ "items": items });
+        self.show_subagent_turns(&[turn]);
+    }
+
     pub fn toggle_side_panel_mcp(&mut self, provider: &str) {
         if let Some(snapshot) = self.integration_snapshot_mut(match provider {
             "Claude" => ModelProvider::Claude,
@@ -15401,14 +15511,6 @@ impl AppState {
         self.dismissed_artifacts =
             remember_dismissed(std::mem::take(&mut self.dismissed_artifacts), dismissed.clone());
         dismissed
-    }
-
-    pub fn stop_subagent(&self, id: String) -> Action {
-        let turn = self
-            .codex_subagents
-            .get(&id)
-            .and_then(|metadata| metadata.turn_id.clone());
-        Action::StopSubagent { id, turn }
     }
 
     pub fn close_overlay(&mut self) -> Action {
@@ -20284,6 +20386,10 @@ mod tests {
         state.set_provider_changing(None);
         assert!(!state.host_loading());
 
+        state.set_host_activity(Some("Reloading".to_owned()));
+        assert_eq!(state.view().activity.as_deref(), Some("Reloading"));
+        state.set_host_activity(None);
+
         state.set_host_loading(true);
         assert_eq!(state.view().activity.as_deref(), Some("Loading session"));
     }
@@ -20299,27 +20405,15 @@ mod tests {
         assert!(state.host_loading());
         assert_eq!(state.view().activity.as_deref(), Some("Loading session"));
 
-        // The dots cycle through "", ".", "..", "..." and start over.
-        let frames: Vec<String> = (0..9)
-            .map(|_| {
-                state.tick();
-                state.view().activity.unwrap_or_default()
-            })
-            .collect();
-        assert_eq!(
-            frames,
-            [
-                "Loading session",
-                "Loading session.",
-                "Loading session.",
-                "Loading session..",
-                "Loading session..",
-                "Loading session...",
-                "Loading session...",
-                "Loading session",
-                "Loading session",
-            ]
-        );
+        // The dots cycle through "", ".", "..", "..." by elapsed time and start over.
+        for (elapsed, expected) in [
+            (300, "Loading session."),
+            (800, "Loading session..."),
+            (1_050, "Loading session"),
+        ] {
+            state.host_loading_since = Instant::now() - Duration::from_millis(elapsed);
+            assert_eq!(state.view().activity.as_deref(), Some(expected));
+        }
 
         state.set_host_loading(false);
         assert!(!state.host_loading());
@@ -22505,13 +22599,17 @@ mod tests {
         state.handle_notification("turn/subagents/updated", &json!({
             "subagents": [
                 { "id": "agent", "name": "explore" },
+                { "id": "nested", "name": "plan", "depth": 1 },
                 { "id": "shell", "name": "Bash", "backgroundTask": true, "depth": 1 }
             ]
         }));
+        // A subagent's own background task gets no row, but still keeps the host busy.
         assert_eq!(
-            state.view().subagents.iter().map(|row| row.depth).collect::<Vec<_>>(),
-            [0, 1]
+            state.view().subagents.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["agent", "nested"]
         );
+        assert_eq!(state.subagents.len(), 3);
+        assert!(state.host_children_busy());
         state.handle_notification("turn/subagents/updated", &json!({
             "subagents": [
                 { "id": "shell", "name": "Bash", "backgroundTask": true, "description": "npm test" },
@@ -22724,10 +22822,19 @@ mod tests {
                 }
             }),
         );
-        assert_eq!(state.view().subagents[0].name, "Robie [explorer]");
+        assert_eq!(state.view().subagents[0].name, "Robie");
+        assert_eq!(state.view().subagents[0].description, "explorer");
 
+        // 활동의 `/root/<task_name>` 경로는 이름을 덮지 않는다.
         state.handle_notification("item/completed", &codex_activity(child, "started"));
-        assert_eq!(state.view().subagents[0].name, "/root/auth-explorer");
+        assert_eq!(state.view().subagents[0].name, "Robie");
+
+        let role_only = CodexSubagent {
+            role: Some("explorer".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(role_only.display_name(), "Agent");
+        assert_eq!(role_only.description(), "explorer");
 
         state.handle_notification(
             "item/started",
@@ -23045,26 +23152,77 @@ mod tests {
         assert_eq!(rows[0].id, child);
     }
 
-    /// Codex는 자식 스레드의 턴을 중단해 하위 에이전트 하나만 멈춘다. 그 턴 id는
-    /// 자식의 `turn/started`에서 온다. Claude 행은 행 id만으로 작업을 찾는다.
+    /// 줄을 누르면 그 하위 에이전트 기록이 본문에 뜨고, 끝나 목록에서 빠져도 보고 있는
+    /// 행은 남는다. 입력을 보내면 메인 대화로 돌아오고 브리지도 그만 지켜본다.
     #[test]
-    fn stopping_a_subagent_row_carries_the_codex_child_turn() {
+    fn clicking_a_subagent_row_shows_its_transcript_until_main_is_back() {
+        let mut state = state_with_a_running_subagent();
+        assert!(state.view().subagents[0].viewable);
+        assert!(state.view().subagent_view.is_none());
+
+        state.view_subagent(Some("toolu_1".to_owned()));
+        assert_eq!(state.take_subagent_watch_change(), Some(Some("toolu_1".to_owned())));
+        assert_eq!(state.take_subagent_watch_change(), None);
+        state.handle_notification(
+            "turn/subagent/history",
+            &json!({
+                "id": "toolu_1",
+                "turns": [{ "id": "t1", "items": [
+                    { "type": "userMessage", "id": "u1", "content": [{ "type": "text", "text": "Find auth code" }] },
+                    { "type": "agentMessage", "id": "a1", "text": "Found it in src/auth.rs" },
+                ] }],
+            }),
+        );
+        let view = state.view();
+        let transcript = view.subagent_view.as_ref().expect("the body shows the subagent");
+        assert_eq!(transcript.id, "toolu_1");
+        assert!(transcript.blocks.iter().any(|block| block.body.contains("src/auth.rs")));
+        assert!(view.subagents[0].selected);
+
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
+        let rows = state.view().subagents;
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].selected);
+
+        state.editor.set_text("next");
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(state.view().subagent_view.is_none());
+        assert!(state.view().subagents.is_empty());
+        assert_eq!(state.take_subagent_watch_change(), Some(None));
+    }
+
+    /// 보는 중 Esc는 순정처럼 메인으로 돌아올 뿐 진행 중인 턴을 멈추지 않는다.
+    #[test]
+    fn esc_returns_from_a_subagent_view_without_interrupting() {
+        let mut state = state_with_a_running_subagent();
+        state.busy = true;
+        state.turn_id = Some("turn".to_owned());
+        state.view_subagent(Some("toolu_1".to_owned()));
+
+        assert!(matches!(state.handle_key(KeyEvent::from(KeyCode::Esc)), Action::Tick(true)));
+        assert!(state.view().subagent_view.is_none());
+        assert!(matches!(state.handle_key(KeyEvent::from(KeyCode::Esc)), Action::Interrupt));
+    }
+
+    /// Codex 하위 에이전트는 자식 스레드가 끝낸 항목을 모아 본문에 띄운다.
+    #[test]
+    fn a_codex_subagent_row_shows_the_items_its_thread_completed() {
         let mut state = test_state();
-        let child = "00000000-0000-0000-0000-000000000111";
+        let child = "00000000-0000-0000-0000-000000000222";
         spawn_codex_subagent(&mut state, child);
         state.handle_notification(
-            "turn/started",
-            &json!({ "threadId": child, "turn": { "id": "child-turn" } }),
+            "item/completed",
+            &json!({
+                "threadId": child,
+                "item": { "type": "agentMessage", "id": "m1", "text": "child says hi" },
+            }),
         );
 
-        assert!(matches!(
-            state.stop_subagent(child.to_owned()),
-            Action::StopSubagent { id, turn: Some(turn) } if id == child && turn == "child-turn"
-        ));
-        assert!(matches!(
-            state.stop_subagent("toolu_1".to_owned()),
-            Action::StopSubagent { turn: None, .. }
-        ));
+        state.view_subagent(Some(child.to_owned()));
+
+        let view = state.view();
+        let blocks = view.subagent_view.expect("the child is in the body").blocks;
+        assert!(blocks.iter().any(|block| block.body.contains("child says hi")));
     }
 
     fn state_with_a_running_subagent() -> AppState {
@@ -23093,23 +23251,8 @@ mod tests {
 
         assert!(tick.redraw);
         assert!(!tick.animation_only);
-
-        assert!(!tick.spinner_only);
-
-        // An external terminal draws its own IME preedit, so an idle row waits
-        // for the next elapsed second instead of spinning.
-        state.idle_row_spinner = false;
+        // The row's dot is static, so it waits for the next elapsed second.
         assert!(!state.render_tick().redraw);
-
-        // Where dvz draws the preedit, only the row's spinner advances in between.
-        state.idle_row_spinner = true;
-        let same_second = state.render_tick();
-        assert!(same_second.redraw && same_second.animation_only && same_second.spinner_only);
-        assert!(state.animation_view().activity_phase > 0.0);
-
-        // A running turn animates anyway, so its frames may still fall back.
-        state.busy = true;
-        assert!(!state.render_tick().spinner_only);
     }
 
     #[test]
@@ -32050,6 +32193,19 @@ mod tests {
     }
 
     #[test]
+    fn shell_result_is_sent_to_the_model_like_claude_code() {
+        let mut state = test_state();
+        let action = state.submit_shell_result("git status", 1, "out\n", "err\r\n");
+        assert!(matches!(
+            action,
+            Action::Submit(text) if text == "<bash-input>git status</bash-input>\n<bash-stdout>out</bash-stdout><bash-stderr>err\nExit code 1</bash-stderr>"
+        ));
+        let prompt = state.drain_committed().pop().expect("prompt card");
+        assert!(matches!(prompt.kind, BlockKind::User));
+        assert_eq!(prompt.body, "! git status");
+    }
+
+    #[test]
     fn interrupted_local_shell_keeps_output_and_is_marked() {
         let mut state = test_state();
         let anchor = state.begin_local_shell("ping -t host");
@@ -33370,7 +33526,7 @@ mod tests {
         ));
         assert!(matches!(
             state.run_slash_command("/plugins marketplace upgrade"),
-            Action::UpgradeMarketplaces
+            Action::UpgradeMarketplaces(None)
         ));
         // A name is rejected rather than silently ignored, because the server
         // upgrades every git marketplace regardless of what is named.

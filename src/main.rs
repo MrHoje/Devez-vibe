@@ -574,7 +574,7 @@ fn activity_frame(state: &mut AppState, renderer: &mut Renderer) -> Result<()> {
         return Ok(());
     }
     let animated = tick.animation_only && renderer.render_animation(state.animation_view())?;
-    if !animated && !tick.spinner_only {
+    if !animated {
         draw(state, renderer)?;
     }
     Ok(())
@@ -1240,6 +1240,8 @@ async fn choose_startup_session(
                 diff_display_mode: DiffDisplayMode::Collapse,
                 side_panel_width: None,
                 side_panel_prompts_expanded: true,
+                side_panel_subagents_expanded: true,
+                subagent_view: None,
                 side_panel_diff: &[],
                 side_panel_diff_selected: None,
                 side_panel_diff_expanded: true,
@@ -1726,7 +1728,13 @@ async fn execute_split_conversation_action(
             interrupt_turn(server, state).await;
             Ok(false)
         }
-        action => execute_action(server, state, renderer, management_tx, action).await,
+        Action::RunShell(command) => {
+            let action = run_local_shell(state, renderer, command).await?;
+            Box::pin(execute_split_conversation_action(server, state, renderer, management_tx, action, None)).await
+        }
+        // A split screen paints both panes together; the single-pane draw that
+        // shows the wait label would push this pane's blocks into the main one.
+        action => run_action(server, state, renderer, management_tx, action).await,
     }
 }
 
@@ -1876,7 +1884,6 @@ async fn event_loop(
         }
         let mut connection_closed = false;
         let mut animation_tick = false;
-        let mut spinner_tick = false;
         // Set when an edit took a selection. Paste batching holds the screen still
         // while keys arrive in a burst, but text vanishing from the prompt has to
         // be seen at once — otherwise the selection looks untouched until the next
@@ -2315,12 +2322,9 @@ async fn event_loop(
                 let mut redraw = main_tick.redraw
                     || btw_tick.as_ref().is_some_and(|tick| tick.redraw);
                 animation_tick = btw_state.is_none() && main_tick.animation_only;
-                spinner_tick = main_tick.spinner_only
-                    && !btw_tick.as_ref().is_some_and(|tick| tick.redraw);
                 if renderer.recover_external_screen_write() {
                     redraw = true;
                     animation_tick = false;
-                    spinner_tick = false;
                 }
                 // Ctrl+wheel font zoom changes the cell grid without always
                 // sending a `Resize`, so the size is polled here as well.
@@ -2330,7 +2334,6 @@ async fn event_loop(
                     renderer.relayout()?;
                     redraw = true;
                     animation_tick = false;
-                    spinner_tick = false;
                 } else if resize.pending() {
                     // Nothing painted onto a grid that is still moving survives.
                     redraw = false;
@@ -2394,6 +2397,7 @@ async fn event_loop(
             }
             action => execute_action(server, state, renderer, &management_tx, action).await?,
         };
+        sync_subagent_watch(server, state).await;
         if returning_from_side {
             side_exit_key_guard = Some(Instant::now() + SIDE_EXIT_KEY_SETTLE);
         }
@@ -2405,9 +2409,7 @@ async fn event_loop(
             if animated {
                 perf::record_animation(animation_started.elapsed());
             }
-            // An idle row spinner never forces a full frame on its own.
-            let spinner_only = spinner_tick && !selection_edited && !force_paint;
-            if !animated && !spinner_only {
+            if !animated {
                 draw_conversations(state, &mut btw_state, split_focus, renderer)?;
             }
         }
@@ -2694,6 +2696,11 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
             state.toggle_side_panel_prompts();
             Action::Tick(true)
         }
+        Pick::ViewSubagent(id) => state.view_subagent(id),
+        Pick::SubagentSection => {
+            state.toggle_side_panel_subagents();
+            Action::Tick(true)
+        }
         Pick::McpSection(provider) => {
             state.toggle_side_panel_mcp(&provider);
             Action::Tick(true)
@@ -2729,7 +2736,6 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
         Pick::AgentMode => state.click_agent_mode(),
         Pick::Model => state.run_command("/model"),
         Pick::EffortSetting => state.run_command("/effort"),
-        Pick::StopSubagent(id) => state.stop_subagent(id),
         Pick::ScrollToBottom => Action::ScrollToBottom,
         Pick::History(_) => Action::None,
         Pick::Prompt(block_id) => Action::ScrollToPrompt(block_id),
@@ -2890,7 +2896,7 @@ async fn run_local_shell(
     state: &mut AppState,
     renderer: &mut Renderer,
     command: String,
-) -> Result<()> {
+) -> Result<Action> {
     renderer.scroll_to_bottom();
     let cwd = state.view().cwd;
     let anchor: Block = state.begin_local_shell(&command);
@@ -2926,14 +2932,23 @@ async fn run_local_shell(
         Wake::Input(event) => Ok(Some(event)),
     })
     .await?;
-    let (output, exit_code) = match result {
-        Ok((stdout, stderr, code)) => (local_shell_output(&stdout, &stderr), code),
-        Err(error) => (error.to_string(), Some(-1)),
+    let (output, exit_code, streams) = match result {
+        Ok((stdout, stderr, code)) => (local_shell_output(&stdout, &stderr), code, Some((stdout, stderr))),
+        Err(error) => (error.to_string(), Some(-1), None),
     };
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let id = state.finish_local_shell(&anchor, &command, output, exit_code, duration_ms);
     renderer.toggle_tool(id);
-    Ok(())
+    // Esc로 멈춘 명령은 순정처럼 답을 청하지 않는다.
+    Ok(match (exit_code, streams) {
+        (Some(code), Some((stdout, stderr))) => state.submit_shell_result(
+            &command,
+            code,
+            &String::from_utf8_lossy(&stdout),
+            &String::from_utf8_lossy(&stderr),
+        ),
+        _ => Action::None,
+    })
 }
 
 /// 셸 자식을 끝까지 기다리며 출력을 읽는다. `stopped`가 오면 작업 개체를 버려
@@ -3023,7 +3038,43 @@ fn worktree_fork_params(state: &AppState, path: &Path) -> Value {
     thread_fork_params(state, Some(path), false)
 }
 
+/// Commands that wait on a backend, a CLI, or the network name the wait above
+/// the composer, and their requests repaint while they run instead of freezing
+/// the screen.
 async fn execute_action(
+    server: &mut BackendServer,
+    state: &mut AppState,
+    renderer: &mut Renderer,
+    management_tx: &mpsc::UnboundedSender<ManagementUpdate>,
+    action: Action,
+) -> Result<bool> {
+    let label = match &action {
+        Action::ReloadPlugins => "Reloading",
+        Action::InstallPlugin(_) => "Installing",
+        Action::UninstallPlugin(_) => "Uninstalling",
+        Action::AddMarketplace(_) => "Adding",
+        Action::RemoveMarketplace(_) => "Removing",
+        Action::SetPlugin { .. } | Action::SetSkill { .. } => "Updating",
+        Action::SubmitProviderAuth(_) | Action::CompleteProviderOAuth { .. } => "Connecting",
+        Action::PreparePluginInstall(_)
+        | Action::PreparePluginUninstall(_)
+        | Action::ShowSkills
+        | Action::OpenSkills { .. }
+        | Action::ShowStatus
+        | Action::ShowUsage
+        | Action::NewThread => "Loading",
+        _ => return run_action(server, state, renderer, management_tx, action).await,
+    };
+    state.set_host_activity(Some(label.to_owned()));
+    let result = match draw(state, renderer) {
+        Ok(()) => run_action(server, state, renderer, management_tx, action).await,
+        Err(error) => Err(error),
+    };
+    state.set_host_activity(None);
+    result
+}
+
+async fn run_action(
     server: &mut BackendServer,
     state: &mut AppState,
     renderer: &mut Renderer,
@@ -3044,11 +3095,13 @@ async fn execute_action(
         | Action::SelectComposerAll
         | Action::Quit) => return execute_local_action(state, renderer, action),
         Action::ShowStatus => {
-            refresh_account(server, state).await;
+            let account = await_integration_panel(state, renderer, read_account(server, state)).await?;
+            apply_account(state, account);
             state.show_status();
         }
         Action::ShowUsage => {
-            refresh_account(server, state).await;
+            let account = await_integration_panel(state, renderer, read_account(server, state)).await?;
+            apply_account(state, account);
             state.show_usage();
         }
         Action::Submit(text) => {
@@ -3074,22 +3127,13 @@ async fn execute_action(
                 state.restore_unsent_steer();
             }
         }
-        Action::RunShell(command) => run_local_shell(state, renderer, command).await?,
+        Action::RunShell(command) => {
+            let action = run_local_shell(state, renderer, command).await?;
+            return Box::pin(execute_action(server, state, renderer, management_tx, action)).await;
+        }
         Action::RunUpdate => start_self_update(management_tx.clone()),
         Action::Interrupt => {
             interrupt_turn(server, state).await;
-        }
-        // 행은 런타임의 종료 알림이 걷는다. 여기서는 실패만 알린다.
-        Action::StopSubagent { id, turn } => {
-            if let Err(error) = server
-                .request(
-                    "subagent/stop",
-                    json!({ "threadId": state.thread_id, "id": id, "turnId": turn }),
-                )
-                .await
-            {
-                state.push_notice(BlockKind::Error, "Subagent stop failed", error.to_string());
-            }
         }
         // Claude's bridge understands cancellation. Codex's typed answer does
         // not: interrupt its turn without ever releasing an empty answer.
@@ -3207,7 +3251,10 @@ async fn execute_action(
         }
         Action::ActivateCodex => activate_codex(server, state, renderer).await?,
         Action::ActivateOpenCode => {
-            if open_code::has_connected_provider() {
+            // 2.x keeps credentials out of `auth.json`, so a miss there asks OpenCode.
+            if open_code::has_connected_provider()
+                || await_with_activity(state, renderer, server.open_code_connected()).await?
+            {
                 activate_open_code(server, state, renderer).await?;
             } else {
                 open_provider_connection(server, state, renderer).await?;
@@ -3571,6 +3618,16 @@ async fn execute_action(
             Err(error) => state.push_notice(BlockKind::Error, "Rename failed", error.to_string()),
         },
         Action::OpenMcp(notice) => {
+            // MCP servers load with the session, so build it as the first prompt would.
+            if state.thread_pending() {
+                state.set_host_loading(true);
+                draw(state, renderer)?;
+                let opened = open_pending_thread(server, state, renderer).await;
+                state.set_host_loading(false);
+                if !opened? {
+                    return Ok(false);
+                }
+            }
             open_integration_loading(state, renderer, "MCP")?;
             match await_integration_panel(state, renderer, list_mcp_servers(server, state)).await? {
                 Ok(response) => {
@@ -3694,12 +3751,10 @@ async fn execute_action(
                         );
                         return Ok(false);
                     };
-                    match server
-                        .set_provider_api_key(&provider_id, &api_key, &inputs)
-                        .await
-                    {
+                    let request = server.set_provider_api_key(&provider_id, &api_key, &inputs);
+                    match await_integration_panel(state, renderer, request).await? {
                         Ok(()) => {
-                            refresh_provider_models(server, state, &provider_name).await;
+                            refresh_provider_models(server, state, renderer, &provider_name).await?;
                         }
                         Err(error) => state.push_notice(
                             BlockKind::Error,
@@ -3709,10 +3764,8 @@ async fn execute_action(
                     }
                 }
                 ProviderAuthKind::OAuth => {
-                    match server
-                        .authorize_provider_oauth(&provider_id, method_index, &inputs)
-                        .await
-                    {
+                    let request = server.authorize_provider_oauth(&provider_id, method_index, &inputs);
+                    match await_integration_panel(state, renderer, request).await? {
                         Ok(authorization) => {
                             let url = authorization
                                 .get("url")
@@ -3748,13 +3801,12 @@ async fn execute_action(
                             }
                             draw(state, renderer)?;
                             if callback_method == "auto" {
-                                match server
-                                    .complete_provider_oauth(&provider_id, method_index, None)
-                                    .await
-                                {
+                                let request =
+                                    server.complete_provider_oauth(&provider_id, method_index, None);
+                                match await_integration_panel(state, renderer, request).await? {
                                     Ok(()) => {
-                                        refresh_provider_models(server, state, &provider_name)
-                                            .await;
+                                        refresh_provider_models(server, state, renderer, &provider_name)
+                                            .await?;
                                     }
                                     Err(error) => {
                                         state.provider_connection_failed(error.to_string())
@@ -3777,11 +3829,9 @@ async fn execute_action(
             method,
             code,
         } => {
-            match server
-                .complete_provider_oauth(&provider_id, method, Some(&code))
-                .await
-            {
-                Ok(()) => refresh_provider_models(server, state, &provider_name).await,
+            let request = server.complete_provider_oauth(&provider_id, method, Some(&code));
+            match await_integration_panel(state, renderer, request).await? {
+                Ok(()) => refresh_provider_models(server, state, renderer, &provider_name).await?,
                 Err(error) => {
                     state.push_notice(BlockKind::Error, "OAuth connection failed", error.to_string())
                 }
@@ -3919,7 +3969,7 @@ async fn execute_action(
         }
         Action::ConfirmPluginInstall(plugin) => state.confirm_plugin_install(&plugin),
         Action::ConfirmPluginUninstall(plugin) => state.confirm_plugin_uninstall(&plugin),
-        Action::PreparePluginInstall(query) => match list_plugins(server, state).await {
+        Action::PreparePluginInstall(query) => match await_integration_panel(state, renderer, list_plugins(server, state)).await? {
             Ok(response) => match PluginCatalog::from_value(&response).resolve(&query) {
                 Some(plugin) if plugin.installed && !plugin.enabled => state.push_notice(
                     BlockKind::System,
@@ -3956,7 +4006,7 @@ async fn execute_action(
                 state.push_notice(BlockKind::Error, "Plugin lookup failed", error.to_string())
             }
         },
-        Action::PreparePluginUninstall(query) => match list_plugins(server, state).await {
+        Action::PreparePluginUninstall(query) => match await_integration_panel(state, renderer, list_plugins(server, state)).await? {
             Ok(response) => match PluginCatalog::from_value(&response).resolve(&query) {
                 Some(plugin) if plugin.installed && !plugin.uninstall_allowed => state.push_notice(
                     BlockKind::Warning,
@@ -3985,7 +4035,7 @@ async fn execute_action(
                 state.push_notice(BlockKind::Error, "Plugin lookup failed", error.to_string())
             }
         },
-        Action::SetPlugin { query, enabled } => match list_plugins(server, state).await {
+        Action::SetPlugin { query, enabled } => match await_integration_panel(state, renderer, list_plugins(server, state)).await? {
             Ok(response) => match PluginCatalog::from_value(&response).resolve(&query) {
                 Some(plugin) if !plugin.installed => state.push_notice(
                     BlockKind::Warning,
@@ -4019,15 +4069,9 @@ async fn execute_action(
                     },
                 ),
                 Some(plugin) => {
-                    if let Err(error) = write_plugin_enabled(
-                        server,
-                        state,
-                        &plugin.id,
-                        plugin.scope.as_deref(),
-                        enabled,
-                    )
-                    .await
-                    {
+                    let request =
+                        write_plugin_enabled(server, state, &plugin.id, plugin.scope.as_deref(), enabled);
+                    if let Err(error) = await_integration_panel(state, renderer, request).await? {
                         state.push_notice(
                             BlockKind::Error,
                             "Failed to update plugin",
@@ -4048,7 +4092,7 @@ async fn execute_action(
                                 }
                             ),
                         );
-                        let _ = refresh_integrations(server, state, true).await;
+                        let _ = refresh_integrations(server, state, renderer, true).await;
                     }
                 }
                 None => state.push_notice(
@@ -4127,7 +4171,8 @@ async fn execute_action(
             if let Some(ref_name) = ref_name {
                 params["refName"] = Value::String(ref_name.to_owned());
             }
-            match integration_request(server, state, "marketplace/add", params).await {
+            let request = integration_request(server, state, "marketplace/add", params);
+            match await_integration_panel(state, renderer, request).await? {
                 Ok(response) => {
                     let already = response
                         .get("alreadyAdded")
@@ -4137,17 +4182,18 @@ async fn execute_action(
                         .get("installedRoot")
                         .and_then(Value::as_str)
                         .unwrap_or(source);
-                    let _ = refresh_integrations(server, state, true).await;
+                    let _ = refresh_integrations(server, state, renderer, true).await;
                     reopen_marketplaces(
                         server,
                         state,
+                        renderer,
                         if already {
                             tr(format!("이미 추가되어 있습니다 · {root}"), format!("Already added · {root}"))
                         } else {
                             tr(format!("추가했습니다 · {root}"), format!("Added · {root}"))
                         },
                     )
-                    .await;
+                    .await?;
                 }
                 Err(error) => state.push_notice(
                     BlockKind::Error,
@@ -4157,18 +4203,17 @@ async fn execute_action(
             }
         }
         Action::RemoveMarketplace(name) => {
-            match integration_request(
+            let request = integration_request(
                 server,
                 state,
                 "marketplace/remove",
                 json!({ "marketplaceName": name }),
-            )
-            .await
-            {
+            );
+            match await_integration_panel(state, renderer, request).await? {
                 Ok(_) => {
-                    let _ = refresh_integrations(server, state, true).await;
-                    reopen_marketplaces(server, state, tr(format!("제거했습니다 · {name}"), format!("Removed · {name}")))
-                        .await;
+                    let _ = refresh_integrations(server, state, renderer, true).await;
+                    let notice = tr(format!("제거했습니다 · {name}"), format!("Removed · {name}"));
+                    reopen_marketplaces(server, state, renderer, notice).await?;
                 }
                 Err(error) => state.push_notice(
                     BlockKind::Error,
@@ -4181,18 +4226,23 @@ async fn execute_action(
             // Re-reading the catalogues is what makes new skills and mentions
             // usable; restarting the MCP servers is what makes a plugin's tools
             // usable. Neither implies the other, so a reload does both.
-            let integrations = refresh_integrations(server, state, true).await;
-            let using_claude = claude::is_claude_model(state.selected_model_name());
+            let integrations = refresh_integrations(server, state, renderer, true).await;
+            let model = state.selected_model_name().to_owned();
+            let using_claude = claude::is_claude_model(&model);
             let reconnect = if using_claude {
-                integration_request(server, state, "plugin/reload", json!({})).await
+                let request = integration_request(server, state, "plugin/reload", json!({}));
+                await_integration_panel(state, renderer, request).await?
             } else {
-                server.request("config/mcpServer/reload", json!({})).await
+                let request = server.request("config/mcpServer/reload", json!({}));
+                await_integration_panel(state, renderer, request).await?
             };
             let mcp_response = if reconnect.is_ok() {
-                match list_mcp_servers(server, state).await {
-                    Ok(response) => Some(response),
+                match await_integration_panel(state, renderer, list_mcp_servers(server, state)).await? {
+                    Ok(response) => {
+                        state.update_mcp_servers_for_model(&response, &model);
+                        Some(response)
+                    }
                     Err(error) => {
-                        let model = state.selected_model_name().to_owned();
                         state.note_mcp_query_error_for_model(error.to_string(), &model);
                         None
                     }
@@ -4200,57 +4250,63 @@ async fn execute_action(
             } else {
                 None
             };
-            if let Some(response) = &mcp_response {
-                let model = state.selected_model_name().to_owned();
-                state.update_mcp_servers_for_model(response, &model);
-            }
             let servers = (!using_claude)
                 .then(|| mcp_response.as_ref().map(McpServerInfo::list_from_value))
                 .flatten();
-            let mut report = format_reload_report(
+            let report = format_reload_report(
                 integrations.as_ref().err().map(ToString::to_string),
                 reconnect.as_ref().err().map(ToString::to_string),
                 servers.as_deref(),
             );
-            if using_claude
-                && let Ok(response) = &reconnect
-                && let Some(message) = response.get("message").and_then(Value::as_str)
-            {
-                if !report.is_empty() {
-                    report.push('\n');
-                }
-                report.push_str(message);
+            let headline = if using_claude {
+                tr(
+                    "Claude 플러그인 설정을 다시 읽었습니다. 새 대화부터 적용됩니다.",
+                    "Reloaded Claude plugin settings. They apply from the next conversation.",
+                )
+            } else {
+                tr("플러그인을 다시 불러왔습니다.", "Reloaded plugins.")
+            };
+            if integrations.is_err() || reconnect.is_err() {
+                state.push_notice(BlockKind::Warning, headline, report);
+            } else {
+                // An untitled note renders as a bare `◆` row, without the card.
+                let body = [headline, report.as_str()].join("\n");
+                state.push_notice(BlockKind::System, "", body.trim_end());
             }
-            state.push_notice(
-                if integrations.is_err() || reconnect.is_err() {
-                    BlockKind::Warning
-                } else {
-                    BlockKind::System
-                },
-                if using_claude {
-                    "✓ Plugin settings refreshed"
-                } else {
-                    "✓ Plugins reloaded"
-                },
-                report,
-            );
         }
-        Action::UpgradeMarketplaces => {
-            match integration_request(server, state, "marketplace/upgrade", json!({})).await {
-                Ok(response) => {
-                    let _ = refresh_integrations(server, state, true).await;
-                    reopen_marketplaces(server, state, format_upgrade_result(&response)).await;
+        Action::UpgradeMarketplaces(name) => {
+            let title = if name.is_some() { "Updating marketplace" } else { "Updating marketplaces" };
+            open_integration_loading(state, renderer, title)?;
+            let request = integration_request(
+                server,
+                state,
+                "marketplace/upgrade",
+                json!({ "marketplaceName": name }),
+            );
+            let result = await_integration_panel(state, renderer, request).await?;
+            // A partial failure still refreshed the others, so the lists are
+            // reread either way and the panel stays open on the outcome.
+            let _ = refresh_integrations(server, state, renderer, true).await;
+            let notice = match result {
+                Ok(response) => format_upgrade_result(&response),
+                Err(error) => {
+                    state.push_notice(
+                        BlockKind::Error,
+                        "Failed to update marketplace",
+                        error.to_string(),
+                    );
+                    tr(
+                        "갱신하지 못했습니다. 위 알림을 확인하세요.",
+                        "Update failed. See the notice above.",
+                    )
+                    .to_owned()
                 }
-                Err(error) => state.push_notice(
-                    BlockKind::Error,
-                    "Failed to update marketplace",
-                    error.to_string(),
-                ),
-            }
+            };
+            reopen_marketplaces(server, state, renderer, notice).await?;
         }
         Action::InstallPlugin(target) => {
             let using_claude = claude::is_claude_model(state.selected_model_name());
-            let response = integration_request(
+            let request = integration_request(
                 server,
                 state,
                 "plugin/install",
@@ -4259,9 +4315,8 @@ async fn execute_action(
                     "marketplacePath": target.marketplace_path,
                     "remoteMarketplaceName": target.remote_marketplace_name
                 }),
-            )
-            .await;
-            match response {
+            );
+            match await_integration_panel(state, renderer, request).await? {
                 Ok(response) => {
                     let auth = format_apps_needing_auth(&response);
                     // Skills and mentions come from the catalogue the refresh
@@ -4292,7 +4347,7 @@ async fn execute_action(
                             )
                         },
                     );
-                    let _ = refresh_integrations(server, state, true).await;
+                    let _ = refresh_integrations(server, state, renderer, true).await;
                 }
                 Err(error) => {
                     state.push_notice(BlockKind::Error, "Plugin install failed", error.to_string())
@@ -4301,14 +4356,13 @@ async fn execute_action(
         }
         Action::UninstallPlugin(target) => {
             let using_claude = claude::is_claude_model(state.selected_model_name());
-            match integration_request(
+            let request = integration_request(
                 server,
                 state,
                 "plugin/uninstall",
                 json!({ "pluginId": target.plugin_id }),
-            )
-            .await
-            {
+            );
+            match await_integration_panel(state, renderer, request).await? {
                 Ok(_) => {
                     state.push_notice(
                         BlockKind::System,
@@ -4333,7 +4387,7 @@ async fn execute_action(
                             )
                         },
                     );
-                    let _ = refresh_integrations(server, state, true).await;
+                    let _ = refresh_integrations(server, state, renderer, true).await;
                 }
                 Err(error) => {
                     state.push_notice(BlockKind::Error, "Plugin removal failed", error.to_string())
@@ -4342,86 +4396,61 @@ async fn execute_action(
         }
         Action::ShowSkills => {
             let provider = SkillProvider::from_model(state.selected_model_name());
-            open_skills(server, state, provider, None).await;
+            open_skills(server, state, renderer, provider, None).await?;
         }
         Action::OpenSkills { provider, notice } => {
-            open_skills(server, state, provider, notice).await;
+            open_skills(server, state, renderer, provider, notice).await?;
         }
         Action::SetSkill {
             provider,
             name,
             enabled,
-        } => match list_skills(server, &state.cwd, false, provider).await {
-            Ok(skills) => match resolve_skill(&skills, &name) {
-                Some(skill) if skill.enabled == enabled => {
-                    open_skills(
-                        server,
-                        state,
-                        provider,
-                        Some(if enabled {
-                            tr(format!("{} · 이미 켜짐", skill.name), format!("{} · already on", skill.name))
-                        } else {
-                            tr(format!("{} · 이미 꺼짐", skill.name), format!("{} · already off", skill.name))
-                        }),
-                    )
-                    .await
-                }
-                Some(skill) => match write_skill_enabled(
-                    server,
-                    &state.cwd,
-                    provider,
-                    &skill.path,
-                    skill.source.as_deref(),
-                    &skill.scope,
-                    enabled,
-                )
-                .await
-                {
-                    Ok(response) => {
-                        let effective = response
-                            .get("effectiveEnabled")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(enabled);
-                        open_skills(
-                            server,
-                            state,
-                            provider,
-                            Some(format!(
-                                "{} · {}",
-                                skill.name,
-                                if effective { "On" } else { "Off" }
-                            )),
-                        )
-                        .await;
+        } => {
+            let cwd = state.cwd.clone();
+            let skills = await_integration_panel(state, renderer, list_skills(server, &cwd, false, provider)).await?;
+            let notice = match skills.map(|skills| resolve_skill(&skills, &name)) {
+                Ok(Some(skill)) if skill.enabled == enabled => {
+                    if enabled {
+                        tr(format!("{} · 이미 켜짐", skill.name), format!("{} · already on", skill.name))
+                    } else {
+                        tr(format!("{} · 이미 꺼짐", skill.name), format!("{} · already off", skill.name))
                     }
-                    Err(error) => {
-                        open_skills(
-                            server,
-                            state,
-                            provider,
-                            Some(tr(
-                                format!("{} · 변경 실패: {error}", skill.name),
-                                format!("{} · change failed: {error}", skill.name),
-                            )),
-                        )
-                        .await;
-                    }
-                },
-                None => {
-                    open_skills(
-                        server,
-                        state,
-                        provider,
-                        Some(tr(
-                            format!("{name} · Skill을 찾을 수 없습니다."),
-                            format!("{name} · skill not found."),
-                        )),
-                    )
-                    .await;
                 }
-            },
-            Err(error) => state.push_notice(BlockKind::Error, "Skill lookup failed", error.to_string()),
-        },
+                Ok(Some(skill)) => {
+                    let request = write_skill_enabled(
+                        server,
+                        &cwd,
+                        provider,
+                        &skill.path,
+                        skill.source.as_deref(),
+                        &skill.scope,
+                        enabled,
+                    );
+                    match await_integration_panel(state, renderer, request).await? {
+                        Ok(response) => {
+                            let effective = response
+                                .get("effectiveEnabled")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(enabled);
+                            format!("{} · {}", skill.name, if effective { "On" } else { "Off" })
+                        }
+                        Err(error) => tr(
+                            format!("{} · 변경 실패: {error}", skill.name),
+                            format!("{} · change failed: {error}", skill.name),
+                        ),
+                    }
+                }
+                Ok(None) => tr(
+                    format!("{name} · Skill을 찾을 수 없습니다."),
+                    format!("{name} · skill not found."),
+                ),
+                Err(error) => {
+                    state.push_notice(BlockKind::Error, "Skill lookup failed", error.to_string());
+                    return Ok(false);
+                }
+            };
+            open_skills(server, state, renderer, provider, Some(notice)).await?;
+        }
         Action::SetSkillEnabled {
             provider,
             name,
@@ -4617,7 +4646,7 @@ async fn open_provider_connection(
 ) -> Result<()> {
     state.open_provider_loading();
     draw(state, renderer)?;
-    match server.provider_catalog().await {
+    match await_integration_panel(state, renderer, server.provider_catalog()).await? {
         Ok(catalog) => state.open_provider_picker(&catalog),
         Err(error) => state.provider_connection_failed(error.to_string()),
     }
@@ -4635,9 +4664,9 @@ fn open_integration_loading(
     draw(state, renderer)
 }
 
-/// Keeps the loading panel's dots moving until `request` answers. Nothing but
-/// the panel changes meanwhile, so it repaints from the same shared borrow the
-/// request holds; keys stay queued for the panel that replaces it.
+/// Keeps a loading panel's or the activity row's dots moving until `request`
+/// answers. Nothing else changes meanwhile, so it repaints from the same shared
+/// borrow the request holds; keys stay queued for whatever the answer opens.
 async fn await_integration_panel<T>(
     state: &AppState,
     renderer: &mut Renderer,
@@ -4669,7 +4698,7 @@ async fn start_new_thread(
     // runtime is selected by then. Until it does, the screen is an empty new
     // conversation with no session behind it.
     draw(state, renderer)?;
-    let refresh_errors = refresh_new_thread_catalogs(server, state).await;
+    let refresh_errors = refresh_new_thread_catalogs(server, state, renderer).await?;
     if !refresh_errors.is_empty() {
         state.push_notice(
             BlockKind::Warning,
@@ -4688,11 +4717,12 @@ async fn start_new_thread(
 async fn refresh_new_thread_catalogs(
     server: &mut BackendServer,
     state: &mut AppState,
-) -> Vec<String> {
+    renderer: &mut Renderer,
+) -> Result<Vec<String>> {
     let model = state.selected_model_name().to_owned();
     if open_code::is_open_code_model(&model) {
-        return match server.open_code_provider_api() {
-            Some(api) => match api.skills().await {
+        return Ok(match server.open_code_provider_api() {
+            Some(api) => match await_integration_panel(state, renderer, api.skills()).await? {
                 Ok(response) => {
                     state.update_skills(&response);
                     Vec::new()
@@ -4703,15 +4733,17 @@ async fn refresh_new_thread_catalogs(
                 tr("Skill 조회 실패: OpenCode 연결이 없습니다.", "Skill lookup failed: no OpenCode connection.")
                     .to_owned(),
             ],
-        };
+        });
     }
 
     let using_codex = is_codex_model(&model);
-    if using_codex && let Err(error) = server.start_codex().await {
-        return vec![tr(format!("Codex 목록 조회 실패: {error}"), format!("Codex list lookup failed: {error}"))];
+    if using_codex
+        && let Err(error) = await_integration_panel(state, renderer, server.start_codex()).await?
+    {
+        return Ok(vec![tr(format!("Codex 목록 조회 실패: {error}"), format!("Codex list lookup failed: {error}"))]);
     }
     let Some(client) = server.integration_client(&model) else {
-        return vec![tr("Skills·Plugins 조회 연결이 없습니다.", "No connection for looking up skills and plugins.").to_owned()];
+        return Ok(vec![tr("Skills·Plugins 조회 연결이 없습니다.", "No connection for looking up skills and plugins.").to_owned()]);
     };
     let skills_client = client.clone();
     let plugins_client = client;
@@ -4731,8 +4763,10 @@ async fn refresh_new_thread_catalogs(
         "plugin/installed",
         json!({ "cwd": cwd.clone(), "cwds": [cwd] }),
     );
-    let (models, skills, plugins) =
-        tokio::join!(model_refresh, skills_refresh, plugins_refresh);
+    let (models, skills, plugins) = await_integration_panel(state, renderer, async {
+        tokio::join!(model_refresh, skills_refresh, plugins_refresh)
+    })
+    .await?;
 
     let mut errors = Vec::new();
     if let Some(models) = models {
@@ -4768,7 +4802,7 @@ async fn refresh_new_thread_catalogs(
             errors.push(tr(format!("플러그인 조회 실패: {error}"), format!("Plugin lookup failed: {error}")));
         }
     }
-    errors
+    Ok(errors)
 }
 
 /// `/resume`, given the same treatment as [`start_new_thread`]: the screen resets
@@ -5428,7 +5462,6 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 여러 단계·두 번 이상 도구 호출·설계 판단이 필요하면 첫 작업 도구 전에 TaskCreate로 작업 목록을 만든다. 한 번으로 끝난다고 확신할 때만 생략한다. 진행 안내나 본문 목록은 TaskCreate를 대신하지 않는다.\n",
     "- 모든 TaskCreate의 subject는 `1. `, `2. `, `3. `으로 직접 번호를 붙인다. 새 목록은 기존 Task 번호와 무관하게 1부터 시작한다. 실제 조사·수정·검증만 Task로 두고 보고만을 별도 Task로 만들지 않는다.\n",
     "- 각 Task의 첫 Read/Grep/Glob/Bash 전에 in_progress, 끝난 직후 completed로 바꾼다. 동시에 진행 중인 Task는 하나이며 종료 직전에 여러 Task를 일괄 완료하지 않는다.\n",
-    "- Agent 호출의 name은 대상과 동작을 담은 영문 소문자·숫자·밑줄 이름으로 짓는다.\n",
     "답변:\n",
     "- 문단과 불릿 항목 사이에는 빈 줄을 한 줄 넣는다. 주제가 바뀌면 줄바꿈만 하지 말고 별도 문단이나 불릿으로 나눈다. 코드 블록과 표 내부의 줄 간격은 유지한다.\n",
     "- 결론부터 한국어 불릿·코드 블록으로 쓴다. 서론·인사·맺음말 요약·이모지는 쓰지 않는다. 항목명·상태·판정과 다른 에이전트의 보고도 쉬운 한국어로 풀고 영어 판정은 별도 규격의 내부 기록에만 유지한다. 판정 코드는 기술 식별자·인용문 원문 보존의 예외가 아니며, 괄호 안에서도 한국어 판정으로 바꾼다.\n",
@@ -5451,6 +5484,17 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
 );
 
 const CLAUDE_TURN_REMINDER: &str = "한국어로 사용자 영향과 필요한 조치부터 쓴다. 분량과 예외는 현재 역할을 따른다. 근거·미확인 범위는 남기고 기술 식별자는 판단에 필요할 때만 쓴다. 새 사실 없는 진행 문장은 생략한다.";
+
+/// 하위 에이전트 행은 순정처럼 name과 description을 함께 보인다. name은 영문
+/// 식별자만 받으므로 description만 `/language`를 따른다. 언어는 세션 중에도
+/// 바뀌므로 시작 지침이 아니라 매 턴 알림에 싣는다.
+fn claude_turn_reminder() -> String {
+    let naming = tr(
+        "Agent 호출의 name은 대상과 동작을 담은 영문 소문자·숫자·밑줄 이름으로 짓고 description은 짧은 한국어로 쓴다.",
+        "Agent 호출의 name은 대상과 동작을 담은 영문 소문자·숫자·밑줄 이름으로 짓고 description은 짧은 영어로 쓴다.",
+    );
+    format!("{CLAUDE_TURN_REMINDER} {naming}")
+}
 
 /// The Claude selections a session has to be told, because the bridge opens a
 /// fresh SDK session for every start and resume. Anything left out here comes
@@ -5525,7 +5569,7 @@ fn turn_additional_context(agent: agent::AgentMode, auto_knowledge: bool) -> Val
             "kind": "application"
         },
         "claude-devez-vibe-reminder": {
-            "value": CLAUDE_TURN_REMINDER,
+            "value": claude_turn_reminder(),
             "kind": "application"
         },
         "devez-vibe-agent": {
@@ -5625,10 +5669,12 @@ async fn list_skills(
 async fn open_skills(
     server: &mut BackendServer,
     state: &mut AppState,
+    renderer: &mut Renderer,
     provider: SkillProvider,
     notice: Option<String>,
-) {
-    match list_skills(server, &state.cwd, true, provider).await {
+) -> Result<()> {
+    let request = list_skills(server, &state.cwd, true, provider);
+    match await_integration_panel(state, renderer, request).await? {
         Ok(response) => state.open_skills_picker(provider, &response, notice),
         Err(error) => {
             let response = json!({
@@ -5641,6 +5687,7 @@ async fn open_skills(
             state.open_skills_picker(provider, &response, notice);
         }
     }
+    Ok(())
 }
 
 async fn integration_request(
@@ -5693,15 +5740,14 @@ async fn list_mcp_servers(server: &BackendServer, state: &AppState) -> Result<Va
 async fn refresh_provider_models(
     server: &BackendServer,
     state: &mut AppState,
+    renderer: &mut Renderer,
     provider_name: &str,
-) {
-    match server
-        .request(
-            "model/list",
-            json!({ "includeHidden": false, "limit": 100 }),
-        )
-        .await
-    {
+) -> Result<()> {
+    let request = server.request(
+        "model/list",
+        json!({ "includeHidden": false, "limit": 100 }),
+    );
+    match await_integration_panel(state, renderer, request).await? {
         Ok(response) => {
             state.replace_models(parse_models(&response));
             state.provider_connected(provider_name);
@@ -5712,6 +5758,7 @@ async fn refresh_provider_models(
             state.push_notice(BlockKind::Warning, "Model refresh failed", error.to_string());
         }
     }
+    Ok(())
 }
 
 async fn write_plugin_enabled(
@@ -5778,17 +5825,26 @@ fn mcp_toggle_request(
     }
 }
 
-async fn reopen_marketplaces(server: &BackendServer, state: &mut AppState, notice: String) {
-    match list_plugins(server, state).await {
+async fn reopen_marketplaces(
+    server: &BackendServer,
+    state: &mut AppState,
+    renderer: &mut Renderer,
+    notice: String,
+) -> Result<()> {
+    match await_integration_panel(state, renderer, list_plugins(server, state)).await? {
         Ok(response) => {
             state.open_marketplace_picker(&PluginCatalog::from_value(&response), Some(notice));
         }
-        Err(error) => state.push_notice(
-            BlockKind::Warning,
-            "Failed to refresh marketplaces",
-            format!("{notice}\n{error}"),
-        ),
+        Err(error) => {
+            state.close_integration_loading();
+            state.push_notice(
+                BlockKind::Warning,
+                "Failed to refresh marketplaces",
+                format!("{notice}\n{error}"),
+            )
+        }
     }
+    Ok(())
 }
 
 /// Splits the `owner/repo@ref` shorthand the Codex CLI accepts. An `@` inside a
@@ -5845,10 +5901,12 @@ fn format_reload_report(
 /// echoes the marketplaces it considered in `selectedMarketplaces`, which is the
 /// only trustworthy account of the upgrade's scope.
 fn format_upgrade_result(response: &Value) -> String {
+    // Claude CLI prints its progress first; the last line is the outcome, and
+    // the panel hint has room for one line.
     if let Some(message) = response
         .get("message")
         .and_then(Value::as_str)
-        .filter(|message| !message.is_empty())
+        .and_then(|message| message.lines().map(str::trim).rfind(|line| !line.is_empty()))
     {
         return message.to_owned();
     }
@@ -6166,6 +6224,7 @@ async fn recv_skills(receiver: &mut Option<mpsc::Receiver<SkillsResult>>) -> Opt
 async fn refresh_integrations(
     server: &BackendServer,
     state: &mut AppState,
+    renderer: &mut Renderer,
     force_reload: bool,
 ) -> Result<()> {
     let model = state.selected_model_name().to_owned();
@@ -6178,8 +6237,8 @@ async fn refresh_integrations(
         app_thread_id,
         mcp_thread_id,
         force_reload,
-    )
-    .await;
+    );
+    let catalog = await_integration_panel(state, renderer, catalog).await?;
     apply_integrations(state, catalog)
 }
 
@@ -7193,6 +7252,17 @@ async fn turn_is_running(server: &BackendServer, thread_id: &str, turn_id: &str)
 /// parallel so a long command remains visible while a missed terminal event is
 /// still bounded. Unknown/error replies are deliberately left to the state's
 /// retry counter rather than guessed terminal here.
+/// 본문에 띄운 하위 에이전트가 바뀌면 브리지가 지켜볼 기록도 바꾼다.
+async fn sync_subagent_watch(server: &BackendServer, state: &mut AppState) {
+    if let Some(id) = state.take_subagent_watch_change()
+        && let Err(error) = server
+            .request("subagent/watch", json!({ "threadId": state.thread_id, "id": id }))
+            .await
+    {
+        state.push_notice(BlockKind::Error, "Subagent view failed", error.to_string());
+    }
+}
+
 async fn codex_subagent_statuses(
     server: &BackendServer,
     ids: Vec<String>,
@@ -7229,28 +7299,35 @@ fn codex_thread_running(response: &Value) -> Option<bool> {
 }
 
 async fn refresh_account(server: &BackendServer, state: &mut AppState) {
-    let model = state.selected_model_name().to_owned();
+    let account = read_account(server, state).await;
+    apply_account(state, account);
+}
+
+/// The account label and plan, read from a shared borrow so `/status` can keep
+/// painting while the runtime answers. `None` leaves the current value.
+async fn read_account(server: &BackendServer, state: &AppState) -> (Option<String>, Option<AccountPlan>) {
+    let model = state.selected_model_name();
     // OpenCode 계정은 opencode CLI가 관리한다. Codex의 account/read를 빌려
     // ChatGPT 이메일을 보여 주지 않는다.
-    if open_code::is_open_code_model(&model) {
-        state.set_account("OpenCode CLI".to_owned());
-        state.set_account_plan(AccountPlan::default());
-        return;
+    if open_code::is_open_code_model(model) {
+        return (Some("OpenCode CLI".to_owned()), Some(AccountPlan::default()));
     }
-    if claude::is_claude_model(&model) {
-        if let Ok(account) = server
+    if claude::is_claude_model(model) {
+        let account = server
             .request("claude/account/read", json!({ "cwd": state.cwd }))
-            .await
-            && let Some(label) = claude_account_label(&account)
-        {
-            state.set_account(label);
-        }
-        return;
+            .await;
+        return (account.ok().as_ref().and_then(claude_account_label), None);
     }
-    if let Ok(label) = ensure_account(server).await {
+    (ensure_account(server).await.ok(), Some(read_runtime_account_plan(server, model).await))
+}
+
+fn apply_account(state: &mut AppState, (label, plan): (Option<String>, Option<AccountPlan>)) {
+    if let Some(label) = label {
         state.set_account(label);
     }
-    state.set_account_plan(read_runtime_account_plan(server, &model).await);
+    if let Some(plan) = plan {
+        state.set_account_plan(plan);
+    }
 }
 
 fn claude_account_label(account: &Value) -> Option<String> {
@@ -8953,6 +9030,26 @@ mod tests {
         }
     }
 
+    /// name은 영문 식별자만 받으므로 언어 설정은 description에만 걸린다.
+    #[test]
+    fn claude_subagent_description_follows_the_screen_language() {
+        let reminder = |english| {
+            language::set_english(english);
+            turn_additional_context(agent::AgentMode::Standard, false)
+                ["claude-devez-vibe-reminder"]["value"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        for (english, description) in [(false, "description은 짧은 한국어로"), (true, "description은 짧은 영어로")] {
+            let rule = reminder(english);
+            assert!(rule.contains("name은 대상과 동작을 담은 영문 소문자"));
+            assert!(rule.contains(description));
+        }
+        language::set_english(false);
+        assert!(!CLAUDE_DEVEZ_INSTRUCTIONS.contains("Agent 호출의 name"));
+    }
+
     /// The role travels as its own application context key on every turn,
     /// Builder included.
     #[test]
@@ -9029,11 +9126,11 @@ mod tests {
         // Both providers hold the full rules already. Claude alone gets a short
         // reminder for language and readability.
         assert!(context.get("codex-devez-vibe-reminder").is_none());
-        assert_eq!(
+        assert!(
             context
                 .pointer("/claude-devez-vibe-reminder/value")
-                .and_then(Value::as_str),
-            Some(CLAUDE_TURN_REMINDER)
+                .and_then(Value::as_str)
+                .is_some_and(|reminder| reminder.starts_with(CLAUDE_TURN_REMINDER))
         );
         // Check provider-specific delivery, not the obsolete wording of the rules.
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskCreate"));
@@ -10458,6 +10555,15 @@ mod tests {
         assert_eq!(
             format_upgrade_result(&json!({ "message": "Claude marketplace updated" })),
             "Claude marketplace updated"
+        );
+        // Real Claude CLI output: progress lines, then the outcome.
+        assert_eq!(
+            format_upgrade_result(&json!({
+                "message": "Updating marketplace: seecode...Refreshing marketplace cache (timeout: 120s)…\n\
+                            Clone complete, validating marketplace…\n\
+                            ✔ Successfully updated marketplace: seecode\n"
+            })),
+            "✔ Successfully updated marketplace: seecode"
         );
     }
 

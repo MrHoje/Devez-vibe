@@ -714,34 +714,20 @@ impl BackendServer {
                     self.codex()?.request(method, params).await
                 }
             }
-            // 하위 에이전트 행의 x. 행 id는 Claude에서는 브리지가 아는 작업 행,
-            // Codex에서는 자식 스레드 id다.
-            "subagent/stop" => {
+            // 화면이 고른 하위 에이전트 기록. Claude만 브리지가 기록 파일을 지켜보고,
+            // Codex 자식 항목은 화면이 알림에서 직접 모은다.
+            "subagent/watch" => {
                 let visible = thread_id(&params)?;
-                let id = params.get("id").and_then(Value::as_str).unwrap_or_default();
-                match self.route_kind(visible) {
-                    RuntimeKind::Claude => {
-                        let backing = self.backing_id(visible, RuntimeKind::Claude)?;
-                        self.claude
-                            .request("session/stopTask", json!({ "sessionId": backing, "id": id }))
-                            .await
-                    }
-                    // 순정 TUI처럼 자식 스레드의 진행 중 턴을 중단한다. 턴 id는 화면이
-                    // 자식의 `turn/started`에서 받아 둔 것이다.
-                    RuntimeKind::Codex => {
-                        let turn = params.get("turnId").and_then(Value::as_str).context(tr(
-                            "하위 에이전트의 진행 중인 턴을 찾지 못했습니다.",
-                            "Couldn't find the subagent's turn in progress.",
-                        ))?;
-                        self.codex()?
-                            .request("turn/interrupt", json!({ "threadId": id, "turnId": turn }))
-                            .await
-                    }
-                    RuntimeKind::OpenCode => Err(anyhow::anyhow!(tr(
-                        "OpenCode provider는 하위 에이전트 하나만 멈추는 기능을 지원하지 않습니다.",
-                        "The OpenCode provider can't stop a single subagent.",
-                    ))),
+                if self.route_kind(visible) != RuntimeKind::Claude {
+                    return Ok(json!({}));
                 }
+                let backing = self.backing_id(visible, RuntimeKind::Claude)?;
+                self.claude
+                    .request(
+                        "session/watchSubagent",
+                        json!({ "sessionId": backing, "id": params.get("id") }),
+                    )
+                    .await
             }
             "thread/fork" => {
                 let visible = thread_id(&params)?;
@@ -1049,11 +1035,13 @@ impl BackendServer {
             .await
     }
 
+    /// 첫 프롬프트 전에는 스레드 id가 비어 있다. 빈 id를 그대로 넘기면 app-server가
+    /// `invalid thread id`로 거절하므로 아직 스레드가 없다고 답한다.
     pub fn codex_thread_id(&self, visible: &str) -> Option<String> {
         self.route(visible)
             .and_then(|route| route.codex_id)
             .or_else(|| {
-                (!is_claude_thread(visible) && !visible.starts_with("ses_"))
+                (!visible.is_empty() && !is_claude_thread(visible) && !visible.starts_with("ses_"))
                     .then(|| visible.to_owned())
             })
     }
@@ -1136,6 +1124,14 @@ impl BackendServer {
 
     pub async fn start_open_code(&mut self) -> Result<()> {
         self.ensure_open_code().await.map(|_| ())
+    }
+
+    /// Starts OpenCode to ask it, since 2.x credentials never reach `auth.json`.
+    pub async fn open_code_connected(&mut self) -> bool {
+        match self.ensure_open_code().await {
+            Ok(open_code) => open_code.provider_connected().await,
+            Err(_) => false,
+        }
     }
 
     pub fn respond(&self, id: Value, result: Value) -> Result<()> {

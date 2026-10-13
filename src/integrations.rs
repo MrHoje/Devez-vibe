@@ -1904,12 +1904,32 @@ pub enum MarketplacePickerResult {
     Cancel,
     Add(String),
     Remove(String),
-    /// Upgrades every configured git marketplace. Codex 0.145's
-    /// `marketplace/upgrade` ignores its `selectedMarketplaces` selector — a
-    /// bogus selector is accepted and every git marketplace is refreshed anyway
-    /// — so offering a per-marketplace upgrade would be a promise the server
-    /// does not keep.
-    UpgradeAll,
+    /// Opens the plugin list of one marketplace.
+    Browse(String),
+    /// Refreshes one marketplace, or every git marketplace when `None`. Codex
+    /// 0.145 ignored the name and refreshed them all, so the result reports the
+    /// scope the server says it used rather than the one asked for.
+    Upgrade(Option<String>),
+}
+
+/// What the selected marketplace's Enter menu offers, as in Claude Code.
+#[derive(Clone, Copy)]
+enum MarketplaceAction {
+    Browse,
+    Update,
+    Remove,
+}
+
+fn marketplace_actions(marketplace: &MarketplaceInfo) -> &'static [MarketplaceAction] {
+    if marketplace.is_configurable() {
+        &[
+            MarketplaceAction::Browse,
+            MarketplaceAction::Update,
+            MarketplaceAction::Remove,
+        ]
+    } else {
+        &[MarketplaceAction::Browse]
+    }
 }
 
 pub struct MarketplacePicker {
@@ -1917,6 +1937,8 @@ pub struct MarketplacePicker {
     selected: usize,
     /// `Some` while the add field is open; holds the source being typed.
     source: Option<Editor>,
+    /// `Some` while the selected marketplace's menu is open; holds its row.
+    menu: Option<usize>,
     notice: Option<String>,
 }
 
@@ -1926,6 +1948,7 @@ impl MarketplacePicker {
             marketplaces,
             selected: 0,
             source: None,
+            menu: None,
             notice: None,
         }
     }
@@ -1943,6 +1966,9 @@ impl MarketplacePicker {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if self.source.is_some() {
             return self.handle_add_key(key, ctrl);
+        }
+        if let Some(row) = self.menu {
+            return self.handle_menu_key(key, ctrl, row);
         }
         match key.code {
             KeyCode::Esc => MarketplacePickerResult::Back,
@@ -1970,7 +1996,44 @@ impl MarketplacePicker {
                 }
                 None => MarketplacePickerResult::None,
             },
-            KeyCode::Char('u') | KeyCode::Enter => MarketplacePickerResult::UpgradeAll,
+            KeyCode::Enter => {
+                if self.selected_marketplace().is_some() {
+                    self.menu = Some(0);
+                }
+                MarketplacePickerResult::None
+            }
+            KeyCode::Char('u') => MarketplacePickerResult::Upgrade(None),
+            _ => MarketplacePickerResult::None,
+        }
+    }
+
+    fn handle_menu_key(&mut self, key: KeyEvent, ctrl: bool, row: usize) -> MarketplacePickerResult {
+        let Some((name, actions)) = self
+            .selected_marketplace()
+            .map(|marketplace| (marketplace.name.clone(), marketplace_actions(marketplace)))
+        else {
+            self.menu = None;
+            return MarketplacePickerResult::None;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.menu = None;
+                MarketplacePickerResult::None
+            }
+            KeyCode::Char('c') if ctrl => MarketplacePickerResult::Cancel,
+            KeyCode::Up => {
+                self.menu = Some(row.saturating_sub(1));
+                MarketplacePickerResult::None
+            }
+            KeyCode::Down => {
+                self.menu = Some((row + 1).min(actions.len() - 1));
+                MarketplacePickerResult::None
+            }
+            KeyCode::Enter => match actions[row] {
+                MarketplaceAction::Browse => MarketplacePickerResult::Browse(name),
+                MarketplaceAction::Update => MarketplacePickerResult::Upgrade(Some(name)),
+                MarketplaceAction::Remove => MarketplacePickerResult::Remove(name),
+            },
             _ => MarketplacePickerResult::None,
         }
     }
@@ -2081,6 +2144,39 @@ impl MarketplacePicker {
             };
         }
 
+        if let (Some(row), Some(marketplace)) = (self.menu, self.selected_marketplace()) {
+            let mut lines = marketplace_actions(marketplace)
+                .iter()
+                .enumerate()
+                .map(|(index, action)| OverlayLine {
+                    text: match action {
+                        MarketplaceAction::Browse => {
+                            format!("Browse plugins ({})", marketplace.plugin_count)
+                        }
+                        MarketplaceAction::Update => "Update marketplace".to_owned(),
+                        MarketplaceAction::Remove => "Remove marketplace".to_owned(),
+                    },
+                    selected: index == row,
+                    muted: false,
+                })
+                .collect::<Vec<_>>();
+            pad_management_rows(&mut lines);
+            return OverlayView {
+                closable: false,
+                title: marketplace.name.clone(),
+                lines,
+                slider: None,
+                hint: self
+                    .notice
+                    .clone()
+                    .unwrap_or_else(|| "Enter Select  Esc Back".to_owned()),
+                style: OverlayStyle::ManagementPanel,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            };
+        }
+
         let window = visible_window(
             Some(self.selected),
             self.marketplaces.len(),
@@ -2118,7 +2214,7 @@ impl MarketplacePicker {
             lines,
             slider: None,
             hint: self.notice.clone().unwrap_or_else(|| {
-                "A Add  X Remove  U Refresh all Git marketplaces  Esc Back".to_owned()
+                "Enter Open  A Add  X Remove  U Refresh all  Esc Back".to_owned()
             }),
             style: OverlayStyle::ManagementPanel,
             input: None,
@@ -2814,22 +2910,47 @@ mod tests {
         let catalog = PluginCatalog::from_value(&plugin_response());
         let mut picker = MarketplacePicker::new(catalog.marketplaces.clone());
 
-        // Upgrade is all-or-nothing because the server ignores its selector, so
-        // both keys have to mean the same thing on any row.
-        assert!(matches!(
-            picker.handle_key(press(KeyCode::Enter)),
-            MarketplacePickerResult::UpgradeAll
-        ));
         assert!(matches!(
             picker.handle_key(press(KeyCode::Char('u'))),
-            MarketplacePickerResult::UpgradeAll
+            MarketplacePickerResult::Upgrade(None)
         ));
 
+        // Enter opens the selected marketplace's menu, as in Claude Code.
+        assert!(matches!(
+            picker.handle_key(press(KeyCode::Enter)),
+            MarketplacePickerResult::None
+        ));
+        let menu = picker.overlay_view();
+        assert_eq!(menu.title, "openai-bundled");
+        assert_eq!(menu.lines[0].text, "Browse plugins (2)");
+        assert_eq!(menu.lines[2].text, "Remove marketplace");
+        assert!(matches!(
+            picker.handle_key(press(KeyCode::Enter)),
+            MarketplacePickerResult::Browse(ref name) if name == "openai-bundled"
+        ));
         picker.handle_key(press(KeyCode::Down));
         assert!(matches!(
             picker.handle_key(press(KeyCode::Enter)),
-            MarketplacePickerResult::UpgradeAll
+            MarketplacePickerResult::Upgrade(Some(ref name)) if name == "openai-bundled"
         ));
+        picker.handle_key(press(KeyCode::Down));
+        assert!(matches!(
+            picker.handle_key(press(KeyCode::Enter)),
+            MarketplacePickerResult::Remove(ref name) if name == "openai-bundled"
+        ));
+        // Esc closes only the menu.
+        picker.handle_key(press(KeyCode::Esc));
+        assert!(picker.overlay_view().title.starts_with("Marketplaces"));
+
+        // The remote catalog can only be browsed.
+        picker.handle_key(press(KeyCode::Down));
+        picker.handle_key(press(KeyCode::Enter));
+        picker.handle_key(press(KeyCode::Down));
+        assert!(matches!(
+            picker.handle_key(press(KeyCode::Enter)),
+            MarketplacePickerResult::Browse(ref name) if name == "openai-curated-remote"
+        ));
+        picker.handle_key(press(KeyCode::Esc));
         assert!(matches!(
             picker.handle_key(press(KeyCode::Char('x'))),
             MarketplacePickerResult::None

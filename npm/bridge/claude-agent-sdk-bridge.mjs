@@ -3,7 +3,7 @@
 import { randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { createReadStream, existsSync, readFileSync, readdirSync } from "node:fs";
-import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve as resolvePath, sep } from "node:path";
@@ -1522,13 +1522,18 @@ function runClaudeCommand(params, args, deadlineMs = CLAUDE_COMMAND_TIMEOUT) {
       const output = Buffer.concat(stdout).toString("utf8").trim();
       const detail = Buffer.concat(stderr).toString("utf8").trim();
       if (code === 0) resolve(output);
-      else reject(new Error(detail || output || `Claude 명령이 종료 코드 ${code}로 실패했습니다.`));
+      else reject(Object.assign(new Error(detail || output || `Claude 명령이 종료 코드 ${code}로 실패했습니다.`), { exitCode: code }));
     });
   });
 }
 
+// Windows의 Claude Code는 가끔 출력을 다 낸 뒤에도 0xC0000005 같은 충돌 코드로
+// 끝난다. 읽기 명령이라 종료 코드로 실패하면 한 번 더 실행한다. 멈춤은 다시 기다리지 않는다.
 async function runClaudeJson(params, args) {
-  const output = await runClaudeCommand(params, args);
+  const output = await runClaudeCommand(params, args).catch((error) => {
+    if (error.exitCode === undefined) throw error;
+    return runClaudeCommand(params, args);
+  });
   try { return output ? JSON.parse(output) : null; }
   catch (error) {
     throw new Error(`Claude 플러그인 응답을 해석하지 못했습니다: ${error.message}`);
@@ -1888,6 +1893,13 @@ function questionFallbackMessage(questions) {
     "도구를 다시 호출하지 말고 다음 질문을 일반 텍스트로 사용자에게 제시한 뒤 답변을 기다리세요:",
     text,
   ].join("\n");
+}
+
+// Windows는 충돌한 프로세스를 0xC0000000 이상의 종료 코드로 알린다(0xC0000005 접근
+// 위반, 0xC0000374 힙 손상). 설정·인증 오류의 일반 종료 코드와 달리 다시 띄우면 대개 뜬다.
+function isClaudeCliCrash(error) {
+  const code = /process exited with code (\d+)/.exec(String(error?.message ?? error))?.[1];
+  return Number(code) >= 0xC0000000;
 }
 
 async function createSession(params, resumeId) {
@@ -2569,12 +2581,16 @@ const SUBAGENT_PULSE_MS = 5000;
 // 자체 시험에서 "오래 조용한 행"을 만들 때 쓰는 나이.
 const IDLE_ROW_AGE_MS = 120_000;
 
+// 순정 Claude Code처럼 행에 Agent의 name과 description을 함께 보인다. description의
+// 언어는 매 턴 지침이 화면 언어에 맞춘다.
 function startSubagent(session, block) {
   const input = block.input || {};
+  const description = firstLine(input.description || "", SUBAGENT_DESCRIPTION_LIMIT);
   const existing = findSubagent(session, block.id);
   if (existing) {
     existing.toolUseId = block.id;
     existing.name = firstLine(input.name || input.subagent_type || input.agentType || existing.name || "agent", 40);
+    existing.description = description || existing.description;
     existing.backgroundTask = false;
     existing.lastSeenAt = Date.now();
     emitSubagents(session);
@@ -2586,8 +2602,7 @@ function startSubagent(session, block) {
     taskId: "",
     background: false,
     name: firstLine(input.name || input.subagent_type || input.agentType || "agent", 40),
-    // 행은 이름과 경과 시간만 보인다. 무엇을 시켰는지는 이름이 말하게 한다.
-    description: "",
+    description,
     tool: "",
     startedAt: Date.now(),
     lastSeenAt: Date.now(),
@@ -2674,7 +2689,7 @@ function resumeBackgroundSubagent(session, toolUseId, pending, result) {
     taskId,
     background: true,
     name: known?.name || "agent",
-    description: "",
+    description: known?.description || "",
     tool: "",
     startedAt: Date.now(),
     lastSeenAt: Date.now(),
@@ -4060,7 +4075,7 @@ async function transcriptPath(id) {
  * conversation. A resume can re-append earlier messages under their original
  * uuids, so each uuid's first appearance wins.
  */
-function transcriptEntries(raw) {
+function transcriptEntries(raw, sidechain = false) {
   const messages = [];
   const seen = new Set();
   for (const line of raw.split("\n")) {
@@ -4070,7 +4085,7 @@ function transcriptEntries(raw) {
     } catch {
       continue;
     }
-    if (!entry || typeof entry !== "object" || entry.isSidechain) continue;
+    if (!entry || typeof entry !== "object" || (!sidechain && entry.isSidechain)) continue;
     if (entry.type !== "user" && entry.type !== "assistant" && entry.type !== "system") continue;
     if (typeof entry.uuid === "string" && entry.uuid) {
       if (seen.has(entry.uuid)) continue;
@@ -4115,14 +4130,60 @@ function restoreArtifacts(id, messages) {
   });
 }
 
-async function transcriptMessagesAt(path) {
+async function transcriptMessagesAt(path, sidechain = false) {
   let raw;
   try {
     raw = await readFile(path, "utf8");
   } catch {
     return [];
   }
-  return transcriptEntries(raw);
+  return transcriptEntries(raw, sidechain);
+}
+
+// 하위 에이전트 기록은 본 기록 옆 `<세션 id>/subagents/agent-<작업 id>.jsonl`에 쌓인다.
+// 행 id는 도구 호출 id라, 작업 id를 아직 모르거나 이미 끝난 행은 meta 파일의 toolUseId로 찾는다.
+async function subagentTranscriptPath(session, id) {
+  const main = await transcriptPath(liveSessionId(session.id));
+  if (!main) return null;
+  const dir = join(main.slice(0, -".jsonl".length), "subagents");
+  const taskId = findSubagent(session, id)?.taskId || (id.startsWith("task:") ? id.slice(5) : "");
+  if (taskId) return join(dir, `agent-${taskId}.jsonl`);
+  let names;
+  try {
+    names = await readdir(dir);
+  } catch {
+    return null;
+  }
+  for (const name of names) {
+    if (!name.endsWith(".meta.json")) continue;
+    try {
+      const meta = JSON.parse(await readFile(join(dir, name), "utf8"));
+      if (meta.toolUseId === id) return join(dir, name.replace(/\.meta\.json$/, ".jsonl"));
+    } catch {}
+  }
+  return null;
+}
+
+// 화면이 띄운 하위 에이전트 하나만 지켜본다. 기록 파일이 커질 때만 다시 읽어 turns를 보낸다.
+function watchSubagent(session, id) {
+  clearInterval(session.subagentWatch?.timer);
+  session.subagentWatch = null;
+  if (!id) return;
+  const watch = { id, size: -1 };
+  session.subagentWatch = watch;
+  watch.timer = setInterval(() => sendSubagentHistory(session, watch).catch(() => {}), 1000);
+  watch.timer.unref?.();
+  setImmediate(() => sendSubagentHistory(session, watch).catch(() => {}));
+}
+
+async function sendSubagentHistory(session, watch) {
+  if (lookupSession(session.id) !== session) return watchSubagent(session, null);
+  const path = await subagentTranscriptPath(session, watch.id);
+  const size = (path && (await stat(path).catch(() => null))?.size) ?? -1;
+  if (session.subagentWatch !== watch || size === watch.size) return;
+  watch.size = size;
+  const turns = path ? historyTurns(await transcriptMessagesAt(path, true)) : [];
+  notify("turn/subagent/history", { threadId: session.id, id: watch.id, turns });
 }
 
 /** Every message of `id`'s conversation: the transcript file when it exists,
@@ -4299,7 +4360,9 @@ async function dispatch(method, params = {}) {
     return {};
   }
   if (method === "marketplace/upgrade") {
-    const output = await runClaudeCommand(params, ["plugin", "marketplace", "update"], CLAUDE_INSTALL_TIMEOUT);
+    const name = String(params.marketplaceName || "");
+    const args = ["plugin", "marketplace", "update", ...(name ? [name] : [])];
+    const output = await runClaudeCommand(params, args, CLAUDE_INSTALL_TIMEOUT);
     return { message: output, consideredRoots: ["Claude marketplaces"], errors: [] };
   }
   if (method === "skills/list") return claudeSkills(params);
@@ -4307,9 +4370,7 @@ async function dispatch(method, params = {}) {
   if (method === "account/read") {
     return await runClaudeJson(params, ["auth", "status", "--json"]) || {};
   }
-  if (method === "plugin/reload") {
-    return { message: "Claude 플러그인 설정을 다시 읽었습니다. 새 대화부터 적용됩니다." };
-  }
+  if (method === "plugin/reload") return {};
   if (method === "permissions/status") return claudePermissionStatus(params);
   if (method === "permissions/update") return updateClaudePermission(params);
   if (method === "permissions/auto-mode") return setClaudeAutoModeDisabled(params);
@@ -4328,7 +4389,12 @@ async function dispatch(method, params = {}) {
     return { known: true, running: Boolean(session.turn), turnId: session.turn?.id ?? null };
   }
   if (method === "session/start") {
-    const { session, account, usage } = await createSession(params);
+    // Claude Code가 뜨는 도중 가끔 충돌한다. 새 세션은 아직 쓴 것이 없고 다시 만들 때
+    // 새 id를 받으므로 한 번 더 띄운다.
+    const { session, account, usage } = await createSession(params).catch((error) => {
+      if (!isClaudeCliCrash(error)) throw error;
+      return createSession(params);
+    });
     return {
       id: session.id,
       thread: { id: session.id, turns: [] },
@@ -4398,6 +4464,11 @@ async function dispatch(method, params = {}) {
       nextCursor: null,
     };
   }
+  if (method === "session/watchSubagent") {
+    const session = lookupSession(params.sessionId);
+    if (session) watchSubagent(session, params.id ? String(params.id) : null);
+    return {};
+  }
   if (method === "session/history") {
     const id = liveSessionId(params.sessionId);
     const messages = await sessionMessages(id, params.cwd);
@@ -4427,15 +4498,6 @@ async function dispatch(method, params = {}) {
       // send the result that would close it.
       if (session.turn === turn && turn.awaitingSteer) finishTurn(session, null);
     }
-    return {};
-  }
-  // 하위 에이전트 행의 x. 행은 도구 호출 id로 알려도 stop_task는 작업 id를 받으므로,
-  // task_started가 아직 오지 않은 행은 멈출 수 없다. 행은 종료 통지가 거둔다.
-  if (method === "session/stopTask") {
-    const session = lookupSession(params.sessionId);
-    const running = session && findSubagent(session, String(params.id || ""));
-    if (!running?.taskId) throw new Error("아직 멈출 수 있는 작업 정보가 없습니다. 잠시 후 다시 시도하세요.");
-    await session.query.stopTask(running.taskId);
     return {};
   }
   if (method === "session/compact") {
@@ -4758,6 +4820,17 @@ async function runCommandTimeoutSelfTest() {
     30_000,
   );
   if (quick !== "ok") throw new Error(`Claude command self-test returned ${quick}`);
+  // 출력 뒤 실패로 끝난 읽기 명령은 한 번 더 실행해 그 결과를 쓴다.
+  const marker = join(tmpdir(), `dvz-json-retry-${process.pid}`);
+  const flaky = `const fs = require("fs"); const first = !fs.existsSync(${JSON.stringify(marker)});`
+    + ` fs.writeFileSync(${JSON.stringify(marker)}, ""); process.stdout.write(first ? "[0]" : "[1]");`
+    + " process.exitCode = first ? 1 : 0;";
+  try {
+    const retried = await runClaudeJson({ claudePath: process.execPath }, ["-e", flaky]);
+    if (JSON.stringify(retried) !== "[1]") throw new Error(`Claude read retry self-test returned ${JSON.stringify(retried)}`);
+  } finally {
+    await rm(marker, { force: true });
+  }
 }
 
 // 사유가 늘어나면 안내 없이 영어 원문만 남으므로, 설치된 SDK의 목록과 대조한다.
@@ -4841,6 +4914,33 @@ async function runSelfTest() {
     || JSON.stringify(restoredPrompts) !== JSON.stringify(["compact 이전 질문", "compact 이후 질문"])) {
     throw new Error(`Claude compacted transcript self-test failed: ${JSON.stringify({ restored: restored.length, restoredPrompts })}`);
   }
+  // 하위 에이전트 기록 파일은 모든 줄이 sidechain이라, 그 파일을 읽을 때만 남긴다.
+  const subagentPrompt = historyTurns(transcriptEntries(compactedTranscript, true))
+    .flatMap((turn) => turn.items)
+    .some((item) => item.type === "userMessage" && item.content?.[0]?.text === "subagent");
+  if (!subagentPrompt) throw new Error("Claude subagent transcript self-test failed");
+  // 끝나서 작업 id를 모르는 행도 meta 파일의 toolUseId로 그 기록을 찾는다.
+  const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
+  const configDir = join(tmpdir(), `devez-subagent-self-test-${randomUUID()}`);
+  const agentDir = join(configDir, "projects", "D--work", "subagent-session", "subagents");
+  await mkdir(agentDir, { recursive: true });
+  await writeFile(join(configDir, "projects", "D--work", "subagent-session.jsonl"), "");
+  await writeFile(join(agentDir, "agent-a1.meta.json"), JSON.stringify({ toolUseId: "toolu_child" }));
+  await writeFile(join(agentDir, "agent-a1.jsonl"), JSON.stringify({
+    type: "user", uuid: "child-1", isSidechain: true, message: { role: "user", content: "child prompt" },
+  }));
+  process.env.CLAUDE_CONFIG_DIR = configDir;
+  try {
+    const childPath = await subagentTranscriptPath({ id: "subagent-session", subagents: new Map() }, "toolu_child");
+    const childTurns = childPath ? historyTurns(await transcriptMessagesAt(childPath, true)) : [];
+    if (!childTurns.some((turn) => turn.items.some((item) => item.content?.[0]?.text === "child prompt"))) {
+      throw new Error(`Claude subagent transcript lookup self-test failed: ${childPath}`);
+    }
+  } finally {
+    if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
+    await rm(configDir, { recursive: true, force: true });
+  }
   // A resumed transcript lists its Artifact pages once each at their latest
   // publish, read through the file's toolUseResult spelling.
   const artifactTranscript = [
@@ -4884,6 +4984,12 @@ async function runSelfTest() {
     || prefersInstalledCli("C:/Users/me/.local/bin/claude.exe", "2.1.260", "")
     || !isNewerVersion("2.2.0", "2.1.999")) {
     throw new Error("Claude installed CLI preference self-test failed");
+  }
+  // 충돌 종료만 다시 띄운다. 일반 종료 코드와 다른 실패는 그대로 알린다.
+  if (!isClaudeCliCrash(new Error("Claude Code process exited with code 3221226356"))
+    || isClaudeCliCrash(new Error("Claude Code process exited with code 1"))
+    || isClaudeCliCrash(new Error("Claude 세션을 찾을 수 없습니다: abc"))) {
+    throw new Error("Claude CLI crash retry self-test failed");
   }
   const latestOptions = makeOptions({ cwd: process.cwd(), permissionMode: "plan" }, "00000000-0000-4000-8000-000000000000");
   if (latestOptions.permissionMode !== BOOTSTRAP_PERMISSION_MODE
@@ -5527,24 +5633,6 @@ async function runSelfTest() {
     await dispatch("session/interrupt", { sessionId: limitSession.id });
     resumeAfterUsageLimit(limitSession, cancelledWait, cancelledWait.resetsAt);
     if (limitSession.turn || retryInputs.length !== 1) throw new Error("Cancelled usage limit resumed");
-    // 행의 x는 행 id가 아니라 SDK 작업 id로 멈춘다. 작업 id를 아직 모르는 행은 거절한다.
-    const stoppedTasks = [];
-    const stopSession = {
-      id: "stop-task-self-test",
-      query: { async stopTask(taskId) { stoppedTasks.push(taskId); } },
-      subagents: new Map([
-        ["toolu_stop", { id: "toolu_stop", toolUseId: "toolu_stop", taskId: "agent-stop" }],
-        ["toolu_pending", { id: "toolu_pending", toolUseId: "toolu_pending", taskId: "" }],
-      ]),
-    };
-    sessions.set(stopSession.id, stopSession);
-    await dispatch("session/stopTask", { sessionId: stopSession.id, id: "toolu_stop" });
-    const pendingStop = await dispatch("session/stopTask", { sessionId: stopSession.id, id: "toolu_pending" })
-      .then(() => null, (error) => error);
-    sessions.delete(stopSession.id);
-    if (stoppedTasks.join() !== "agent-stop" || !pendingStop) {
-      throw new Error(`Claude per-task stop self-test failed: ${stoppedTasks}`);
-    }
     // Ultracode rides with each prompt's effort; a steer that becomes a turn keeps it.
     const flagCalls = [];
     const ultracodeSession = {
@@ -6244,6 +6332,18 @@ async function runSelfTest() {
     });
     if (commandSession.subagents.size !== 0) {
       throw new Error(`Claude foreground row outlived its tool result: ${JSON.stringify([...commandSession.subagents])}`);
+    }
+    // 행은 순정처럼 name(없으면 종류)과 description을 함께 싣는다.
+    for (const [input, name] of [
+      [{ name: "auth_review", description: "인증 흐름 조사", subagent_type: "Explore" }, "auth_review"],
+      [{ description: "인증 흐름 조사", subagent_type: "Explore" }, "Explore"],
+    ]) {
+      startSubagent(commandSession, { id: "toolu_named", input });
+      const row = findSubagent(commandSession, "toolu_named");
+      if (row?.name !== name || row.description !== "인증 흐름 조사") {
+        throw new Error(`Claude subagent row name self-test failed: ${JSON.stringify(row)}`);
+      }
+      commandSession.subagents.delete("toolu_named");
     }
     // 클라우드로 띄운 원격 Agent도 접수 결과에서 줄이 남고, 종료 통지가 거둔다.
     commandSession.tools.set("toolu_remote", { name: "Agent", input: { name: "cloud_review" }, item: { id: "toolu_remote" } });

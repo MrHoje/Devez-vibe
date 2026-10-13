@@ -471,7 +471,7 @@ mod tests {
             "codexBase": crate::DEVEZ_INSTRUCTIONS,
             "claudeBase": crate::CLAUDE_DEVEZ_INSTRUCTIONS,
             "codexQuestion": crate::CODEX_QUESTION_INSTRUCTIONS,
-            "claudeReminder": crate::CLAUDE_TURN_REMINDER,
+            "claudeReminder": crate::claude_turn_reminder(),
         })).unwrap()).unwrap();
     }
 

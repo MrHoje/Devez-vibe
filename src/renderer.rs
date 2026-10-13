@@ -519,7 +519,7 @@ pub struct SteeredPromptView {
 /// One running provider subagent or ordinary background task.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubagentView {
-    /// The provider's id for the row: what its `x` asks the provider to stop.
+    /// The provider's id for the row: what a click asks to show in the body.
     pub id: String,
     pub name: String,
     pub is_background_task: bool,
@@ -528,8 +528,17 @@ pub struct SubagentView {
     pub elapsed: Duration,
     /// Levels below the subagent that launched it.
     pub depth: usize,
-    /// Whether the runtime can stop this one row; only then is the `x` drawn.
-    pub stoppable: bool,
+    /// 본문에 띄운 행이라 테마색으로 칠한다.
+    pub selected: bool,
+    /// 눌러서 본문에 띄울 기록이 있는 행. 백그라운드 명령은 없다.
+    pub viewable: bool,
+}
+
+/// 본문 대신 그릴 하위 에이전트 기록과, 기록이 바뀔 때마다 오르는 판.
+pub struct SubagentTranscript<'a> {
+    pub id: &'a str,
+    pub revision: u64,
+    pub blocks: &'a [Block],
 }
 
 /// One page this session published as a claude.ai Artifact, listed under the
@@ -601,6 +610,8 @@ pub struct View<'a> {
     /// Running subagents shown in the side panel when it is open, or under the
     /// status line as the narrow-layout fallback.
     pub subagents: Vec<SubagentView>,
+    /// 줄을 눌러 본문에 띄운 하위 에이전트 기록. None이면 메인 대화를 그린다.
+    pub subagent_view: Option<SubagentTranscript<'a>>,
     /// Artifacts published this session, newest last, drawn under the status line.
     pub artifacts: Vec<ArtifactView>,
     pub composer_placeholder: &'a str,
@@ -635,6 +646,7 @@ pub struct View<'a> {
     /// The working folder shown in the side panel header.
     pub cwd: String,
     pub side_panel_prompts_expanded: bool,
+    pub side_panel_subagents_expanded: bool,
     /// 패널의 변경 섹션이 그릴 미커밋 diff.
     pub side_panel_diff: &'a [PanelFileDiff],
     /// 그중 패치까지 펼쳐 둔 파일의 경로.
@@ -840,6 +852,9 @@ pub struct Renderer {
     diff_display_mode: DiffDisplayMode,
     chat_layout: bool,
     expanded_tools: HashSet<u64>,
+    /// 본문에 띄운 하위 에이전트 기록을 감싼 줄과, 그 줄을 만든 id·판·폭·펼친 도구 수.
+    subagent_view_lines: Option<Vec<PaintLine>>,
+    subagent_view_key: Option<(String, u64, u16, usize)>,
     response_collapse: Option<(u64, f32)>,
     fold_progress_groups: bool,
     /// Wrapped transcript rows owned by folded progress records. Double-click
@@ -1693,6 +1708,8 @@ impl Renderer {
             diff_display_mode: DiffDisplayMode::Collapse,
             chat_layout: false,
             expanded_tools: HashSet::new(),
+            subagent_view_lines: None,
+            subagent_view_key: None,
             response_collapse: None,
             fold_progress_groups: false,
             progress_group_rows: Vec::new(),
@@ -1845,8 +1862,8 @@ impl Renderer {
         moved || cleared
     }
 
-    /// 패널이 보여 줄 두 영역을 한 벌의 줄로 합친다. 위쪽은 있는 만큼, 변경
-    /// 섹션이 있으면 패널의 절반까지만 쓰고 나머지를 그 섹션에 넘긴다. 각 영역은
+    /// 패널이 보여 줄 두 영역을 한 벌의 줄로 합친다. 위쪽은 있는 만큼 다 쓰고,
+    /// 남은 높이만 변경 섹션에 넘겨 화면이 낮아지면 diff부터 줄어든다. 각 영역은
     /// 자기 오프셋에서 잘라 붙이므로 페인트 쪽은 스크롤을 몰라도 된다.
     fn compose_side_panel(
         &mut self,
@@ -1861,11 +1878,7 @@ impl Renderer {
             return top;
         }
         let capacity = rows.saturating_sub(2);
-        let top_rows = top.len().min(if diff_head.is_empty() {
-            capacity
-        } else {
-            capacity / 2
-        });
+        let top_rows = top.len().min(capacity);
         // 변경 섹션은 아래 구분선에 붙지 않도록 늘 한 줄을 남긴다.
         let diff_rows = capacity.saturating_sub(top_rows + 1);
         // 바뀐 파일 목록은 무엇을 고를지 고르는 자리라 제자리에 남고, 그 아래
@@ -3242,6 +3255,7 @@ impl Renderer {
             )
         });
         let frame_width = width;
+        self.update_subagent_view(view.subagent_view.as_ref(), frame_width);
         // Fullscreen assistant output shares the transcript surface with its
         // completed form. Keeping active and completed text on one surface
         // removes the live-frame -> history transfer that previously needed
@@ -3322,6 +3336,7 @@ impl Renderer {
                 &view.subagents,
                 &view.cwd,
                 view.side_panel_prompts_expanded,
+                view.side_panel_subagents_expanded,
                 view.side_panel_diff,
                 view.side_panel_diff_selected,
                 view.side_panel_diff_expanded,
@@ -3400,6 +3415,44 @@ impl Renderer {
         queue!(self.out, Print(composer_hint_signal))?;
         self.out.flush()?;
         Ok(())
+    }
+
+    /// 하위 에이전트를 띄우거나 거두면 스크롤·선택을 새로 잡고, 그 기록을 본문 줄로 감싼다.
+    fn update_subagent_view(&mut self, view: Option<&SubagentTranscript>, width: u16) {
+        let key = view.map(|view| {
+            (view.id.to_owned(), view.revision, width, self.expanded_tools.len())
+        });
+        if key.as_ref().map(|key| &key.0) != self.subagent_view_key.as_ref().map(|key| &key.0) {
+            self.scroll_back = 0;
+            self.history_view_rows_anchor = None;
+            self.history_view_start_anchor = None;
+            self.selection.clear();
+            self.reusable_display_prefix = 0;
+        }
+        if key == self.subagent_view_key {
+            return;
+        }
+        self.subagent_view_lines = view.map(|view| {
+            let mut lines = Vec::new();
+            for block in visible_transcript_blocks(
+                view.blocks,
+                self.shell_display_mode,
+                self.diff_display_mode,
+            ) {
+                lines.extend(self.history_block_lines(block, width));
+            }
+            if lines.is_empty() {
+                lines.push(PaintLine {
+                    tone: Tone::Muted,
+                    ..PaintLine::plain(format!(
+                        "  {}",
+                        crate::language::tr("아직 출력이 없습니다.", "No output yet.")
+                    ))
+                });
+            }
+            lines
+        });
+        self.subagent_view_key = key;
     }
 
     pub fn remove_split_history_blocks(&mut self, block_ids: &[u64]) {
@@ -3665,24 +3718,6 @@ impl Renderer {
             return Ok(false);
         }
         updates.extend(plan_lines.into_iter().enumerate());
-        // Running rows under the composer keep their text; only the spinner in
-        // the bullet's place advances, in step with the plan's.
-        let spinner = working_spinner_frame(view.activity_phase);
-        updates.extend(
-            self.previous_lines
-                .iter()
-                .enumerate()
-                .filter(|(_, line)| is_subagent_spinner_row(line))
-                .map(|(row, line)| {
-                    (
-                        row,
-                        PaintLine {
-                            text: spinner.to_owned(),
-                            ..line.clone()
-                        },
-                    )
-                }),
-        );
         let painted_height = self
             .painted_frame
             .as_ref()
@@ -3831,6 +3866,7 @@ impl Renderer {
         subagents: &[SubagentView],
         cwd: &str,
         side_panel_prompts_expanded: bool,
+        side_panel_subagents_expanded: bool,
         side_panel_diff: &[PanelFileDiff],
         side_panel_diff_selected: Option<&str>,
         side_panel_diff_expanded: bool,
@@ -3907,7 +3943,7 @@ impl Renderer {
             .map(|(_, rows)| *rows)
             .sum::<usize>();
         let next_stream_rows = streamed_rows.values().copied().sum::<usize>();
-        if self.scroll_back > 0 {
+        if self.scroll_back > 0 && self.subagent_view_lines.is_none() {
             let row_delta = next_stream_rows as isize - retained_stream_rows as isize;
             self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
         }
@@ -3931,13 +3967,19 @@ impl Renderer {
                 )
             });
         let mut display_wrapped = std::mem::take(&mut self.fullscreen_display_lines);
-        reuse_display_prefix(
-            &mut display_wrapped,
-            &self.wrapped,
-            self.reusable_display_prefix,
-        );
-        self.reusable_display_prefix = self.wrapped.len();
-        display_wrapped.extend(streamed_lines);
+        if let Some(lines) = &self.subagent_view_lines {
+            // 하위 에이전트를 보는 동안 본문은 그 기록이다. 메인 줄은 돌아온 뒤 처음부터 다시 잇는다.
+            display_wrapped.clone_from(lines);
+            self.reusable_display_prefix = 0;
+        } else {
+            reuse_display_prefix(
+                &mut display_wrapped,
+                &self.wrapped,
+                self.reusable_display_prefix,
+            );
+            self.reusable_display_prefix = self.wrapped.len();
+            display_wrapped.extend(streamed_lines);
+        }
         let anchored_view_rows = self.history_view_rows_anchor;
         let live_rows_after_absorb = frame.lines.len().saturating_sub(1);
         if display_wrapped
@@ -3975,7 +4017,11 @@ impl Renderer {
                     layout.content_width(),
                     side_panel_prompts_expanded,
                 ));
-                lines.extend(side_panel_subagent_lines(subagents, layout.content_width()));
+                lines.extend(side_panel_subagent_lines(
+                    subagents,
+                    layout.content_width(),
+                    side_panel_subagents_expanded,
+                ));
                 if SIDE_PANEL_INTEGRATIONS_CONNECTED {
                     let content_capacity = rows.saturating_sub(2);
                     let remaining = content_capacity.saturating_sub(lines.len());
@@ -4042,6 +4088,7 @@ impl Renderer {
         // Fade only the newest visible transcript tail. A user reading older
         // history must never see unrelated rows restyled by a hidden stream.
         let stream_fade = (stream_fade_tail > 0
+            && self.subagent_view_lines.is_none()
             && view_rows > 0
             && start.saturating_add(view_rows) >= display_wrapped.len())
         .then(|| StreamFade {
@@ -4073,7 +4120,7 @@ impl Renderer {
             frame.cursor_line,
         );
         screen.splice(0..0, plan_lines);
-        let response_bullet_row = waiting_for_response
+        let response_bullet_row = (waiting_for_response && self.subagent_view_lines.is_none())
             .then(|| {
                 visible_response_bullet_row(&display_wrapped, start..start + view_rows, plan_rows)
             })
@@ -6185,6 +6232,9 @@ pub enum Pick {
     DiffDisplayMode,
     PlanSummary,
     PromptSection,
+    SubagentSection,
+    /// 하위 에이전트 줄이나 `main` 줄: 그 대화를 본문에 띄운다. None이 main이다.
+    ViewSubagent(Option<String>),
     McpSection(String),
     PluginSection(String),
     /// 패널 머리글의 [▶]: 패널을 12칸 좁힌다.
@@ -6205,8 +6255,6 @@ pub enum Pick {
     Model,
     /// The status line's effort reading: opens `/effort`.
     EffortSetting,
-    /// The `x` on a running-subagent row: stops the subagent with this id.
-    StopSubagent(String),
     /// The fullscreen transcript control that returns to its newest row.
     ScrollToBottom,
     /// A completed response's progress disclosure, hosted by its user prompt.
@@ -6434,10 +6482,6 @@ fn shimmer_spans_with_band(label: &str, phase: f32, base: Rgb, band: f32) -> Vec
 
 /// Gajae-Code's Unicode activity loader frames.
 const WORKING_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-fn working_spinner_frame(phase: f32) -> &'static str {
-    WORKING_SPINNER[(phase.clamp(0.0, 0.999) * WORKING_SPINNER.len() as f32) as usize]
-}
 
 /// Activity labels that carry the loader glyph and the shimmer sweep.
 const SPINNING_ACTIVITY_LABELS: [&str; 2] = ["Working..", "Compacting.."];
@@ -6688,54 +6732,73 @@ fn steer_preview_lines(prompts: &[SteeredPromptView], width: u16) -> Vec<PaintLi
 /// Running subagents are listed under the status line, one row each, so a fan-out
 /// stays visible without pushing the transcript around. Rows disappear as each
 /// subagent finishes; background rows may outlive the parent turn.
-fn subagent_lines(subagents: &[SubagentView], width: u16, phase: f32) -> Vec<PaintLine> {
-    subagents
+fn subagent_lines(subagents: &[SubagentView], width: u16) -> Vec<PaintLine> {
+    if subagents.is_empty() {
+        return Vec::new();
+    }
+    // 상태 줄처럼 오른쪽 두 칸을 비운다. DevezCode 콘솔은 `·`·`…`를 두 칸으로 세어
+    // 넘친 끝을 잘라 내므로, 가장 많이 센 행만큼 끝을 당겨 경과 시간을 한 열에 맞춘다.
+    let edge = usize::from(width).saturating_sub(2);
+    let extra = subagents
         .iter()
-        .map(|subagent| subagent_line(subagent, width, phase))
-        .collect()
+        .map(|subagent| line_console_extra(&subagent_line(subagent, edge)))
+        .max()
+        .unwrap_or(0);
+    let mut lines = vec![subagent_main_line(subagents, " ")];
+    lines.extend(
+        subagents
+            .iter()
+            .map(|subagent| subagent_line(subagent, edge.saturating_sub(extra))),
+    );
+    lines
+}
+
+/// 본문에 띄운 줄만 테마색으로 칠한다. 점과 이름의 색을 돌려준다.
+fn subagent_row_tones(selected: bool) -> (Tone, Tone) {
+    if selected {
+        (Tone::Accent, Tone::Accent)
+    } else {
+        (Tone::Muted, Tone::Plain)
+    }
+}
+
+/// 줄 전체를 하나의 클릭 대상으로 만든다.
+fn with_row_pick(mut line: PaintLine, pick: Pick) -> PaintLine {
+    line.pick = Some(PickRegions::span(0, painted_line_width(&line), pick));
+    line
+}
+
+/// 목록 맨 위의 `main`. 하위 에이전트를 보다가 눌러 메인 대화로 돌아온다.
+fn subagent_main_line(subagents: &[SubagentView], gutter: &str) -> PaintLine {
+    let selected = !subagents.iter().any(|subagent| subagent.selected);
+    let (glyph_tone, name_tone) = subagent_row_tones(selected);
+    with_row_pick(
+        PaintLine {
+            prefix: format!("{gutter}• "),
+            prefix_tone: glyph_tone,
+            text: "main".to_owned(),
+            tone: name_tone,
+            ..PaintLine::plain("")
+        },
+        Pick::ViewSubagent(None),
+    )
 }
 
 /// 이름 뒤에 이만큼도 남지 않으면 호출 설명을 통째로 뺀다. 한두 글자만 남기고
 /// 잘린 설명은 무엇을 시켰는지 알려 주지 못한 채 폭만 먹는다.
 const SUBAGENT_DESCRIPTION_MIN_WIDTH: usize = 12;
 const SUBAGENT_DESCRIPTION_SEPARATOR: &str = " · ";
-const SUB_AGENT_LABEL: &str = "Sub agent: ";
 const BACKGROUND_TASK_LABEL: &str = "Background task: ";
-/// Columns the stop mark takes at the end of a row: a two-column gap and the `x`.
-const SUBAGENT_STOP_WIDTH: usize = 3;
+/// Columns kept between a row's name or description and its elapsed reading.
+const SUBAGENT_ELAPSED_GAP: usize = 2;
 
+/// 하위 에이전트 줄은 라벨 없이 이름부터 쓰고, 백그라운드 작업만 라벨로 구분한다.
 fn subagent_label_prefix(subagent: &SubagentView) -> &'static str {
     if subagent.is_background_task {
         BACKGROUND_TASK_LABEL
     } else {
-        SUB_AGENT_LABEL
+        ""
     }
-}
-
-fn subagent_stop_width(subagent: &SubagentView) -> usize {
-    if subagent.stoppable {
-        SUBAGENT_STOP_WIDTH
-    } else {
-        0
-    }
-}
-
-/// Ends a row the runtime can stop with an `x`: Claude Code's stop key for the
-/// row, drawn as a click target the way the artifact row draws its dismiss key.
-/// The gap is its own span so only the mark takes the click.
-fn with_subagent_stop(mut line: PaintLine, subagent: &SubagentView) -> PaintLine {
-    if !subagent.stoppable {
-        return line;
-    }
-    for text in ["  ", "x"] {
-        line.tail.push(PaintSpan {
-            text: text.to_owned(),
-            tone: Tone::Muted,
-            bold: false,
-        });
-    }
-    let mark = line.tail.len();
-    line.with_picks(&[(mark, Pick::StopSubagent(subagent.id.clone()))])
 }
 
 /// 이름 옆에 그 호출로 무엇을 시켰는지 붙인다. 자리가 모자라면 None을 돌려
@@ -6754,12 +6817,10 @@ fn subagent_description_span(description: &str, available: usize) -> Option<Pain
     })
 }
 
-/// Codex는 `/root/eghis2_daily_popup`처럼 경로형 식별자를, Claude는 `devez-reviewer`처럼
-/// 하이픈 식별자를 이름으로 주므로 두 제공자 행이 같은 낱말 형태로 읽히게 정리한다.
-/// 첫 글자는 라벨처럼 대문자로 세운다.
+/// Claude는 `devez-reviewer`·`auth_review`처럼 하이픈·밑줄 식별자를 이름으로 주므로
+/// 낱말 형태로 읽히게 정리한다. 첫 글자는 라벨처럼 대문자로 세운다.
 fn subagent_display_name(name: &str) -> String {
-    let name = name.trim().strip_prefix("/root/").unwrap_or(name.trim());
-    let name = name.replace(['_', '-'], " ");
+    let name = name.trim().replace(['_', '-'], " ");
     let mut chars = name.chars();
     chars
         .next()
@@ -6776,65 +6837,62 @@ fn subagent_indent(subagent: &SubagentView, room: usize) -> String {
 /// Indent gives way first on a narrow row, so the name keeps this much.
 const SUBAGENT_NAME_MIN_WIDTH: usize = 8;
 
-fn subagent_line(subagent: &SubagentView, width: u16, phase: f32) -> PaintLine {
+/// 순정 Claude Code처럼 경과 시간은 행 오른쪽, `right_edge` 열 앞에서 끝난다.
+fn subagent_line(subagent: &SubagentView, right_edge: usize) -> PaintLine {
     let label = subagent_label_prefix(subagent);
-    let elapsed = format!(" · {}", format_subagent_elapsed(subagent.elapsed.as_secs()));
-    // 계획의 진행 중 단계와 같은 스피너가 점 자리에서 돈다.
-    let glyph = working_spinner_frame(phase);
-    // The gutter, glyph, label, elapsed reading, and stop mark are fixed, so the name
+    let elapsed = format_subagent_elapsed(subagent.elapsed.as_secs());
+    let elapsed_width = UnicodeWidthStr::width(elapsed.as_str());
+    // 측면 패널 행과 같은 고정 점이라 경과 초가 바뀔 때만 다시 그린다.
+    let glyph = "•";
+    // The gutter, glyph, label, gap, and elapsed reading are fixed, so the name
     // is compacted first and the call description takes only what the name leaves behind.
     let fixed = 1
         + UnicodeWidthStr::width(glyph)
         + 1
         + UnicodeWidthStr::width(label)
-        + UnicodeWidthStr::width(elapsed.as_str())
-        + subagent_stop_width(subagent);
+        + SUBAGENT_ELAPSED_GAP
+        + elapsed_width;
     let indent = subagent_indent(
         subagent,
-        usize::from(width).saturating_sub(fixed + 1 + SUBAGENT_NAME_MIN_WIDTH),
+        right_edge.saturating_sub(fixed + SUBAGENT_NAME_MIN_WIDTH),
     );
-    let available = usize::from(width).saturating_sub(fixed + indent.len() + 1);
+    let available = right_edge.saturating_sub(fixed + indent.len());
     let name = compact_right(&subagent_display_name(&subagent.name), available);
     let description = subagent_description_span(
         &subagent.description,
         available.saturating_sub(UnicodeWidthStr::width(name.as_str())),
     );
 
+    let (glyph_tone, name_tone) = subagent_row_tones(subagent.selected);
     let mut tail = vec![PaintSpan {
         text: format!(" {label}{name}"),
-        tone: Tone::Plain,
+        tone: name_tone,
         bold: false,
     }];
     tail.extend(description);
+    let used = 1 + indent.len() + UnicodeWidthStr::width(glyph) + spans_width(&tail);
+    let gap = right_edge.saturating_sub(used + elapsed_width).max(1);
     tail.push(PaintSpan {
-        text: elapsed,
+        text: format!("{}{elapsed}", " ".repeat(gap)),
         tone: Tone::Muted,
         bold: false,
     });
 
-    with_subagent_stop(
-        PaintLine {
-            prefix: format!(" {indent}"),
-            prefix_tone: Tone::Muted,
-            text: glyph.to_owned(),
-            tone: Tone::Accent,
-            bold: false,
-            tool_heading: None,
-            pick: None,
-            tail,
-        },
-        subagent,
-    )
-}
-
-/// A running-subagent row under the composer, told apart by its label. The
-/// animation path advances only its spinner between full frames.
-fn is_subagent_spinner_row(line: &PaintLine) -> bool {
-    WORKING_SPINNER.contains(&line.text.as_str())
-        && line.tail.first().is_some_and(|span| {
-            let label = span.text.trim_start();
-            label.starts_with(SUB_AGENT_LABEL) || label.starts_with(BACKGROUND_TASK_LABEL)
-        })
+    let line = PaintLine {
+        prefix: format!(" {indent}"),
+        prefix_tone: Tone::Muted,
+        text: glyph.to_owned(),
+        tone: glyph_tone,
+        bold: false,
+        tool_heading: None,
+        pick: None,
+        tail,
+    };
+    if subagent.viewable {
+        with_row_pick(line, Pick::ViewSubagent(Some(subagent.id.clone())))
+    } else {
+        line
+    }
 }
 
 fn format_subagent_elapsed(seconds: u64) -> String {
@@ -7614,7 +7672,7 @@ fn normal_frame_with_expansion(
     if status_line_painted && (!subagents.is_empty() || !artifacts.is_empty()) {
         lines.push(PaintLine::blank());
     }
-    lines.extend(subagent_lines(subagents, width, activity_phase));
+    lines.extend(subagent_lines(subagents, width));
     lines.extend(artifact_line(artifacts, width));
 
     Frame {
@@ -10197,6 +10255,20 @@ fn plan_lines(block: &Block, width: u16) -> Vec<PaintLine> {
 /// panel's content-fit box instead of the full terminal width.
 fn notice_card_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     let title = block.title.trim_start_matches("✓ ").trim_start();
+    // An untitled note is a short outcome, printed as bare `◆` rows without the card.
+    if title.is_empty() {
+        let mut lines = block
+            .body
+            .lines()
+            .enumerate()
+            .flat_map(|(index, row)| {
+                let marker = if index == 0 { "◆ " } else { "  " };
+                wrapped_line(marker, Tone::Muted, row, Tone::Plain, false, width)
+            })
+            .collect::<Vec<_>>();
+        lines.push(PaintLine::blank());
+        return lines;
+    }
     // Two walls plus the reserved final column bound how wide a row may wrap.
     let wrap_width = ((width as usize).saturating_sub(4).max(9)) as u16;
     let details = block
@@ -10764,30 +10836,31 @@ const SIDE_PANEL_SUBAGENT_LIMIT: usize = 5;
 /// Active provider subagents sit below the input prompt section while any are
 /// running. The same list remains below the status line when the panel is shut,
 /// so opening the panel moves the information instead of duplicating it.
-fn side_panel_subagent_lines(subagents: &[SubagentView], content_width: usize) -> Vec<PaintLine> {
+fn side_panel_subagent_lines(
+    subagents: &[SubagentView],
+    content_width: usize,
+    expanded: bool,
+) -> Vec<PaintLine> {
     if subagents.is_empty() || content_width == 0 {
         return Vec::new();
     }
 
-    let mut lines = vec![
-        PaintLine {
-            text: compact_right(
-                &format!("Subagents  {} Running", subagents.len()),
-                content_width,
-            ),
-            bold: true,
-            ..PaintLine::plain("")
-        },
-        PaintLine::blank(),
-    ];
+    let heading = side_panel_section_heading(
+        &format!("Subagents {} Running", subagents.len()),
+        expanded,
+        content_width,
+        Pick::SubagentSection,
+    );
+    if !expanded {
+        return vec![heading, side_panel_divider(content_width)];
+    }
+    let mut lines = vec![heading, PaintLine::blank(), subagent_main_line(subagents, "")];
     for subagent in subagents.iter().take(SIDE_PANEL_SUBAGENT_LIMIT) {
         let label = subagent_label_prefix(subagent);
         let elapsed = format!(" · {}", format_subagent_elapsed(subagent.elapsed.as_secs()));
-        let stop = subagent_stop_width(subagent);
         let fixed = UnicodeWidthStr::width("• ")
             + UnicodeWidthStr::width(label)
-            + UnicodeWidthStr::width(elapsed.as_str())
-            + stop;
+            + UnicodeWidthStr::width(elapsed.as_str());
         let prefix = format!(
             "{}• ",
             subagent_indent(
@@ -10798,8 +10871,7 @@ fn side_panel_subagent_lines(subagents: &[SubagentView], content_width: usize) -
         let available = content_width.saturating_sub(
             UnicodeWidthStr::width(prefix.as_str())
                 + UnicodeWidthStr::width(label)
-                + UnicodeWidthStr::width(elapsed.as_str())
-                + stop,
+                + UnicodeWidthStr::width(elapsed.as_str()),
         );
         let name = compact_right(&subagent_display_name(&subagent.name), available);
         let description = subagent_description_span(
@@ -10813,17 +10885,20 @@ fn side_panel_subagent_lines(subagents: &[SubagentView], content_width: usize) -
             tone: Tone::Muted,
             bold: false,
         });
-        lines.push(with_subagent_stop(
-            PaintLine {
-                prefix,
-                prefix_tone: Tone::Accent,
-                text: format!("{label}{name}"),
-                tone: Tone::Plain,
-                tail,
-                ..PaintLine::plain("")
-            },
-            subagent,
-        ));
+        let (glyph_tone, name_tone) = subagent_row_tones(subagent.selected);
+        let line = PaintLine {
+            prefix,
+            prefix_tone: glyph_tone,
+            text: format!("{label}{name}"),
+            tone: name_tone,
+            tail,
+            ..PaintLine::plain("")
+        };
+        lines.push(if subagent.viewable {
+            with_row_pick(line, Pick::ViewSubagent(Some(subagent.id.clone())))
+        } else {
+            line
+        });
     }
     let hidden = subagents.len().saturating_sub(SIDE_PANEL_SUBAGENT_LIMIT);
     if hidden > 0 {
@@ -10832,7 +10907,7 @@ fn side_panel_subagent_lines(subagents: &[SubagentView], content_width: usize) -
             ..PaintLine::plain(compact_right(&format!("… +{hidden}"), content_width))
         });
     }
-    lines.extend([PaintLine::blank(), side_panel_divider(content_width)]);
+    lines.push(side_panel_divider(content_width));
     lines
 }
 
@@ -14823,6 +14898,8 @@ mod tests {
             diff_display_mode: DiffDisplayMode::Collapse,
             side_panel_width: None,
             side_panel_prompts_expanded: true,
+            side_panel_subagents_expanded: true,
+            subagent_view: None,
             side_panel_diff: &[],
             side_panel_diff_selected: None,
             side_panel_diff_expanded: true,
@@ -20060,8 +20137,15 @@ mod tests {
             tool: tool.to_owned(),
             elapsed: Duration::from_secs(secs),
             depth: 0,
-            stoppable: false,
+            selected: false,
+            viewable: false,
         }
+    }
+
+    /// 경과 시간이 `edge` 열 앞에서 끝나도록 사이를 띄운 하위 에이전트 행.
+    fn aligned(left: &str, elapsed: &str, edge: usize) -> String {
+        let gap = edge - UnicodeWidthStr::width(left) - UnicodeWidthStr::width(elapsed);
+        format!("{left}{}{elapsed}", " ".repeat(gap))
     }
 
     #[test]
@@ -20071,30 +20155,30 @@ mod tests {
         child.is_background_task = true;
         child.depth = 1;
         assert_eq!(
-            painted(&subagent_line(&parent, 80, 0.0)),
-            " ⠋ Sub agent: Explore · 40s"
+            painted(&subagent_line(&parent, 80)),
+            aligned(" • Explore", "40s", 80)
         );
         assert_eq!(
-            painted(&subagent_line(&child, 80, 0.0)),
-            "   ⠋ Background task: Bash · npm run dev · 12s"
+            painted(&subagent_line(&child, 80)),
+            aligned("   • Background task: Bash · npm run dev", "12s", 80)
         );
         // A deep chain stops at four levels, and on a narrow row the indent
         // gives way before the name does.
         child.depth = 9;
         assert!(
-            painted(&subagent_line(&child, 80, 0.0))
-                .starts_with(&format!(" {}⠋", " ".repeat(8)))
+            painted(&subagent_line(&child, 80))
+                .starts_with(&format!(" {}•", " ".repeat(8)))
         );
-        let deep = subagent_line(&child, 32, 0.0);
-        assert!(painted(&deep).starts_with(" ⠋ Background task: Bash"));
+        let deep = subagent_line(&child, 32);
+        assert!(painted(&deep).starts_with(" • Background task: Bash"));
         assert!(painted_line_width(&deep) <= 32);
-        let deep_panel = side_panel_subagent_lines(&[child.clone()], 30);
-        assert!(painted(&deep_panel[2]).starts_with("• Background task: Bash"));
-        assert!(painted_line_width(&deep_panel[2]) <= 30);
+        let deep_panel = side_panel_subagent_lines(&[child.clone()], 30, true);
+        assert!(painted(&deep_panel[3]).starts_with("• Background task: Bash"));
+        assert!(painted_line_width(&deep_panel[3]) <= 30);
         child.depth = 1;
-        let panel = side_panel_subagent_lines(&[parent, child], 80);
-        assert_eq!(painted(&panel[2]), "• Sub agent: Explore · 40s");
-        assert_eq!(painted(&panel[3]), "  • Background task: Bash · npm run dev · 12s");
+        let panel = side_panel_subagent_lines(&[parent, child], 80, true);
+        assert_eq!(painted(&panel[3]), "• Explore · 40s");
+        assert_eq!(painted(&panel[4]), "  • Background task: Bash · npm run dev · 12s");
     }
 
     #[test]
@@ -20102,24 +20186,24 @@ mod tests {
         for name in ["Bash", "Workflow", "Monitor"] {
             let mut task = test_subagent(name, "npm test", "", 29);
             task.is_background_task = true;
-            let line = subagent_line(&task, 80, 0.0);
+            let line = subagent_line(&task, 80);
             assert_eq!(
                 painted(&line),
-                format!(" ⠋ Background task: {name} · npm test · 29s")
+                aligned(&format!(" • Background task: {name} · npm test"), "29s", 80)
             );
-            let lines = side_panel_subagent_lines(&[task.clone()], 80);
+            let lines = side_panel_subagent_lines(&[task.clone()], 80, true);
             assert_eq!(
-                painted(&lines[2]),
+                painted(&lines[3]),
                 format!("• Background task: {name} · npm test · 29s")
             );
-            let narrow = subagent_line(&task, 32, 0.0);
-            assert!(painted(&narrow).starts_with(" ⠋ Background task: "));
-            assert!(painted(&narrow).ends_with(" · 29s"));
+            let narrow = subagent_line(&task, 32);
+            assert!(painted(&narrow).starts_with(" • Background task: "));
+            assert!(painted(&narrow).ends_with(" 29s"));
             assert!(painted_line_width(&narrow) <= 32);
-            let narrow_panel = side_panel_subagent_lines(&[task], 32);
-            assert!(painted(&narrow_panel[2]).starts_with("• Background task: "));
-            assert!(painted(&narrow_panel[2]).ends_with(" · 29s"));
-            assert!(painted_line_width(&narrow_panel[2]) <= 32);
+            let narrow_panel = side_panel_subagent_lines(&[task], 32, true);
+            assert!(painted(&narrow_panel[3]).starts_with("• Background task: "));
+            assert!(painted(&narrow_panel[3]).ends_with(" · 29s"));
+            assert!(painted_line_width(&narrow_panel[3]) <= 32);
         }
     }
 
@@ -20180,14 +20264,16 @@ mod tests {
             test_subagent("developer", "Fix the parser", "", 3),
         ];
 
+        // 상태 줄처럼 오른쪽 두 칸을 비우고 모든 행의 경과 시간을 한 열에 맞춘다.
         assert_eq!(
-            subagent_lines(&subagents, 80, 0.0)
+            subagent_lines(&subagents, 80)
                 .iter()
                 .map(painted)
                 .collect::<Vec<_>>(),
             [
-                " ⠋ Sub agent: Explore · Find auth code · 1m 33s",
-                " ⠋ Sub agent: Developer · Fix the parser · 3s",
+                " • main".to_owned(),
+                aligned(" • Explore · Find auth code", "1m 33s", 78),
+                aligned(" • Developer · Fix the parser", "3s", 78),
             ]
         );
     }
@@ -20197,23 +20283,23 @@ mod tests {
         let subagent = test_subagent("Explore", "", "Grep(fn login)", 4);
 
         assert_eq!(
-            painted(&subagent_line(&subagent, 80, 0.0)),
-            " ⠋ Sub agent: Explore · 4s"
+            painted(&subagent_line(&subagent, 80)),
+            aligned(" • Explore", "4s", 80)
         );
     }
 
     #[test]
-    fn subagent_row_names_drop_the_root_path_and_read_as_words() {
-        let codex = test_subagent("/root/eghis2_daily_popup", "", "", 28);
+    fn subagent_row_names_read_as_words() {
+        let named = test_subagent("eghis2_daily_popup", "", "", 28);
         let claude = test_subagent("devez-reviewer", "변경 검토", "", 3);
 
         assert_eq!(
-            painted(&subagent_line(&codex, 80, 0.0)),
-            " ⠋ Sub agent: Eghis2 daily popup · 28s"
+            painted(&subagent_line(&named, 80)),
+            aligned(" • Eghis2 daily popup", "28s", 80)
         );
         assert_eq!(
-            painted(&subagent_line(&claude, 80, 0.0)),
-            " ⠋ Sub agent: Devez reviewer · 변경 검토 · 3s"
+            painted(&subagent_line(&claude, 80)),
+            aligned(" • Devez reviewer · 변경 검토", "3s", 80)
         );
     }
 
@@ -20226,63 +20312,118 @@ mod tests {
             93,
         );
 
-        let line = subagent_line(&subagent, 30, 0.0);
+        let line = subagent_line(&subagent, 30);
 
         assert!(!painted(&line).contains("hidden"));
-        assert!(painted(&line).starts_with(" ⠋ Sub agent: "));
-        assert!(painted(&line).ends_with(" · 1m 33s"));
+        assert!(painted(&line).starts_with(" • "));
+        assert!(painted(&line).ends_with(" 1m 33s"));
         assert!(painted_line_width(&line) <= 30);
 
-        let lines = side_panel_subagent_lines(&[subagent], 30);
-        assert!(painted(&lines[2]).starts_with("• Sub agent: "));
-        assert!(painted(&lines[2]).ends_with(" · 1m 33s"));
-        assert!(painted_line_width(&lines[2]) <= 30);
+        let lines = side_panel_subagent_lines(&[subagent], 30, true);
+        assert!(painted(&lines[3]).starts_with("• "));
+        assert!(painted(&lines[3]).ends_with(" · 1m 33s"));
+        assert!(painted_line_width(&lines[3]) <= 30);
     }
 
     #[test]
     fn a_narrow_subagent_row_drops_the_description_before_the_name() {
         let subagent = test_subagent("Explore", "Find the auth code path", "", 4);
 
-        let line = subagent_line(&subagent, 36, 0.0);
+        let line = subagent_line(&subagent, 24);
 
         assert!(painted(&line).contains("Explore"));
         assert!(!painted(&line).contains("Find"));
-        assert!(painted_line_width(&line) <= 36);
+        assert!(painted_line_width(&line) <= 24);
     }
 
-    /// Claude Code stops the selected row with `x`. Here that `x` is a click
-    /// target on rows the runtime can stop, and the rest of the row takes no click.
+    /// 순정 Claude Code처럼 경과 시간은 행 오른쪽 끝에 붙고, 행에는 누를 곳이 없다.
     #[test]
-    fn a_stoppable_subagent_row_ends_with_an_x_that_stops_it() {
-        let mut subagent = test_subagent("Plan", "Find auth code", "", 4);
-        subagent.stoppable = true;
-        let stop = Some(Pick::StopSubagent("toolu_Plan".to_owned()));
+    fn a_subagent_row_puts_its_elapsed_time_at_the_right_edge() {
+        let subagent = test_subagent("Plan", "Find auth code", "", 4);
 
-        let line = subagent_line(&subagent, 80, 0.0);
-        assert_eq!(painted(&line), " ⠋ Sub agent: Plan · Find auth code · 4s  x");
-        assert_eq!(pick_on(&line, "x"), stop);
-        for label in ["⠋", "Sub agent:", "Plan", "Find auth code", "4s"] {
+        let line = subagent_line(&subagent, 80);
+        assert_eq!(painted(&line), aligned(" • Plan · Find auth code", "4s", 80));
+        for label in ["•", "Plan", "Find auth code", "4s"] {
             assert_eq!(pick_on(&line, label), None, "{label}");
         }
-        assert!(is_subagent_spinner_row(&line));
-        let narrow = subagent_line(&subagent, 30, 0.0);
-        assert!(painted(&narrow).ends_with(" · 4s  x"));
-        assert!(painted_line_width(&narrow) <= 30);
+        let narrow = subagent_line(&subagent, 30);
+        assert!(painted(&narrow).ends_with(" 4s"));
+        assert_eq!(painted_line_width(&narrow), 30);
 
-        let panel = side_panel_subagent_lines(&[subagent.clone()], 44);
-        assert_eq!(painted(&panel[2]), "• Sub agent: Plan · Find auth code · 4s  x");
-        assert_eq!(pick_on(&panel[2], "x"), stop);
-        assert_eq!(pick_on(&panel[2], "Plan"), None);
-        let narrow_panel = side_panel_subagent_lines(&[subagent], 30);
-        assert!(painted(&narrow_panel[2]).ends_with(" · 4s  x"));
-        assert!(painted_line_width(&narrow_panel[2]) <= 30);
+        let panel = side_panel_subagent_lines(&[subagent], 44, true);
+        assert_eq!(painted(&panel[3]), "• Plan · Find auth code · 4s");
+    }
 
-        // A runtime that cannot stop one row gets no mark and no click target,
-        // but its spinner still turns.
-        let plain = subagent_line(&test_subagent("Plan", "", "", 4), 80, 0.0);
-        assert_eq!(painted(&plain), " ⠋ Sub agent: Plan · 4s");
-        assert!(plain.pick.is_none());
-        assert!(is_subagent_spinner_row(&plain));
+    /// 목록 맨 위에 `main`이 서고, 본문에 띄운 줄만 테마색이다. 줄 전체가 클릭 대상이며
+    /// 백그라운드 명령 줄은 누를 곳이 없다.
+    #[test]
+    fn subagent_rows_start_with_main_and_paint_only_the_viewed_row() {
+        let mut viewed = test_subagent("Explore", "", "", 4);
+        viewed.viewable = true;
+        viewed.selected = true;
+        let mut task = test_subagent("Bash", "npm test", "", 2);
+        task.is_background_task = true;
+
+        let lines = subagent_lines(&[viewed, task], 60);
+
+        assert_eq!(painted(&lines[0]), " • main");
+        assert_eq!(pick_on(&lines[0], "main"), Some(Pick::ViewSubagent(None)));
+        assert_eq!((lines[0].prefix_tone, lines[0].tone), (Tone::Muted, Tone::Plain));
+        assert_eq!((lines[1].tone, lines[1].tail[0].tone), (Tone::Accent, Tone::Accent));
+        assert_eq!(
+            pick_on(&lines[1], "4s"),
+            Some(Pick::ViewSubagent(Some("toolu_Explore".to_owned())))
+        );
+        assert_eq!(lines[2].tone, Tone::Muted);
+        assert_eq!(pick_on(&lines[2], "Bash"), None);
+    }
+
+    /// 하위 에이전트를 띄우면 그 기록이 본문 줄이 되고 스크롤은 맨 아래로 돌아간다.
+    /// 같은 판의 기록은 다시 감싸지 않는다.
+    #[test]
+    fn viewing_a_subagent_swaps_the_body_lines_and_resets_the_scroll() {
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.scroll_back = 7;
+        let blocks = [Block::new(BlockKind::Assistant, "Claude", "child answer")];
+        let shown = |renderer: &Renderer| {
+            renderer
+                .subagent_view_lines
+                .as_ref()
+                .is_some_and(|lines| lines.iter().any(|line| painted(line).contains("child answer")))
+        };
+
+        renderer.update_subagent_view(
+            Some(&SubagentTranscript { id: "toolu_1", revision: 1, blocks: &blocks }),
+            60,
+        );
+        assert_eq!(renderer.scroll_back, 0);
+        assert!(shown(&renderer));
+
+        renderer.update_subagent_view(
+            Some(&SubagentTranscript { id: "toolu_1", revision: 1, blocks: &[] }),
+            60,
+        );
+        assert!(shown(&renderer));
+
+        renderer.update_subagent_view(None, 60);
+        assert!(renderer.subagent_view_lines.is_none());
+    }
+
+    /// DevezCode 콘솔은 `·`를 두 칸으로 세므로, 설명이 있는 행과 없는 행의 경과
+    /// 시간이 같은 열에서 끝나면서 상태 줄처럼 콘솔의 오른쪽 두 칸을 비워야 한다.
+    #[test]
+    fn devezcode_subagent_rows_align_their_elapsed_time_inside_the_console() {
+        with_devezcode_xterm_widths(|| {
+            let lines = subagent_lines(
+                &[
+                    test_subagent("Explore", "Find auth code", "", 93),
+                    test_subagent("Plan", "", "", 3),
+                ],
+                60,
+            );
+            assert_eq!(painted_line_width(&lines[1]), painted_line_width(&lines[2]));
+            assert!(lines.iter().all(|line| console_width(&painted(line)) <= 58));
+        });
     }
 
     #[test]
@@ -20292,34 +20433,39 @@ mod tests {
             test_subagent("developer", "Fix the parser", "", 3),
         ];
 
-        let lines = side_panel_subagent_lines(&subagents, 44);
+        let lines = side_panel_subagent_lines(&subagents, 44, true);
 
-        assert_eq!(painted(&lines[0]), "Subagents  2 Running");
+        assert_eq!(painted(&lines[0]), "▲ Subagents 2 Running");
         assert!(lines[1] == PaintLine::blank());
         assert_eq!(
-            painted(&lines[2]),
-            "• Sub agent: Explore · Find auth c… · 1m 33s"
+            painted(&lines[3]),
+            "• Explore · Find auth code · 1m 33s"
         );
         assert_eq!(
-            painted(&lines[3]),
-            "• Sub agent: Developer · Fix the parser · 3s"
+            painted(&lines[4]),
+            "• Developer · Fix the parser · 3s"
         );
-        assert!(lines[4] == PaintLine::blank());
         assert_eq!(lines[5].tone, Tone::SidePanelDivider);
         assert!(lines.iter().all(|line| painted_line_width(line) <= 44));
+
+        let collapsed = side_panel_subagent_lines(&subagents, 44, false);
+        assert_eq!(painted(&collapsed[0]), "▼ Subagents 2 Running");
+        assert_eq!(pick_on(&collapsed[0], "▼"), Some(Pick::SubagentSection));
+        assert_eq!(collapsed.len(), 2);
+        assert_eq!(collapsed[1].tone, Tone::SidePanelDivider);
     }
 
     #[test]
     fn the_side_panel_hides_the_subagent_section_when_idle_and_caps_fan_out() {
-        assert!(side_panel_subagent_lines(&[], 44).is_empty());
+        assert!(side_panel_subagent_lines(&[], 44, true).is_empty());
         let subagents = (0..=SIDE_PANEL_SUBAGENT_LIMIT)
             .map(|index| test_subagent(&format!("agent-{index}"), "", "", 1))
             .collect::<Vec<_>>();
 
-        let lines = side_panel_subagent_lines(&subagents, 44);
+        let lines = side_panel_subagent_lines(&subagents, 44, true);
 
-        assert_eq!(painted(&lines[0]), "Subagents  6 Running");
-        assert_eq!(painted(&lines[2 + SIDE_PANEL_SUBAGENT_LIMIT]), "… +1");
+        assert_eq!(painted(&lines[0]), "▲ Subagents 6 Running");
+        assert_eq!(painted(&lines[3 + SIDE_PANEL_SUBAGENT_LIMIT]), "… +1");
     }
 
     #[test]
@@ -20380,7 +20526,9 @@ mod tests {
             .expect("update notice");
         assert!(update_index > composer_index);
         // 상태줄·갱신 안내와 서브에이전트 행 사이에는 빈 줄 하나가 들어간다.
-        assert_eq!(update_index + 2, subagent_index);
+        // 빈 줄 다음은 목록 맨 위의 `main`이다.
+        assert_eq!(painted(&frame.lines[update_index + 2]), " • main");
+        assert_eq!(update_index + 3, subagent_index);
         assert!(frame.lines[update_index + 1] == PaintLine::blank());
         assert!(painted(&frame.lines[update_index]).ends_with("dvz update or click here"));
         // 안내 전체가 하나의 버튼이다. 누르면 업데이트가 백그라운드로 돈다.
@@ -21181,6 +21329,19 @@ mod tests {
         assert_eq!(lines[0].tone, Tone::Accent);
         assert_eq!(lines[0].text, "Context compacted");
         assert!(lines[1] == PaintLine::blank());
+    }
+
+    #[test]
+    fn untitled_system_note_prints_bare_rows_without_the_card() {
+        let block = Block::new(BlockKind::System, "", "Reloaded plugins.\nSign-in needed: github");
+        let lines = block_lines(&block, 80);
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].prefix, "◆ ");
+        assert_eq!(lines[0].text, "Reloaded plugins.");
+        assert_eq!(lines[1].prefix, "  ");
+        assert_eq!(lines[1].text, "Sign-in needed: github");
+        assert!(lines[2] == PaintLine::blank());
     }
 
     #[test]
@@ -23070,46 +23231,46 @@ mod tests {
         let layout = renderer.side_panel.unwrap();
         let panel_column = layout.panel_left as u16;
 
-        let compose = |renderer: &mut Renderer| {
+        let compose = |renderer: &mut Renderer, top: usize| {
             renderer.compose_side_panel(
-                text_rows(20, "top"),
+                text_rows(top, "top"),
                 text_rows(3, "list"),
                 text_rows(20, "diff"),
                 20,
             )
         };
 
-        let composed = compose(&mut renderer);
-        // 20줄에서 위아래 여백 둘을 뺀 18줄을 절반으로 나눠 위쪽이 9줄, 남은
-        // 8줄에서 아래 한 줄을 비우고 목록 3줄과 패치 5줄이 들어간다.
+        let composed = compose(&mut renderer, 9);
+        // 20줄에서 위아래 여백 둘을 뺀 18줄 중 위쪽이 9줄을 다 쓰고, 남은
+        // 9줄에서 아래 한 줄을 비우고 목록 3줄과 패치 5줄이 들어간다.
         assert_eq!(composed.len(), 17);
         assert_eq!(composed[0].text, "top0");
         assert_eq!(composed[9].text, "list0");
         assert_eq!(composed[12].text, "diff0");
 
-        // 위쪽 영역의 첫 줄은 패널의 위 여백 바로 아래에 있다.
-        assert!(renderer.scroll_at(panel_column, 1, -3));
-        assert_eq!(renderer.side_panel_scroll, 3);
-        assert_eq!(renderer.side_panel_diff_scroll, 0);
-
         // 바뀐 파일 목록 위에서는 아무것도 움직이지 않는다.
         assert!(!renderer.scroll_at(panel_column, 11, -4));
-        assert_eq!(renderer.side_panel_scroll, 3);
         assert_eq!(renderer.side_panel_diff_scroll, 0);
 
         assert!(renderer.scroll_at(panel_column, 14, -4));
         assert_eq!(renderer.side_panel_diff_scroll, 4);
-
-        let composed = compose(&mut renderer);
-        assert_eq!(composed[0].text, "top3");
-        assert_eq!(composed[9].text, "list0");
+        let composed = compose(&mut renderer, 9);
         assert_eq!(composed[12].text, "diff4");
+
+        // 화면이 낮아 위쪽이 넘치면 변경 섹션이 먼저 사라지고 위쪽만 스크롤한다.
+        let composed = compose(&mut renderer, 20);
+        assert_eq!(composed.len(), 18);
+        assert!(composed.iter().all(|line| line.text.starts_with("top")));
+        assert!(renderer.scroll_at(panel_column, 1, -3));
+        let composed = compose(&mut renderer, 20);
+        assert_eq!(renderer.side_panel_scroll, 2);
+        assert_eq!(composed[0].text, "top2");
 
         // 패널 왼쪽은 전사의 것이다.
         renderer.wrapped = text_rows(30, "t");
         assert!(renderer.scroll_at(0, 8, 5));
         assert_eq!(renderer.scroll_back, 5);
-        assert_eq!(renderer.side_panel_scroll, 3);
+        assert_eq!(renderer.side_panel_scroll, 2);
     }
 
     /// 변경 섹션은 바뀐 파일을 먼저 세어 보여 주고, 고른 파일의 패치만 아래에
@@ -26353,43 +26514,6 @@ mod tests {
             closed.render_animation(animation_view()).expect("no io error"),
             "without the panel the fast path still runs"
         );
-    }
-
-    /// Between full frames the fast path advances only the spinner of a running
-    /// row under the composer; its text and click target stay as painted.
-    #[test]
-    fn the_animation_fast_path_spins_running_subagent_rows() {
-        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
-        renderer.painted_frame = Some(CellFrame::new(80, 24));
-        renderer.last_width = 80;
-        renderer.last_total_width = 80;
-        renderer.previous_lines = vec![PaintLine::blank(); 24];
-        let mut subagent = test_subagent("Workflow", "조사", "", 5);
-        subagent.stoppable = true;
-        let row = subagent_line(&subagent, 80, 0.0);
-        renderer.previous_lines[20] = row.clone();
-
-        let animated = renderer
-            .render_animation(AnimationView {
-                activity: None,
-                activity_model: None,
-                activity_phase: 0.5,
-                waiting_for_response: false,
-                activity_progress_phase: 0.0,
-                plan_summary: None,
-                plan_active: false,
-                plan_shimmer_phase: None,
-                plan_agent: AgentMode::Standard,
-                composer_notice: None,
-                composer_mode: None,
-            })
-            .expect("no io error");
-
-        assert!(animated);
-        let spun = &renderer.previous_lines[20];
-        assert_eq!(spun.text, working_spinner_frame(0.5));
-        assert_ne!(spun.text, row.text);
-        assert!(spun.tail == row.tail && spun.pick == row.pick);
     }
 
     #[test]

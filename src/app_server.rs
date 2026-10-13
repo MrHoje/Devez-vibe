@@ -473,17 +473,21 @@ fn codex_invocation(resolved: &Path, args: &[&str]) -> Command {
 
 const TITLE_INSTRUCTIONS: &str =
     "Write a title for a conversation that begins with the user request below.
-Use the language of the request, about 15 characters including spaces, no quotes or trailing punctuation.
-Reply with the title only. Do not run commands or use tools.";
+Not counting spaces, aim for about 20 bytes and never exceed 24, counting a Korean character as 2 bytes and an English letter or digit as 1 (about 10 Korean characters or 20 English letters).
+No quotes or trailing punctuation. Reply with the title only. Do not run commands or use tools.";
 /// Enough of a long first prompt to say what it is about.
 const TITLE_PROMPT_CHARS: usize = 2_000;
-/// Titles aim at about 15 characters; this only stops a reply that ignored it.
-const TITLE_CHARS: usize = 20;
+/// Titles aim at about 20 bytes; this enforces the 24 the prompt allows.
+const TITLE_BYTES: usize = 24;
 
-/// What both runtimes are asked to title a new session from.
+/// What both runtimes are asked to title a new session from, in the language
+/// `/language` shows.
 pub(crate) fn title_request(prompt: &str) -> String {
     let request: String = prompt.chars().take(TITLE_PROMPT_CHARS).collect();
-    format!("{TITLE_INSTRUCTIONS}\n\n<request>\n{request}\n</request>")
+    let language = crate::language::tr("Korean", "English");
+    format!(
+        "{TITLE_INSTRUCTIONS}\nWrite the title in {language}.\n\n<request>\n{request}\n</request>"
+    )
 }
 
 /// Codex's own clients name a thread from its first prompt; the app-server does
@@ -575,14 +579,21 @@ pub(crate) fn clean_title(reply: &str) -> Option<String> {
     let title = line
         .trim_start_matches(['#', '*', '"', '\'', '`', '“', '‘', ' '])
         .trim_end_matches(['*', '"', '\'', '`', '”', '’', '.', '。', ' ']);
-    // A model counts characters loosely, so the cap is enforced here, at the last
-    // space that fits when the cut would split a word.
-    let title = match title.char_indices().nth(TITLE_CHARS) {
-        Some((end, next)) if !next.is_whitespace() => {
+    // A model counts loosely, so the cap is enforced here: spaces are free, a
+    // Korean character weighs 2 and an English letter or digit 1. The cut falls
+    // at the last space that fits when it would split a word.
+    let mut bytes = 0;
+    let overflow = title.char_indices().find(|&(_, c)| {
+        if !c.is_whitespace() {
+            bytes += if c.is_ascii() { 1 } else { 2 };
+        }
+        bytes > TITLE_BYTES
+    });
+    let title = match overflow {
+        Some((end, _)) => {
             let fitted = &title[..end];
             fitted.rfind(' ').map_or(fitted, |space| &fitted[..space])
         }
-        Some((end, _)) => &title[..end],
         None => title,
     }
     .trim_end();
@@ -1268,16 +1279,24 @@ mod tests {
         assert_eq!(clean_title(" \n \n"), None);
         assert_eq!(
             clean_title(&"가".repeat(80)).map(|title| title.chars().count()),
-            Some(TITLE_CHARS)
+            Some(TITLE_BYTES / 2)
         );
-        // About 15 is asked for; only a reply far past it is cut, at a space.
+        // Spaces are free, Korean weighs 2 and ASCII 1; past 24 the cut falls at a space.
         assert_eq!(
-            clean_title("세션 자동 이름과 rename 추가").as_deref(),
-            Some("세션 자동 이름과 rename 추가")
+            clean_title("세션 자동 이름 생성 규칙 변경").as_deref(),
+            Some("세션 자동 이름 생성 규칙 변경")
+        );
+        assert_eq!(
+            clean_title("세션 자동 이름 생성 규칙을 변경").as_deref(),
+            Some("세션 자동 이름 생성 규칙을")
+        );
+        assert_eq!(
+            clean_title("rename 기능 12개 추가").as_deref(),
+            Some("rename 기능 12개 추가")
         );
         assert_eq!(
             clean_title("Fix the login flow for OAuth users on Windows").as_deref(),
-            Some("Fix the login flow")
+            Some("Fix the login flow for OAuth")
         );
     }
 

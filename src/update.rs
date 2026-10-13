@@ -23,18 +23,14 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Codex 세션을 포크하거나 재개할 때 추론 수준이 초기화되던 문제를 고쳤습니다.",
-    "목록·대기 프롬프트·diff 인용이 떠도 상태 줄이 컴포저 바로 위에 남습니다.",
-    "하위 에이전트·백그라운드 작업 줄의 `x`로 그 작업만 멈춥니다. 활동 기록 창은 없앴습니다.",
-    "Claude Code가 비정상 종료돼도 다음 요청에서 대화를 자동으로 이어 갑니다.",
+    "플러그인·마켓플레이스·`/skills`·`/new`·`/status`·`/connect`를 기다리는 동안 화면이 멈추지 않고 컴포저 위에 진행 상태를 표시합니다.",
+    "하위 에이전트 줄은 점·경과 시간·`이름 · 설명`으로 간결하게 표시하고 줄의 `x`는 없앴으며, Subagents 섹션을 접을 수 있습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Fixed forked or resumed Codex sessions resetting their reasoning effort.",
-    "Status rows stay right above the composer when lists, queued prompts or diff quotes appear.",
-    "The `x` on a subagent or background task row stops just that task. The activity log window is gone.",
-    "When Claude Code exits abnormally, the next request continues the conversation automatically.",
+    "Waiting on plugins, marketplaces, `/skills`, `/new`, `/status` or `/connect` no longer freezes the screen; progress shows above the composer.",
+    "Subagent rows are compact — a dot, elapsed time and `name · description` — the row `x` is gone, and the Subagents section can be collapsed.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

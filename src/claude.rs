@@ -933,7 +933,7 @@ mod tests {
     fn bridge_restores_history_from_the_transcript_file_across_compactions() {
         let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
 
-        assert!(bridge.contains("function transcriptEntries(raw)"));
+        assert!(bridge.contains("function transcriptEntries(raw, sidechain = false)"));
         assert!(bridge.contains("async function sessionMessages(id, cwd)"));
         assert!(bridge.contains("const messages = await sessionMessages(id, params.cwd);"));
         assert!(bridge.contains("Claude compacted transcript self-test failed"));
@@ -1067,8 +1067,6 @@ mod tests {
             bridge.contains("if (SUBAGENT_TOOLS.includes(name)) startSubagent(session, block);")
         );
         assert!(bridge.contains("recordSubagentMessage(session, message)"));
-        // A row's `x` stops that task alone, by the SDK task id the row resolves to.
-        assert!(bridge.contains("await session.query.stopTask(running.taskId);"));
         // The artifact row under the status line listens for this method name.
         assert!(bridge.contains("notify(\"turn/artifact/published\""));
         // A resume replays the transcript's published pages into that row.
