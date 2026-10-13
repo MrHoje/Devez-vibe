@@ -3153,6 +3153,15 @@ async fn run_action(
         }
         Action::NewThread => return start_new_thread(server, state, renderer).await,
         Action::Worktree(name) => {
+            if !state.allow_thread_switch() {
+                return Ok(false);
+            }
+            if let Err(error) =
+                await_integration_panel(state, renderer, server.release_thread(&state.thread_id)).await?
+            {
+                state.push_notice(BlockKind::Warning, "Session still running", error.to_string());
+                return Ok(false);
+            }
             let cwd = PathBuf::from(&state.cwd);
             let result = await_with_activity(state, renderer, async move {
                 tokio::task::spawn_blocking(move || worktree::prepare(&cwd, name.as_deref())).await?
@@ -3597,15 +3606,25 @@ async fn run_action(
             // clock starts before the request, since a runtime that only answers
             // once compaction finished would otherwise show no progress at all.
             state.begin_compaction();
-            if let Err(error) = server
-                .request(
+            let result = await_integration_panel(
+                state,
+                renderer,
+                server.request(
                     "thread/compact/start",
                     json!({ "threadId": state.thread_id }),
-                )
-                .await
-            {
-                state.end_compaction();
-                state.push_notice(BlockKind::Error, "Compaction failed", error.to_string());
+                ),
+            )
+            .await?;
+            match result {
+                Ok(response) => {
+                    if let Some(id) = response.pointer("/turn/id").and_then(Value::as_str) {
+                        state.set_turn_started(id.to_owned());
+                    }
+                }
+                Err(error) => {
+                    state.end_compaction();
+                    state.push_notice(BlockKind::Error, "Compaction failed", error.to_string());
+                }
             }
         }
         Action::RenameThread(name) => match server
@@ -3712,7 +3731,24 @@ async fn run_action(
                 );
                 return Ok(false);
             };
-            let (method, params) = mcp_toggle_request(provider, &state.thread_id, &name, enabled);
+            let thread_id = if provider == SkillProvider::Claude {
+                let Some(id) = server.claude_thread_id(&state.thread_id) else {
+                    state.apply_mcp_enabled(
+                        provider,
+                        &name,
+                        !enabled,
+                        tr(
+                            "Claude 세션이 아직 시작되지 않았습니다.",
+                            "The Claude session hasn't started yet.",
+                        ),
+                    );
+                    return Ok(false);
+                };
+                id
+            } else {
+                String::new()
+            };
+            let (method, params) = mcp_toggle_request(provider, &thread_id, &name, enabled);
             let sender = management_tx.clone();
             tokio::spawn(async move {
                 let mut result = client
@@ -3845,6 +3881,17 @@ async fn run_action(
         Action::McpLogin(name) => {
             let model = state.selected_model_name().to_owned();
             let claude = claude::is_claude_model(&model);
+            let Some(thread_id) = integration_mcp_thread_id(server, state) else {
+                state.push_notice(
+                    BlockKind::Error,
+                    "MCP login failed",
+                    tr(
+                        "MCP 세션이 아직 시작되지 않았습니다.",
+                        "The MCP session hasn't started yet.",
+                    ),
+                );
+                return Ok(false);
+            };
             let Some(client) = server.integration_client(&model) else {
                 state.push_notice(
                     BlockKind::Error,
@@ -3856,14 +3903,14 @@ async fn run_action(
             let (method, params) = if claude {
                 (
                     "mcp/login",
-                    json!({ "sessionId": state.thread_id, "name": name.clone() }),
+                    json!({ "sessionId": thread_id, "name": name.clone() }),
                 )
             } else {
                 (
                     "mcpServer/oauth/login",
                     json!({
                         "name": name.clone(),
-                        "threadId": state.thread_id,
+                        "threadId": thread_id,
                         "timeoutSecs": 300
                     }),
                 )
@@ -4691,10 +4738,19 @@ async fn start_new_thread(
     state: &mut AppState,
     renderer: &mut Renderer,
 ) -> Result<bool> {
+    if !state.allow_thread_switch() {
+        return Ok(false);
+    }
     if state.waiting_for_usage_limit() {
         server.request("turn/interrupt", json!({
             "threadId": state.thread_id, "turnId": state.turn_id
         })).await?;
+    }
+    if let Err(error) =
+        await_integration_panel(state, renderer, server.release_thread(&state.thread_id)).await?
+    {
+        state.push_notice(BlockKind::Warning, "Session still running", error.to_string());
+        return Ok(false);
     }
     renderer.clear_screen()?;
     state.prepare_new_thread();
@@ -4819,6 +4875,9 @@ async fn resume_thread(
     renderer: &mut Renderer,
     target: &str,
 ) -> Result<bool> {
+    if !state.allow_thread_switch() {
+        return Ok(false);
+    }
     // Turning a name into an id is a quick lookup, and a miss has to leave the
     // current session untouched, so it runs before anything is torn down.
     let current_cwd = state.cwd.clone();
@@ -4868,10 +4927,21 @@ async fn resume_into_state(
     thread_id: &str,
     protect_side_exit_keys: bool,
 ) -> Result<Switched> {
+    if !protect_side_exit_keys && !state.allow_thread_switch() {
+        return Ok(Switched::Failed);
+    }
     if state.waiting_for_usage_limit() {
         server.request("turn/interrupt", json!({
             "threadId": state.thread_id, "turnId": state.turn_id
         })).await?;
+    }
+    if !protect_side_exit_keys && thread_id != state.thread_id {
+        if let Err(error) =
+            await_integration_panel(state, renderer, server.release_thread(&state.thread_id)).await?
+        {
+            state.push_notice(BlockKind::Warning, "Session still running", error.to_string());
+            return Ok(Switched::Failed);
+        }
     }
     let previous_thread = state.thread_id.clone();
     // Read before the screen resets: the resumed session has to reopen on the
@@ -6986,7 +7056,7 @@ fn apply_composer_inputs_with_scroll(
 
 fn integration_mcp_thread_id(server: &BackendServer, state: &AppState) -> Option<String> {
     if claude::is_claude_model(state.selected_model_name()) {
-        Some(state.thread_id.clone())
+        server.claude_thread_id(&state.thread_id)
     } else {
         server.codex_thread_id(&state.thread_id)
     }

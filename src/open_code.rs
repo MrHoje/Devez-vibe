@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env, fs,
     net::TcpListener,
     path::{Path, PathBuf},
@@ -47,7 +47,7 @@ type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
 type DetachedMap = Arc<Mutex<HashMap<u64, DetachedTurn>>>;
 type ToolMap = Arc<Mutex<HashMap<String, Value>>>;
 type StreamMap = Arc<Mutex<HashMap<String, SessionStreams>>>;
-type ActiveMap = Arc<Mutex<HashMap<String, ActiveTurn>>>;
+type ActiveMap = Arc<Mutex<ActiveTurns>>;
 type LoadingMap = Arc<Mutex<HashMap<String, LoadedHistory>>>;
 type HistoryMap = Arc<Mutex<HashMap<String, Value>>>;
 type Notification = (String, Value);
@@ -73,6 +73,15 @@ struct ActiveTurn {
     turn_id: String,
     outstanding: usize,
 }
+
+#[derive(Default)]
+struct ActiveTurns {
+    active: HashMap<String, ActiveTurn>,
+    /// Only prompt responses prove completion; absent sessions remain unknown.
+    completed: VecDeque<DetachedTurn>,
+}
+
+const COMPLETED_TURN_LIMIT: usize = 128;
 
 /// session/load가 응답 전에 재생해 주는 과거 대화 조각. 재개 화면 복원에 쓴다.
 struct HistoryChunk {
@@ -408,6 +417,24 @@ pub struct OpenCodeClient {
 }
 
 impl OpenCodeClient {
+    async fn turn_status(&self, session_id: &str, expected_turn: Option<&str>) -> Value {
+        let turns = self.active_turns.lock().await;
+        match turns.active.get(session_id) {
+            Some(turn) if turn.outstanding > 0 => {
+                json!({ "known": true, "running": true, "turnId": turn.turn_id })
+            }
+            _ => match expected_turn.filter(|id| !id.is_empty()).and_then(|id| {
+                turns
+                    .completed
+                    .iter()
+                    .find(|turn| turn.session_id == session_id && turn.turn_id == id)
+            }) {
+                Some(turn) => json!({ "known": true, "running": false, "turnId": turn.turn_id }),
+                _ => json!({ "known": false }),
+            },
+        }
+    }
+
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (response_tx, response_rx) = oneshot::channel();
@@ -450,7 +477,7 @@ impl OpenCodeClient {
         // 추적이 턴이 바뀐 것으로 읽고 진행 표시가 끊긴다.
         let (turn_id, joined) = {
             let mut active = self.active_turns.lock().await;
-            match active.get_mut(session_id) {
+            match active.active.get_mut(session_id) {
                 Some(turn) if steer => {
                     turn.outstanding += 1;
                     (turn.turn_id.clone(), true)
@@ -460,7 +487,7 @@ impl OpenCodeClient {
                         "opencode-turn-{}",
                         self.next_turn.fetch_add(1, Ordering::Relaxed)
                     );
-                    active.insert(
+                    active.active.insert(
                         session_id.to_owned(),
                         ActiveTurn {
                             turn_id: turn_id.clone(),
@@ -489,12 +516,12 @@ impl OpenCodeClient {
         })) {
             self.detached.lock().await.remove(&id);
             let mut active = self.active_turns.lock().await;
-            if let Some(turn) = active.get_mut(session_id)
+            if let Some(turn) = active.active.get_mut(session_id)
                 && turn.turn_id == turn_id
             {
                 turn.outstanding = turn.outstanding.saturating_sub(1);
                 if turn.outstanding == 0 {
-                    active.remove(session_id);
+                    active.active.remove(session_id);
                 }
             }
             return Err(error);
@@ -659,10 +686,10 @@ impl ProviderAuthServer {
         for _ in 0..60 {
             let request = if self.is_v2() {
                 self.v2_request(reqwest::Method::GET, &["api", "info"])?
-                    .timeout(Duration::from_secs(2))
             } else {
                 self.client.get(self.url(&["global", "health"])?)
-            };
+            }
+            .timeout(Duration::from_secs(2));
             if request
                 .send()
                 .await
@@ -801,7 +828,10 @@ impl ProviderAuthServer {
             .await
             .context(tr("OpenCode provider API 요청 실패", "OpenCode provider API request failed"))?;
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = response.text().await.context(tr(
+            "OpenCode provider API 응답 읽기 실패",
+            "Couldn't read the OpenCode provider API response",
+        ))?;
         if !status.is_success() {
             let detail = serde_json::from_str::<Value>(&body)
                 .ok()
@@ -1252,7 +1282,7 @@ impl OpenCodeServer {
         let (event_tx, events) = mpsc::unbounded_channel::<ServerEvent>();
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let detached: DetachedMap = Arc::new(Mutex::new(HashMap::new()));
-        let active_turns: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
+        let active_turns: ActiveMap = Arc::default();
         let loading: LoadingMap = Arc::new(Mutex::new(HashMap::new()));
         let tools: ToolMap = Arc::new(Mutex::new(HashMap::new()));
         let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
@@ -1331,7 +1361,7 @@ impl OpenCodeServer {
             drop(pending);
             // 연결이 죽으면 응답을 기다리던 턴을 닫아 스피너가 영원히 남지
             // 않게 한다.
-            reader_active.lock().await.clear();
+            reader_active.lock().await.active.clear();
             let mut detached = reader_detached.lock().await;
             for (_, turn) in detached.drain() {
                 let _ = reader_events.send(ServerEvent::Notification {
@@ -1715,6 +1745,10 @@ impl OpenCodeServer {
             .await
     }
 
+    pub async fn turn_status(&self, session_id: &str, expected_turn: Option<&str>) -> Value {
+        self.client.turn_status(session_id, expected_turn).await
+    }
+
     pub async fn start_prompt_content(
         &self,
         session_id: &str,
@@ -1855,7 +1889,8 @@ async fn route_message(
             let _ = sender.send(response);
             return;
         }
-        if let Some(turn) = detached.lock().await.remove(&id) {
+        let detached_turn = detached.lock().await.remove(&id);
+        if let Some(turn) = detached_turn {
             let error_detail = message.get("error").map(format_rpc_error);
             if let Some(detail) = &error_detail {
                 let _ = events.send(ServerEvent::Notification {
@@ -1871,12 +1906,12 @@ async fn route_message(
             // 합류한 추가 지시가 아직 돌고 있으면 턴을 끝내지 않는다.
             let finished = {
                 let mut active = active.lock().await;
-                match active.get_mut(&turn.session_id) {
+                match active.active.get_mut(&turn.session_id) {
                     Some(current) if current.turn_id == turn.turn_id => {
                         current.outstanding = current.outstanding.saturating_sub(1);
                         let done = current.outstanding == 0;
                         if done {
-                            active.remove(&turn.session_id);
+                            active.active.remove(&turn.session_id);
                         }
                         done
                     }
@@ -1885,6 +1920,15 @@ async fn route_message(
             };
             if !finished {
                 return;
+            }
+            if !detached.lock().await.values().any(|pending| {
+                pending.session_id == turn.session_id && pending.turn_id == turn.turn_id
+            }) {
+                let mut turns = active.lock().await;
+                turns.completed.push_back(turn.clone());
+                while turns.completed.len() > COMPLETED_TURN_LIMIT {
+                    turns.completed.pop_front();
+                }
             }
             // 열린 본문·사고 항목은 턴이 끝나면 여기서 완료 처리해야
             // 진행 표시가 이 항목을 기다리며 남지 않는다.
@@ -2759,6 +2803,155 @@ fn image_mime(path: &Path) -> &'static str {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn completed_turn_status_is_bounded_and_never_marks_a_new_prompt_idle() {
+        let (outbound, mut requests) = mpsc::unbounded_channel();
+        let client = OpenCodeClient {
+            outbound: Arc::new(StdMutex::new(Some(outbound))),
+            pending: Arc::default(),
+            detached: Arc::default(),
+            active_turns: Arc::default(),
+            next_id: Arc::new(AtomicU64::new(1)),
+            next_turn: Arc::new(AtomicU64::new(1)),
+            events: mpsc::unbounded_channel().0,
+        };
+        let mut ids = Vec::new();
+        for _ in 0..=COMPLETED_TURN_LIMIT {
+            let turn = client.start_prompt("ses_1", vec![], false).await.unwrap();
+            let request = requests.recv().await.unwrap();
+            route_message(
+                json!({ "id": request["id"], "result": {} }),
+                &client.pending,
+                &client.detached,
+                &client.active_turns,
+                &Arc::default(),
+                &Arc::default(),
+                &Arc::default(),
+                &client.events,
+            )
+            .await;
+            ids.push(turn);
+        }
+        assert_eq!(
+            client.active_turns.lock().await.completed.len(),
+            COMPLETED_TURN_LIMIT
+        );
+        assert_eq!(
+            client.turn_status("ses_1", Some(&ids[0])).await,
+            json!({ "known": false })
+        );
+        let last = ids.last().unwrap();
+        assert_eq!(
+            client.turn_status("ses_1", Some(last)).await["running"],
+            false
+        );
+        assert_eq!(
+            client.turn_status("other-session", Some(last)).await,
+            json!({ "known": false })
+        );
+
+        let next = client.start_prompt("ses_1", vec![], false).await.unwrap();
+        assert_eq!(
+            client.turn_status("ses_1", Some(last)).await,
+            json!({ "known": true, "running": true, "turnId": next })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_health_stops_waiting_when_the_server_never_responds() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let auth = ProviderAuthServer::new(listener.local_addr().unwrap().port()).unwrap();
+        let waiting = tokio::spawn(async move {
+            timeout(Duration::from_secs(130), auth.wait_until_ready()).await
+        });
+        let (first, _) = listener.accept().await.unwrap();
+        let silent = tokio::spawn(async move {
+            let mut connections = vec![first];
+            while let Ok((stream, _)) = listener.accept().await {
+                connections.push(stream);
+            }
+        });
+
+        let result = waiting.await.unwrap();
+        silent.abort();
+        assert!(
+            result.is_ok(),
+            "개별 health 요청이 전체 대기 상한보다 먼저 끝나야 한다"
+        );
+        assert!(
+            result.unwrap().is_err(),
+            "응답 없는 서버는 준비 완료로 처리하지 않는다"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_health_retries_after_an_unresponsive_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let auth = ProviderAuthServer::new(listener.local_addr().unwrap().port()).unwrap();
+        let server = tokio::spawn(async move {
+            let (_silent, _) = listener.accept().await.unwrap();
+            let (recovered, _) = listener.accept().await.unwrap();
+            let mut recovered = BufReader::new(recovered);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                recovered.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            recovered
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+        });
+
+        let result = timeout(Duration::from_secs(5), auth.wait_until_ready()).await;
+        server.abort();
+        assert!(
+            result.is_ok(),
+            "첫 연결이 멈춰도 다음 health 요청으로 복구해야 한다"
+        );
+        assert!(result.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn provider_body_timeout_is_reported_instead_of_becoming_an_empty_success() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let auth = ProviderAuthServer::new(listener.local_addr().unwrap().port()).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                stream.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            stream
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let result = auth
+            .send_json(
+                auth.client
+                    .get(auth.url(&["provider"]).unwrap())
+                    .timeout(Duration::from_millis(100)),
+            )
+            .await;
+        server.abort();
+        assert!(
+            result.is_err(),
+            "본문이 오지 않으면 정상 빈 응답으로 숨기지 않는다"
+        );
+    }
+
     #[test]
     fn websearch_tool_updates_become_web_search_items() {
         let started = json!({ "toolCallId": "t1", "title": "websearch", "kind": "other", "rawInput": {} });
@@ -2786,7 +2979,7 @@ mod tests {
             outbound: Arc::new(StdMutex::new(Some(outbound))),
             pending: Arc::new(Mutex::new(HashMap::new())),
             detached: Arc::new(Mutex::new(HashMap::new())),
-            active_turns: Arc::new(Mutex::new(HashMap::new())),
+            active_turns: Arc::default(),
             next_id: Arc::new(AtomicU64::new(1)),
             next_turn: Arc::new(AtomicU64::new(1)),
             events: mpsc::unbounded_channel().0,
@@ -3316,7 +3509,7 @@ mod tests {
             outbound: Arc::new(StdMutex::new(Some(outbound_tx))),
             pending: Arc::new(Mutex::new(HashMap::new())),
             detached: Arc::new(Mutex::new(HashMap::new())),
-            active_turns: Arc::new(Mutex::new(HashMap::new())),
+            active_turns: Arc::default(),
             next_id: Arc::new(AtomicU64::new(1)),
             next_turn: Arc::new(AtomicU64::new(1)),
             events: event_tx.clone(),
@@ -3333,6 +3526,14 @@ mod tests {
             )
             .await
             .expect("첫 prompt");
+        assert_eq!(
+            client.turn_status("absent", None).await,
+            json!({ "known": false })
+        );
+        assert_eq!(
+            client.turn_status("ses_1", Some(&first)).await,
+            json!({ "known": true, "running": true, "turnId": first })
+        );
         let steered = client
             .start_prompt(
                 "ses_1",
@@ -3374,6 +3575,11 @@ mod tests {
         .await;
         assert!(event_rx.try_recv().is_err());
 
+        assert_eq!(
+            client.turn_status("ses_1", Some(&first)).await["running"],
+            true
+        );
+
         // 마지막 응답에서만 turn/completed가 한 번 나온다.
         route_message(
             json!({ "jsonrpc": "2.0", "id": second_id, "result": {} }),
@@ -3387,6 +3593,22 @@ mod tests {
         )
         .await;
         let completed = event_rx.recv().await.expect("turn/completed");
+        assert_eq!(
+            client.turn_status("ses_1", Some(&first)).await,
+            json!({ "known": true, "running": false, "turnId": first })
+        );
+        assert_eq!(
+            client.turn_status("ses_1", Some("unknown-turn")).await,
+            json!({ "known": false })
+        );
+        assert_eq!(
+            client.turn_status("ses_1", Some("")).await,
+            json!({ "known": false })
+        );
+        assert_eq!(
+            client.turn_status("ses_1", None).await,
+            json!({ "known": false })
+        );
         match completed {
             ServerEvent::Notification { method, params } => {
                 assert_eq!(method, "turn/completed");
@@ -3418,7 +3640,7 @@ mod tests {
             outbound: Arc::new(StdMutex::new(Some(outbound_tx))),
             pending: Arc::new(Mutex::new(HashMap::new())),
             detached: Arc::new(Mutex::new(HashMap::new())),
-            active_turns: Arc::new(Mutex::new(HashMap::new())),
+            active_turns: Arc::default(),
             next_id: Arc::new(AtomicU64::new(1)),
             next_turn: Arc::new(AtomicU64::new(1)),
             events: event_tx.clone(),
@@ -3673,7 +3895,7 @@ mod tests {
     async fn open_code_2_subagent_rows_follow_child_session_updates() {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let detached: DetachedMap = Arc::new(Mutex::new(HashMap::new()));
-        let active: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
+        let active: ActiveMap = Arc::default();
         let loading: LoadingMap = Arc::new(Mutex::new(HashMap::new()));
         let tools: ToolMap = Arc::new(Mutex::new(HashMap::new()));
         let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
@@ -3814,7 +4036,7 @@ mod tests {
         let loading: LoadingMap = Arc::new(Mutex::new(HashMap::new()));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let detached: DetachedMap = Arc::new(Mutex::new(HashMap::new()));
-        let active: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
+        let active: ActiveMap = Arc::default();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ServerEvent>();
         loading
             .lock()
@@ -3858,7 +4080,7 @@ mod tests {
         let loading: LoadingMap = Arc::new(Mutex::new(HashMap::new()));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let detached: DetachedMap = Arc::new(Mutex::new(HashMap::new()));
-        let active: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
+        let active: ActiveMap = Arc::default();
         let (event_tx, _event_rx) = mpsc::unbounded_channel::<ServerEvent>();
         loading
             .lock()

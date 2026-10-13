@@ -5186,6 +5186,22 @@ impl AppState {
         !self.subagents.is_empty()
     }
 
+    /// 대화를 떠나 살아 있는 작업이 화면에서 사라지지 않게 한다.
+    pub fn allow_thread_switch(&mut self) -> bool {
+        if !self.host_children_busy() {
+            return true;
+        }
+        self.push_notice(
+            BlockKind::Warning,
+            "Background work in progress",
+            tr(
+                "백그라운드 작업을 마치거나 중단한 뒤 대화를 전환하세요.",
+                "Finish or stop the background work before switching conversations.",
+            ),
+        );
+        false
+    }
+
     pub fn host_loading(&self) -> bool {
         self.host_loading
     }
@@ -6577,12 +6593,20 @@ impl AppState {
     /// The answer decides whether the wait ends — silence alone never does, since
     /// a long think looks exactly the same from here.
     pub fn take_stall_probe(&mut self) -> Option<String> {
-        if !self.busy || self.compacting() || self.awaiting_input() || self.stream_events_pending() {
+        if !self.host_turn_busy() || self.awaiting_input() || self.stream_events_pending() {
             self.stall_probe_at = None;
             return None;
         }
-        let turn_id = self.turn_id.clone()?;
-        if self.turn_progress_at?.elapsed() < TURN_STALL_SILENCE {
+        let turn_id = self
+            .turn_id
+            .clone()
+            .or_else(|| self.compacting().then(String::new))?;
+        let progress_at = if self.compacting() && self.turn_id.is_none() {
+            self.compacting_started_at
+        } else {
+            self.turn_progress_at
+        }?;
+        if progress_at.elapsed() < TURN_STALL_SILENCE {
             return None;
         }
         if self
@@ -6598,6 +6622,23 @@ impl AppState {
     /// The runtime reports the turn we are still waiting on is over: its
     /// `turn/completed` never arrived, so end the wait exactly as that would have.
     pub fn resolve_stall_probe(&mut self, turn_id: &str) -> bool {
+        if self.compacting()
+            && self.turn_id.is_none()
+            && turn_id.is_empty()
+            && !self.awaiting_input()
+        {
+            self.stall_probe_at = None;
+            self.end_compaction();
+            self.push_notice(
+                BlockKind::Warning,
+                "Missing compaction completion",
+                tr(
+                    "압축은 이미 끝났지만 완료 알림이 오지 않아 입력 대기를 해제했습니다.",
+                    "Compaction already ended without a completion notice, so queued input can continue.",
+                ),
+            );
+            return true;
+        }
         if !self.busy || self.turn_id.as_deref() != Some(turn_id) || self.awaiting_input() {
             return false;
         }
@@ -7347,6 +7388,9 @@ impl AppState {
     }
 
     pub fn prepare_resume(&mut self) {
+        self.end_compaction();
+        self.turn_progress_at = None;
+        self.stall_probe_at = None;
         self.claude_usage_limit_reset = None;
         self.composer_undo.clear();
         self.composer_redo.clear();
@@ -10806,6 +10850,14 @@ impl AppState {
 
     pub(crate) fn run_slash_command(&mut self, command: &str) -> Action {
         let parts = command.split_whitespace().collect::<Vec<_>>();
+        if matches!(
+            parts.first().copied(),
+            Some("/new" | "/clear" | "/resume" | "/continue" | "/worktree")
+        )
+            && !self.allow_thread_switch()
+        {
+            return Action::None;
+        }
         let using_claude = self.selected_model_name().starts_with("claude:");
         // OpenCode에는 아래 통합 기능이 없다. Claude나 Codex 런타임으로 잘못
         // 전달해 다른 계정을 만지는 대신 여기서 안내하고 끝낸다.
@@ -14492,6 +14544,8 @@ impl AppState {
     /// compacted boundary arrives (or the turn that carries it ends).
     pub fn begin_compaction(&mut self) {
         self.compacting_started_at = Some(Instant::now());
+        self.turn_progress_at = self.compacting_started_at;
+        self.stall_probe_at = None;
     }
 
     pub fn end_compaction(&mut self) {
@@ -27825,6 +27879,68 @@ mod tests {
         state.handle_notification("turn/completed", &json!({}));
 
         assert!(!state.compacting());
+    }
+
+    #[test]
+    fn new_thread_during_idle_compaction_accepts_its_first_prompt() {
+        let mut state = test_state();
+        let previous_thread = state.thread_id.clone();
+        state.begin_compaction();
+        assert!(matches!(state.run_command("/new"), Action::NewThread));
+
+        state.prepare_new_thread();
+        state.begin_thread_switch();
+        state.handle_notification("thread/compacted", &json!({ "threadId": previous_thread }));
+        assert!(!state.compacting());
+        state.editor.set_text("새 대화의 첫 입력");
+        assert!(matches!(state.handle_key(KeyEvent::from(KeyCode::Enter)), Action::Submit(_)));
+        assert!(state.view().queued_prompts.is_empty());
+    }
+
+    #[test]
+    fn an_idle_compaction_is_probed_and_confirmed_completion_releases_its_queue() {
+        let mut state = test_state();
+        state.begin_compaction();
+        state.editor.set_text("압축 후 입력");
+        assert!(matches!(state.handle_key(KeyEvent::from(KeyCode::Enter)), Action::None));
+        state.turn_progress_at = Some(Instant::now() - TURN_STALL_SILENCE);
+        state.compacting_started_at = state.turn_progress_at;
+        assert_eq!(state.take_stall_probe(), Some(String::new()));
+        assert_eq!(state.take_stall_probe(), None);
+        assert!(state.resolve_stall_probe(""));
+        assert!(!state.host_turn_busy());
+        let queued = state.take_queued_prompt().expect("압축 후 입력 보존");
+        assert!(matches!(state.start_queued_prompt(queued), Action::Submit(_)));
+
+        state.set_turn_started("new-turn".to_owned());
+        assert!(!state.resolve_stall_probe(""), "새 턴에 옛 압축 조회를 적용하지 않는다");
+        assert!(state.busy);
+    }
+
+    #[test]
+    fn unrelated_notifications_do_not_hide_a_missing_compaction_boundary() {
+        let mut state = test_state();
+        state.begin_compaction();
+        state.compacting_started_at = Some(Instant::now() - TURN_STALL_SILENCE);
+        state.handle_notification("account/updated", &json!({}));
+        assert_eq!(state.take_stall_probe(), Some(String::new()));
+        assert!(state.compacting(), "진행 여부는 여전히 런타임에 확인한다");
+    }
+
+    #[test]
+    fn thread_switches_leave_live_background_work_visible() {
+        for command in ["/new", "/clear", "/resume other", "/continue other", "/worktree"] {
+            let mut state = state_with_a_running_subagent();
+            let previous_thread = state.thread_id.clone();
+            assert!(matches!(state.run_command(command), Action::None), "{command}");
+            assert_eq!(state.thread_id, previous_thread);
+            assert!(state.host_children_busy());
+        }
+
+        let mut state = state_with_a_running_subagent();
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
+        assert!(!state.host_children_busy());
+        assert!(matches!(state.run_command("/new"), Action::NewThread));
     }
 
     #[test]

@@ -613,7 +613,7 @@ mod tests {
 
         assert!(bridge.contains("const PREFERRED_PERMISSION_MODE = \"auto\""));
         assert!(!bridge.contains("allowDangerouslySkipPermissions: true"));
-        assert!(bridge.contains("await session.query.setPermissionMode(PREFERRED_PERMISSION_MODE)"));
+        assert!(bridge.contains("withSessionQuery(session, (query) => query.setPermissionMode(PREFERRED_PERMISSION_MODE))"));
         assert_eq!(bridge.matches("await applyPermissionMode(session);").count(), 1);
         assert!(!bridge.contains("claude/permissionMode/rejected"));
     }
@@ -637,6 +637,78 @@ mod tests {
         }.await;
         server.shutdown().await;
         result.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "실제 Claude SDK와 모델 호출·로그인 필요"]
+    async fn live_claude_released_session_restores_saved_turn() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let cwd = std::env::current_dir().unwrap();
+        let marker = format!(
+            "DVZRELEASE{}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let trial_dir = std::env::temp_dir().join(&marker);
+        std::fs::create_dir_all(&trial_dir).unwrap();
+        let mut server = ClaudeServer::new(Path::new("node"), Path::new("claude"), &cwd).unwrap();
+        let result = timeout(Duration::from_secs(180), async {
+            let opened = server.request("session/start", json!({
+                "cwd": trial_dir, "model": "claude:sonnet"
+            })).await?;
+            let mut id = opened["id"].clone();
+            server.request("session/prompt", json!({
+                "sessionId": id, "model": "claude:sonnet",
+                "input": [{ "type": "text", "text": format!("도구를 쓰지 말고 {marker}만 그대로 답하세요.") }]
+            })).await?;
+            let mut answer = String::new();
+            loop {
+                let event = server.next_event().await.context("실제 Claude 연결 종료")?;
+                let ServerEvent::Notification { method, params } = event else { continue; };
+                if method == "claude/session/rebound" {
+                    if let Some(recorded) = params.get("newThreadId").and_then(Value::as_str) {
+                        id = json!(raw_thread_id(recorded));
+                    }
+                }
+                if method == "item/completed"
+                    && params.pointer("/item/type").and_then(Value::as_str) == Some("agentMessage")
+                {
+                    answer.push_str(params.pointer("/item/text").and_then(Value::as_str).unwrap_or_default());
+                }
+                if method == "turn/completed" {
+                    anyhow::ensure!(params.pointer("/turn/error").is_none_or(Value::is_null), "실제 Claude 턴 실패: {params}");
+                    break;
+                }
+            }
+            anyhow::ensure!(answer.contains(&marker), "실제 모델 답변에 검증값이 없음");
+            timeout(Duration::from_secs(20), async {
+                loop {
+                    let reply = server.request("session/release", json!({ "sessionId": id })).await?;
+                    if reply.get("released") == Some(&json!(true)) {
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }).await.context("실제 연결 해제 대기 시간 초과")??;
+            let status = server.request("session/turnStatus", json!({ "sessionId": id })).await?;
+            anyhow::ensure!(status.get("known") == Some(&json!(false)), "해제 뒤 연결이 남음: {status}");
+            let resumed = server.request("session/resume", json!({
+                "sessionId": id, "cwd": trial_dir, "model": "claude:sonnet"
+            })).await?;
+            let history = server.request("session/history", json!({
+                "sessionId": resumed["id"], "cwd": trial_dir
+            })).await?;
+            let restored_answer = history.get("data").and_then(Value::as_array)
+                .into_iter().flatten()
+                .flat_map(|turn| turn.get("items").and_then(Value::as_array).into_iter().flatten())
+                .any(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage")
+                    && item.get("text").and_then(Value::as_str).is_some_and(|text| text.contains(&marker)));
+            anyhow::ensure!(restored_answer, "해제 뒤 저장된 모델 답변이 복원되지 않음");
+            println!("실제 Claude 연결 해제와 저장 대화 재개 검증 통과");
+            Ok::<(), anyhow::Error>(())
+        }).await;
+        server.shutdown().await;
+        result.expect("실제 연결·재개 검증 시간 초과").unwrap();
     }
 
     /// 패널에서 끌어낸 인용은 사용자 글자와 별개의 조각으로 나간다. 브리지가 그

@@ -107,7 +107,7 @@ function rpcError(error) {
  */
 const HOST_REQUEST_RUN = Math.random().toString(36).slice(2, 8);
 
-function hostRequest(method, params, signal) {
+function hostRequest(method, params, signal, sessionId) {
   const id = `claude-host-${HOST_REQUEST_RUN}-${nextHostRequest++}`;
   return new Promise((resolve, reject) => {
     const abort = () => {
@@ -117,6 +117,7 @@ function hostRequest(method, params, signal) {
     if (signal?.aborted) return abort();
     signal?.addEventListener("abort", abort, { once: true });
     pendingHostRequests.set(id, {
+      session: sessionId ? lookupSession(sessionId) : null,
       resolve: (value) => {
         signal?.removeEventListener("abort", abort);
         resolve(value);
@@ -538,7 +539,7 @@ async function applyPermissionMode(session) {
     return;
   }
   try {
-    await session.query.setPermissionMode(PREFERRED_PERMISSION_MODE);
+    await withSessionQuery(session, (query) => query.setPermissionMode(PREFERRED_PERMISSION_MODE));
     session.permissionMode = PREFERRED_PERMISSION_MODE;
     session.permissionModeVerified = true;
     return;
@@ -766,7 +767,7 @@ function makeOptions(params, sessionId, resume) {
   if (resume) options.resume = resume;
   else options.sessionId = sessionId;
   options.canUseTool = (toolName, input, permission) =>
-    requestToolPermission(toolName, input, permission);
+    requestToolPermission(toolName, input, permission, sessionId);
   // Hooks run whatever the permission mode, so a read-only role turn holds even
   // under bypass. The policy itself arrives with each prompt.
   options.hooks = {
@@ -884,7 +885,7 @@ function permissionSuggestionLabel(suggestions) {
     : `Don't ask again ${scope}`;
 }
 
-async function requestToolPermission(toolName, input, permission) {
+async function requestToolPermission(toolName, input, permission, sessionId) {
   if (toolName === "AskUserQuestion") {
     const questions = (input.questions || []).map((question, index) => ({
       id: `q${index}`,
@@ -907,6 +908,7 @@ async function requestToolPermission(toolName, input, permission) {
         payload: Buffer.from(JSON.stringify({ questions }), "utf8").toString("base64"),
       },
       permission.signal,
+      sessionId,
     );
     let response;
     try {
@@ -981,7 +983,7 @@ async function requestToolPermission(toolName, input, permission) {
       reason: permission.decisionReason || permission.description,
     };
   }
-  const response = await hostRequest(method, params, permission.signal);
+  const response = await hostRequest(method, params, permission.signal, sessionId);
   if (!approvalGranted(response)) return { behavior: "deny", message: "사용자가 작업을 거부했습니다." };
   return {
     behavior: "allow",
@@ -1778,7 +1780,7 @@ async function supportedClaudeSkills(params) {
   const cwd = params.cwd || process.cwd();
   const live = [...sessions.values()].find((session) =>
     session.query && sameCwd(session.cwd, cwd));
-  if (live) return filterClaudeSkillCommands(await live.query.supportedCommands());
+  if (live) return withSessionQuery(live, async (query) => filterClaudeSkillCommands(await query.supportedCommands()));
   const cacheKey = `${params.claudePath || "claude"}\n${params.cwd || process.cwd()}`;
   if (params.forceReload) skillCatalogs.delete(cacheKey);
   if (skillCatalogs.has(cacheKey)) return skillCatalogs.get(cacheKey);
@@ -1864,18 +1866,20 @@ async function claudeMcpStatus(params) {
       unavailableReason: "Claude 세션이 아직 시작되지 않았습니다.",
     };
   }
-  return claudeMcpStatusValue(await session.query.mcpServerStatus());
+  return withSessionQuery(session, async (query) => claudeMcpStatusValue(await query.mcpServerStatus()));
 }
 
 async function reconnectClaudeMcp(session, requested) {
-  const names = requested
-    ? [requested]
-    : (await session.query.mcpServerStatus())
-        .filter((server) => server?.status !== "disabled")
-        .map((server) => String(server.name || ""))
-        .filter(Boolean);
-  for (const name of names) await session.query.reconnectMcpServer(name);
-  return names;
+  return withSessionQuery(session, async (query) => {
+    const names = requested
+      ? [requested]
+      : (await query.mcpServerStatus())
+          .filter((server) => server?.status !== "disabled")
+          .map((server) => String(server.name || ""))
+          .filter(Boolean);
+    for (const name of names) await query.reconnectMcpServer(name);
+    return names;
+  });
 }
 
 function isQuestionDeliveryError(error) {
@@ -1918,6 +1922,7 @@ async function createSession(params, resumeId) {
     models: [],
     queue,
     query: null,
+    initializing: true,
     turn: null,
     // Prompts that arrived while a turn was running, run in order afterwards.
     pendingPrompts: [],
@@ -1951,6 +1956,7 @@ async function createSession(params, resumeId) {
   sessions.set(id, session);
   const consumer = consume(session)
     .catch((error) => {
+      if (session.closed) return;
       notify("error", {
         threadId: id,
         provider: "Claude",
@@ -1962,16 +1968,11 @@ async function createSession(params, resumeId) {
     .finally(() => {
       clearUsageLimitWait(session);
       if (session.turn) finishTurn(session, new Error("Claude 연결이 종료되었습니다."));
-      clearSubagents(session);
       // A crashed CLI (Windows reports an access violation as exit code
       // 3221225477) leaves a query that rejects every later request. Dropping
       // the session makes the next prompt fail as missing, which the host answers
       // by resuming it from the transcript instead of the user reopening it.
-      if (sessions.get(session.id) === session) {
-        sessions.delete(session.id);
-        session.queue.close();
-        session.query.close();
-      }
+      closeLiveSession(session);
     });
   session.consumer = consumer;
   let initialization;
@@ -1979,9 +1980,7 @@ async function createSession(params, resumeId) {
     initialization = await agentQuery.initializationResult();
     await applyPermissionMode(session);
   } catch (error) {
-    sessions.delete(id);
-    queue.close();
-    agentQuery.close();
+    closeLiveSession(session);
     await Promise.race([consumer, new Promise((resolve) => setTimeout(resolve, 1000))]);
     throw error;
   }
@@ -2018,7 +2017,68 @@ async function createSession(params, resumeId) {
   session.effort = supportedEffort(capabilities, params.effort);
   const account = initialization.account || await safeAccount(agentQuery);
   const usage = await safeUsage(agentQuery);
+  if (session.closed || sessions.get(session.id) !== session || session.query !== agentQuery) {
+    closeLiveSession(session);
+    throw new Error("Claude 초기화 중 연결이 종료되었습니다.");
+  }
+  session.initializing = false;
+  // 새 연결이 준비된 뒤 이전 유휴 연결을 거둔다. /btw의 부모처럼 작업 중인
+  // 세션과 다른 createSession의 초기화 중인 연결은 그대로 둔다.
+  for (const previous of [...sessions.values()]) {
+    if (previous !== session && !sessionHasLiveWork(previous)) closeLiveSession(previous);
+  }
   return { session, initialization, account, usage };
+}
+
+function sessionHasLiveWork(session) {
+  return Boolean(session.initializing || session.promptStarting || session.queryRequests > 0 || session.turn
+    || session.pendingPrompts?.length || session.queue?.values?.length
+    || session.steerPending > 0 || session.automaticTurnsPending > 0 || session.usageLimitWait
+    || session.subagents?.size || session.hiddenSubagentTasks?.size || session.ambientSubagentTasks?.size
+    || [...pendingHostRequests.values()].some((request) => request.session === session));
+}
+
+// await 뒤 같은 query로 이어지는 제어·조회 요청이 유휴 정리와 겹치지 않게 한다.
+async function withSessionQuery(session, action) {
+  const query = session.query;
+  session.queryRequests = (session.queryRequests || 0) + 1;
+  try {
+    return await action(query);
+  } finally {
+    session.queryRequests -= 1;
+  }
+}
+
+// 저장된 transcript는 남기고 CLI와 이 연결의 참조만 해제한다.
+function closeLiveSession(session) {
+  if (session.closed) return;
+  session.closed = true;
+  clearUsageLimitWait(session);
+  watchSubagent(session, null);
+  clearSubagents(session);
+  for (const [id, request] of pendingHostRequests) {
+    if (request.session !== session) continue;
+    pendingHostRequests.delete(id);
+    request.reject(new Error("Claude 연결이 종료되어 사용자 입력 요청이 취소되었습니다."));
+  }
+  if (sessions.get(session.id) === session) {
+    const aliases = [...sessionAliases.keys()].filter((from) => liveSessionId(from) === session.id);
+    for (const from of aliases) sessionAliases.delete(from);
+    sessions.delete(session.id);
+  }
+  session.queue?.close();
+  if (session.queue?.values) session.queue.values.length = 0;
+  session.query?.close();
+  session.queue = null;
+  session.query = null;
+  session.consumer = null;
+  session.pendingPrompts?.splice(0);
+  session.steerPending = 0;
+  session.automaticTurnsPending = 0;
+  session.streamBlocks?.clear();
+  session.tools?.clear();
+  session.knownSubagents?.clear();
+  session.rowTaskIds?.clear();
 }
 
 async function safeAccount(agentQuery) {
@@ -2660,19 +2720,14 @@ function keepBackgroundSubagent(session, toolUseId, result) {
   running.lastSeenAt = Date.now();
   // level 스냅숏이 접수 결과보다 먼저 와서 자리표시자 행을 만들었으면 여기서 접는다.
   // task_started가 오지 않는 빌드에서는 이 경로가 유일한 병합 지점이다.
-  const placeholder = running.taskId ? session.subagents.get(`task:${running.taskId}`) : null;
+  const placeholder = running.taskId ? [...session.subagents.values()]
+    .find((agent) => agent !== running && agent.taskId === running.taskId) : null;
   if (placeholder && placeholder !== running) {
     running.command ||= placeholder.command;
+    if (placeholder.runId && (!running.runId || running.runId < placeholder.runId)) running.runId = placeholder.runId;
     session.subagents.delete(placeholder.id);
   }
-  if (running.taskId) {
-    session.knownSubagents.set(running.taskId, {
-      rowId: running.id,
-      name: running.name,
-      description: running.description,
-      backgroundTask: running.backgroundTask === true,
-    });
-  }
+  rememberSubagent(session, running);
   return true;
 }
 
@@ -2700,6 +2755,7 @@ function resumeBackgroundSubagent(session, toolUseId, pending, result) {
   };
   session.subagents.set(running.id, running);
   session.knownSubagents.set(taskId, {
+    ...known,
     rowId: running.id,
     name: running.name,
     description: running.description,
@@ -2742,6 +2798,8 @@ function upsertStructuredSubagent(session, message) {
     || session.ambientSubagentTasks?.has(taskId))) return null;
   const byTool = toolUseId && findSubagent(session, toolUseId);
   const byTask = taskId && findSubagent(session, taskId);
+  const runId = subagentRunId(message.run_id);
+  if (isStaleSubagentRun(session, taskId, runId, byTool, byTask)) return null;
   let running = byTool || byTask;
   // The SDK does not order the background level snapshot against task_started.
   // If both paths created a row, keep the tool-use row and fold the placeholder
@@ -2751,6 +2809,7 @@ function upsertStructuredSubagent(session, message) {
     byTool.command ||= byTask.command;
     byTool.taskId ||= byTask.taskId;
     byTool.toolUseId ||= byTask.toolUseId;
+    if (byTask.runId && (!byTool.runId || byTool.runId < byTask.runId)) byTool.runId = byTask.runId;
     if ((!byTool.name || byTool.name === "agent") && byTask.name) byTool.name = byTask.name;
     if (!byTool.tool) byTool.tool = byTask.tool;
     byTool.startedAt = Math.min(byTool.startedAt, byTask.startedAt);
@@ -2779,8 +2838,7 @@ function upsertStructuredSubagent(session, message) {
   }
   if (toolUseId) running.toolUseId = toolUseId;
   if (taskId) running.taskId = taskId;
-  const runId = firstLine(message.run_id || "", 80);
-  if (runId && !isLateRun(running, runId)) running.runId = runId;
+  if (runId) running.runId = runId;
   // 스크립트 Monitor는 local_bash 작업으로 와서 스냅숏 이름이 Bash가 된다.
   if (session.tools?.get(toolUseId)?.name === "Monitor") running.name = "Monitor";
   const parentTaskId = firstLine(message.parent_task_id || "", 80);
@@ -2789,16 +2847,7 @@ function upsertStructuredSubagent(session, message) {
   if (subagentType && (!running.name || running.name === "agent")) running.name = subagentType;
   if (subagentType || isSubagentTaskType(message.task_type)) running.backgroundTask = false;
   running.lastSeenAt = Date.now();
-  if (running.taskId) {
-    const known = session.knownSubagents.get(running.taskId);
-    session.knownSubagents.set(running.taskId, {
-      rowId: running.id,
-      name: running.name,
-      // 진행 요약으로 바뀐 설명이 아니라 호출 설명을 기억해, 다시 실행된 줄이 그 설명으로 돌아오게 한다.
-      description: known?.description || running.description,
-      backgroundTask: running.backgroundTask === true,
-    });
-  }
+  rememberSubagent(session, running);
   return running;
 }
 
@@ -2808,13 +2857,47 @@ function hasLiveChildren(session, taskId) {
 
 // 같은 작업의 실행 id는 열린 순서대로 문자열 정렬된다. 지금 행보다 앞선 실행의
 // 통지는 늦게 도착한 것이라 새 실행의 행을 지우면 안 된다.
+function subagentRunId(value) {
+  return typeof value === "string" ? value : "";
+}
+
 function isLateRun(running, runId) {
-  return Boolean(runId && running.runId && runId < running.runId);
+  return Boolean(runId && running?.runId && runId < running.runId);
+}
+
+// 행을 거둬도 마지막 실행과 완료 실행을 기억한다. 같은 실행의 늦은 진행·스냅숏은
+// 행을 되살리지 못하고, 더 큰 실행 id로 시작한 정상 재실행은 그대로 허용한다.
+function rememberSubagent(session, running, completed = false, runId = running.runId) {
+  if (!running.taskId) return;
+  const known = (session.knownSubagents ||= new Map()).get(running.taskId);
+  const latestRunId = [known?.runId, running.runId, runId].filter(Boolean).sort().at(-1);
+  const completedRunId = [known?.completedRunId, completed && (runId || running.runId)].filter(Boolean).sort().at(-1);
+  session.knownSubagents.set(running.taskId, {
+    ...known,
+    rowId: running.id || known?.rowId,
+    name: running.name || known?.name,
+    // 진행 요약 대신 호출 설명을 보존해 재실행한 행이 원래 설명으로 돌아오게 한다.
+    description: known?.description || running.description || "",
+    backgroundTask: running.backgroundTask === true,
+    ...(latestRunId ? { runId: latestRunId } : {}),
+    ...(completedRunId ? { completedRunId } : {}),
+  });
+}
+
+function isStaleSubagentRun(session, taskId, runId, ...running) {
+  if (!runId) return false;
+  const known = taskId && session.knownSubagents?.get(taskId);
+  return Boolean((known?.completedRunId && runId <= known.completedRunId)
+    || isLateRun(known, runId) || running.some((row) => isLateRun(row, runId)));
 }
 
 function finishStructuredSubagent(session, message) {
   const taskId = firstLine(message.task_id || "", 80);
   const toolUseId = firstLine(message.tool_use_id || "", 80);
+  const running = (taskId && findSubagent(session, taskId))
+    || (toolUseId && findSubagent(session, toolUseId));
+  const runId = subagentRunId(message.run_id);
+  if (isStaleSubagentRun(session, taskId, runId, running)) return true;
   const wasTranscriptHidden = taskId
     ? session.hiddenSubagentTasks?.delete(taskId) === true
     : false;
@@ -2822,12 +2905,10 @@ function finishStructuredSubagent(session, message) {
     ? session.ambientSubagentTasks?.delete(taskId) === true
     : false;
   const wasHidden = wasTranscriptHidden || wasAmbient;
-  const running = (toolUseId && findSubagent(session, toolUseId))
-    || (taskId && findSubagent(session, taskId));
+  rememberSubagent(session, running || { taskId, runId }, true, runId || running?.runId);
   if (!running) return wasHidden;
   // 자기 백그라운드 명령을 기다리며 멈춘 에이전트는 그 명령이 끝나면 다시 돌므로 행을 남긴다.
-  if (hasLiveChildren(session, running.taskId)
-    || isLateRun(running, firstLine(message.run_id || "", 80))) return true;
+  if (hasLiveChildren(session, running.taskId)) return true;
   session.subagents.delete(running.id);
   emitSubagents(session);
   return true;
@@ -2835,10 +2916,32 @@ function finishStructuredSubagent(session, message) {
 
 function syncBackgroundSubagents(session, tasks) {
   const snapshot = Array.isArray(tasks) ? tasks : [];
-  session.ambientSubagentTasks = new Set(snapshot
-    .filter((task) => task?.ambient === true)
+  const staleIds = new Set(snapshot
+    .filter((task) => {
+      const taskId = firstLine(task?.task_id || "", 80);
+      return isStaleSubagentRun(session, taskId, subagentRunId(task?.run_id), findSubagent(session, taskId));
+    })
     .map((task) => firstLine(task?.task_id || "", 80))
     .filter(Boolean));
+  const previousAmbient = session.ambientSubagentTasks || new Set();
+  for (const task of snapshot) {
+    if (task?.ambient !== true) continue;
+    const taskId = firstLine(task?.task_id || "", 80);
+    const runId = subagentRunId(task?.run_id);
+    const running = findSubagent(session, taskId);
+    if (!isStaleSubagentRun(session, taskId, runId, running)) {
+      rememberSubagent(session, running || { taskId }, false, runId);
+    }
+  }
+  session.ambientSubagentTasks = new Set(snapshot
+    .filter((task) => task?.ambient === true && !isStaleSubagentRun(session,
+      firstLine(task?.task_id || "", 80), subagentRunId(task?.run_id),
+      findSubagent(session, task?.task_id)))
+    .map((task) => firstLine(task?.task_id || "", 80))
+    .filter(Boolean));
+  for (const taskId of previousAmbient) {
+    if (staleIds.has(taskId)) session.ambientSubagentTasks.add(taskId);
+  }
   const live = snapshot.filter((task) => {
     const taskId = firstLine(task?.task_id || "", 80);
     return task?.ambient !== true
@@ -2848,12 +2951,15 @@ function syncBackgroundSubagents(session, tasks) {
   let changed = false;
   for (const [id, running] of session.subagents) {
     if (running.taskId && session.ambientSubagentTasks.has(running.taskId)) {
+      rememberSubagent(session, running);
       session.subagents.delete(id);
       changed = true;
       continue;
     }
-    if (!running.background || !running.taskId || liveIds.has(running.taskId)
+    if (!running.background || !running.taskId || liveIds.has(running.taskId) || staleIds.has(running.taskId)
       || live.some((task) => task?.parent_task_id === running.taskId)) continue;
+    // level 스냅숏은 task_started와 순서가 정해져 있지 않아 완료 증거가 아니다.
+    rememberSubagent(session, running);
     session.subagents.delete(id);
     changed = true;
   }
@@ -2862,6 +2968,8 @@ function syncBackgroundSubagents(session, tasks) {
     if (!taskId) continue;
     let running = findSubagent(session, taskId);
     const known = session.knownSubagents.get(taskId);
+    const runId = subagentRunId(task?.run_id);
+    if (isStaleSubagentRun(session, taskId, runId, running)) continue;
     if (!running) {
       running = {
         id: known?.rowId || `task:${taskId}`,
@@ -2881,6 +2989,10 @@ function syncBackgroundSubagents(session, tasks) {
       changed = true;
     }
     running.background = true;
+    if (runId && runId !== running.runId) {
+      running.runId = runId;
+      changed = true;
+    }
     running.lastSeenAt = Date.now();
     const parentTaskId = firstLine(task?.parent_task_id || "", 80);
     if (parentTaskId && parentTaskId !== running.parentTaskId) {
@@ -2895,11 +3007,19 @@ function syncBackgroundSubagents(session, tasks) {
       running.description = description;
       changed = true;
     }
+    rememberSubagent(session, running);
   }
   if (changed || liveIds.size) emitSubagents(session);
 }
 
 function processSubagentSystemMessage(session, message) {
+  if (String(message.subtype || "").startsWith("task_")) {
+    const taskId = firstLine(message.task_id || "", 80);
+    const runId = subagentRunId(message.run_id);
+    const running = (taskId && findSubagent(session, taskId))
+      || (message.tool_use_id && findSubagent(session, message.tool_use_id));
+    if (isStaleSubagentRun(session, taskId, runId, running)) return true;
+  }
   if (message.subtype === "task_started") {
     if (message.skip_transcript === true || message.ambient === true) {
       const taskId = firstLine(message.task_id || "", 80);
@@ -2912,6 +3032,7 @@ function processSubagentSystemMessage(session, message) {
       }
       const running = (toolUseId && findSubagent(session, toolUseId))
         || (taskId && findSubagent(session, taskId));
+      rememberSubagent(session, running || { taskId }, false, subagentRunId(message.run_id));
       if (running) {
         session.subagents.delete(running.id);
         emitSubagents(session);
@@ -2940,9 +3061,15 @@ function processSubagentSystemMessage(session, message) {
       return finishStructuredSubagent(session, message);
     }
     const running = taskId && findSubagent(session, taskId);
-    if (!running) return false;
+    const runId = subagentRunId(message.run_id);
+    if (!running) {
+      rememberSubagent(session, { taskId }, false, runId);
+      return false;
+    }
+    if (runId) running.runId = runId;
     if (patch.is_backgrounded === true) running.background = true;
     running.lastSeenAt = Date.now();
+    rememberSubagent(session, running);
     emitSubagents(session);
     return true;
   }
@@ -2998,6 +3125,7 @@ function subagentToolLabel(block) {
 function finishSubagent(session, toolUseId) {
   const running = findSubagent(session, toolUseId);
   if (!running) return;
+  rememberSubagent(session, running, true);
   session.subagents.delete(running.id);
   emitSubagents(session);
 }
@@ -3006,6 +3134,7 @@ function finishSubagentTask(session, taskId) {
   if (!taskId) return false;
   const entry = [...session.subagents.entries()].find(([, agent]) => agent.taskId === taskId);
   if (!entry) return false;
+  rememberSubagent(session, entry[1], true);
   session.subagents.delete(entry[0]);
   emitSubagents(session);
   return true;
@@ -3015,6 +3144,7 @@ function clearForegroundSubagents(session) {
   let changed = false;
   for (const [id, agent] of session.subagents) {
     if (agent.background) continue;
+    rememberSubagent(session, agent, true);
     session.subagents.delete(id);
     changed = true;
   }
@@ -3142,7 +3272,7 @@ function taskNotifications(message) {
       toolUseId: notificationTag(body, "tool-use-id"),
       status: notificationTag(body, "status"),
       summary: notificationTag(body, "summary"),
-      runId: firstLine(message.origin?.runId || "", 80),
+      runId: subagentRunId(message.origin?.runId),
     });
   }
   return notifications;
@@ -3170,8 +3300,9 @@ function finishNotifiedSubagents(session, notifications) {
           .find((agent) => agent.background && agent.name === name);
       }
     }
-    if (!running || isLateRun(running, notification.runId)
-      || hasLiveChildren(session, running.taskId)) continue;
+    if (isStaleSubagentRun(session, notification.taskId, notification.runId, running)) continue;
+    rememberSubagent(session, running || { taskId: notification.taskId, runId: notification.runId }, true, notification.runId || running?.runId);
+    if (!running || hasLiveChildren(session, running.taskId)) continue;
     session.subagents.delete(running.id);
     emitSubagents(session);
   }
@@ -3451,7 +3582,7 @@ async function processResult(session, message) {
   }
   // Not awaited: the next run's frames queue behind this message, and the
   // account lookup used to hold them back.
-  Promise.all([safeAccount(session.query), safeUsage(session.query)])
+  withSessionQuery(session, (query) => Promise.all([safeAccount(query), safeUsage(query)]))
     .then(([account, usage]) => notify("claude/account/updated", { threadId: session.id, account, usage }))
     .catch(() => {});
   if (!steerFollows) await runPendingPrompt(session);
@@ -3553,6 +3684,7 @@ function beginUntrackedTurn(session, message) {
 }
 
 async function consumeMessage(session, message) {
+  if (session.closed) return;
   adoptSessionId(session, message.session_id);
   beginUntrackedTurn(session, message);
   // A queued SDK response may beat the timer. It already resumes the work.
@@ -3727,55 +3859,60 @@ async function steerPrompt(params) {
 }
 
 async function runPrompt(session, params) {
-  const id = session.id;
-  // The session already runs this model when it started on it (a fork inherits
-  // the parent's), and re-setting it makes the CLI probe the API again, which
-  // fails the whole prompt when that check times out.
-  if (params.model && visibleModel(params.model) !== session.model) {
-    const model = stripClaudeModel(params.model);
-    await session.query.setModel(model);
-    session.model = visibleModel(params.model);
+  session.promptStarting = (session.promptStarting || 0) + 1;
+  try {
+    const id = session.id;
+    // The session already runs this model when it started on it (a fork inherits
+    // the parent's), and re-setting it makes the CLI probe the API again, which
+    // fails the whole prompt when that check times out.
+    if (params.model && visibleModel(params.model) !== session.model) {
+      const model = stripClaudeModel(params.model);
+      await session.query.setModel(model);
+      session.model = visibleModel(params.model);
+    }
+    session.steerPending = 0;
+    // Steering carries no effort of its own, so a steer that lands here because the
+    // turn it meant to join is gone must keep the level the user picked.
+    const effort = supportedEffort(
+      modelCapabilities(session.models, params.model || session.model),
+      params.effort ?? session.effort,
+    );
+    // Ultracode is xhigh plus standing workflows; a steer keeps the session's.
+    const ultracode = (params.ultracode ?? session.ultracode) === true && effort === "xhigh";
+    if (effort) {
+      await session.query.applyFlagSettings({ effortLevel: effort, ultracode });
+    }
+    // The SDK takes the flag without complaint even where dynamic workflows are
+    // off, so ask whether it actually took hold.
+    if (ultracode) {
+      const settings = await session.query.getSettings?.().catch(() => null);
+      if (settings?.applied?.ultracode === false) notify("claude/ultracode/unavailable", { threadId: id });
+    }
+    session.effort = effort;
+    session.ultracode = ultracode;
+    // The role's read-only policy, or none: it binds this turn and the background
+    // work it starts, until the next prompt replaces it. Steering carries no
+    // policy of its own — it joins the turn already running — so a steer that
+    // lands here because that turn is gone must keep the policy in force rather
+    // than silently lifting the role's restrictions.
+    if ("toolPolicy" in params) {
+      session.toolPolicy = params.toolPolicy && typeof params.toolPolicy === "object"
+        ? params.toolPolicy
+        : null;
+    }
+    const content = await inputContent(params.input, params.handoffContext);
+    const turnId = beginTurn(session, params.input);
+    session.queue.push({
+      type: "user",
+      message: { role: "user", content },
+      parent_tool_use_id: null,
+      session_id: id,
+      origin: { kind: "human" },
+    });
+    return { turn: { id: turnId } };
+  } finally {
+    session.promptStarting -= 1;
   }
-  session.steerPending = 0;
-  // Steering carries no effort of its own, so a steer that lands here because the
-  // turn it meant to join is gone must keep the level the user picked.
-  const effort = supportedEffort(
-    modelCapabilities(session.models, params.model || session.model),
-    params.effort ?? session.effort,
-  );
-  // Ultracode is xhigh plus standing workflows; a steer keeps the session's.
-  const ultracode = (params.ultracode ?? session.ultracode) === true && effort === "xhigh";
-  if (effort) {
-    await session.query.applyFlagSettings({ effortLevel: effort, ultracode });
-  }
-  // The SDK takes the flag without complaint even where dynamic workflows are
-  // off, so ask whether it actually took hold.
-  if (ultracode) {
-    const settings = await session.query.getSettings?.().catch(() => null);
-    if (settings?.applied?.ultracode === false) notify("claude/ultracode/unavailable", { threadId: id });
-  }
-  session.effort = effort;
-  session.ultracode = ultracode;
-  // The role's read-only policy, or none: it binds this turn and the background
-  // work it starts, until the next prompt replaces it. Steering carries no
-  // policy of its own — it joins the turn already running — so a steer that
-  // lands here because that turn is gone must keep the policy in force rather
-  // than silently lifting the role's restrictions.
-  if ("toolPolicy" in params) {
-    session.toolPolicy = params.toolPolicy && typeof params.toolPolicy === "object"
-      ? params.toolPolicy
-      : null;
-  }
-  const content = await inputContent(params.input, params.handoffContext);
-  const turnId = beginTurn(session, params.input);
-  session.queue.push({
-    type: "user",
-    message: { role: "user", content },
-    parent_tool_use_id: null,
-    session_id: id,
-    origin: { kind: "human" },
-  });
-  return { turn: { id: turnId } };
 }
 
 // A background task notification is an internal user message that starts its
@@ -4347,7 +4484,7 @@ async function dispatch(method, params = {}) {
     if (!session) throw new Error("Claude 세션이 아직 시작되지 않았습니다.");
     const name = String(params.name || "").trim();
     if (!name) throw new Error("변경할 Claude MCP 서버 이름이 없습니다.");
-    await session.query.toggleMcpServer(name, Boolean(params.enabled));
+    await withSessionQuery(session, (query) => query.toggleMcpServer(name, Boolean(params.enabled)));
     return { effectiveEnabled: Boolean(params.enabled) };
   }
   if (method === "plugin/list") return claudePluginCatalog(params);
@@ -4445,20 +4582,22 @@ async function dispatch(method, params = {}) {
     const id = liveSessionId(params.sessionId);
     const existing = sessions.get(id);
     if (existing) {
-      const messages = await sessionMessages(id, existing.cwd);
-      if (!existing.tasks.size) existing.tasks = historyState(messages).tasks;
-      restoreArtifacts(id, messages);
-      return {
-        id,
-        thread: { id, turns: [] },
-        initialTurnsPage: { data: [], nextCursor: null },
-        cwd: existing.cwd,
-        model: existing.model,
-        reasoningEffort: existing.effort,
-        account: await safeAccount(existing.query),
-        usage: await safeUsage(existing.query),
-        tokenUsage: historyTokenUsage(messages, existing.models, existing.model),
-      };
+      return withSessionQuery(existing, async (query) => {
+        const messages = await sessionMessages(id, existing.cwd);
+        if (!existing.tasks.size) existing.tasks = historyState(messages).tasks;
+        restoreArtifacts(id, messages);
+        return {
+          id,
+          thread: { id, turns: [] },
+          initialTurnsPage: { data: [], nextCursor: null },
+          cwd: existing.cwd,
+          model: existing.model,
+          reasoningEffort: existing.effort,
+          account: await safeAccount(query),
+          usage: await safeUsage(query),
+          tokenUsage: historyTokenUsage(messages, existing.models, existing.model),
+        };
+      });
     }
     const dir = await readableCwd(id, params.cwd);
     // The transcript itself decides whether there is anything to resume:
@@ -4508,7 +4647,7 @@ async function dispatch(method, params = {}) {
     const taskId = (session && (findSubagent(session, id)?.taskId || session.rowTaskIds?.get(id)))
       || (id.startsWith("task:") ? id.slice(5) : "");
     if (!session || !taskId || typeof session.query.getTaskOutput !== "function") return {};
-    const result = await session.query.getTaskOutput(taskId);
+    const result = await withSessionQuery(session, (query) => query.getTaskOutput(taskId));
     return { output: String(result?.output ?? "") };
   }
   if (method === "session/watchSubagent") {
@@ -4536,7 +4675,7 @@ async function dispatch(method, params = {}) {
       const turn = session.turn;
       turn.interruptRequested = true;
       try {
-        await session.query.interrupt();
+        await withSessionQuery(session, (query) => query.interrupt());
       } catch (error) {
         if (session.turn === turn) delete turn.interruptRequested;
         throw error;
@@ -4609,29 +4748,25 @@ async function dispatch(method, params = {}) {
   if (method === "session/close") {
     const session = lookupSession(params.sessionId);
     if (session) {
-      clearUsageLimitWait(session);
-      clearSubagents(session);
-      session.queue.close();
-      session.query.close();
-      sessions.delete(session.id);
-      for (const [from, to] of sessionAliases) {
-        if (to === session.id) sessionAliases.delete(from);
-      }
+      closeLiveSession(session);
       if (params.delete) await deleteSession(session.id, { dir: session.cwd });
     }
     return {};
   }
+  if (method === "session/release") {
+    const session = lookupSession(params.sessionId);
+    if (session && sessionHasLiveWork(session)) return { released: false, busy: true };
+    if (session) closeLiveSession(session);
+    return { released: true, busy: false };
+  }
   if (method === "account/usage") {
     const session = lookupSession(params.sessionId) || [...sessions.values()][0];
     if (!session) return { account: null, usage: null };
-    return { account: await safeAccount(session.query), usage: await safeUsage(session.query) };
+    return withSessionQuery(session, async (query) => ({ account: await safeAccount(query), usage: await safeUsage(query) }));
   }
   if (method === "shutdown") {
     for (const session of sessions.values()) {
-      clearUsageLimitWait(session);
-      clearSubagents(session);
-      session.queue.close();
-      session.query.close();
+      closeLiveSession(session);
     }
     sessions.clear();
     sessionAliases.clear();
@@ -5009,6 +5144,271 @@ async function runSelfTest() {
     else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
     await rm(configDir, { recursive: true, force: true });
   }
+  // SDK 프로세스만 mock으로 바꾸고 저장 전사와 실제 release/resume 경로를 검사한다.
+  const releaseConfigDir = join(tmpdir(), `devez-release-self-test-${randomUUID()}`);
+  const releaseId = randomUUID();
+  const releaseProjectDir = join(releaseConfigDir, "projects", "release-test");
+  const releaseTranscriptPath = join(releaseProjectDir, `${releaseId}.jsonl`);
+  const releaseTranscript = `${JSON.stringify({
+    type: "user", uuid: randomUUID(), sessionId: releaseId, cwd: process.cwd(),
+    message: { role: "user", content: "해제 뒤에도 남을 대화" },
+  })}\n`;
+  await mkdir(releaseProjectDir, { recursive: true });
+  await writeFile(releaseTranscriptPath, releaseTranscript);
+  const originalStartAgentQuery = startAgentQuery;
+  const originalEnsureExecutable = ensureClaudeExecutableChoice;
+  const releaseQueries = [];
+  const releaseNotices = [];
+  const releaseStdoutWrite = process.stdout.write;
+  let nextReleaseInitialization = null;
+  let nextReleaseUsage = null;
+  process.stdout.write = (chunk) => { releaseNotices.push(JSON.parse(String(chunk))); return true; };
+  process.env.CLAUDE_CONFIG_DIR = releaseConfigDir;
+  ensureClaudeExecutableChoice = async () => {};
+  startAgentQuery = async (_queue, options) => {
+    const events = new AsyncQueue();
+    const initialization = nextReleaseInitialization;
+    nextReleaseInitialization = null;
+    const pendingUsage = nextReleaseUsage;
+    nextReleaseUsage = null;
+    const query = {
+      events, options, closeCalls: 0, finishOnClose: releaseQueries.length > 0,
+      async initializationResult() { return initialization ? await initialization : { models: [], account: {} }; },
+      async setPermissionMode() {},
+      async accountInfo() { return {}; },
+      async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET() { return pendingUsage ? await pendingUsage : {}; },
+      close() { this.closeCalls += 1; if (this.finishOnClose) events.close(); },
+      [Symbol.asyncIterator]() {
+        const iterator = events[Symbol.asyncIterator]();
+        return {
+          next: async () => {
+            const step = await iterator.next();
+            if (this.iteratorError) throw this.iteratorError;
+            // 실제 SDK도 close 이후 for-await를 정상 완료 대신 AbortError로 끝낼 수 있다.
+            if (step.done && this.closeCalls) {
+              throw Object.assign(new Error("mock intended query close"), { name: "AbortError" });
+            }
+            return step;
+          },
+        };
+      },
+    };
+    releaseQueries.push(query);
+    return query;
+  };
+  try {
+    const { session } = await createSession({ cwd: process.cwd() }, releaseId);
+    const oldConsumer = session.consumer;
+    const oldQueue = session.queue;
+    const oldQuery = session.query;
+    const assertBusy = async () => {
+      const reply = await dispatch("session/release", { sessionId: releaseId });
+      if (reply.released !== false || reply.busy !== true || lookupSession(releaseId) !== session
+        || oldQuery.closeCalls || oldQueue.closed) throw new Error("Claude release terminated live work");
+    };
+    for (const key of ["initializing", "promptStarting", "steerPending", "automaticTurnsPending", "usageLimitWait", "turn"]) {
+      session[key] = key === "turn" ? { id: "busy-turn" } : 1;
+      await assertBusy();
+      session[key] = null;
+    }
+    session.pendingPrompts.push({ input: [] });
+    await assertBusy();
+    session.pendingPrompts.length = 0;
+    oldQueue.push({ type: "user" });
+    await assertBusy();
+    oldQueue.values.length = 0;
+    session.subagents.set("busy-child", { id: "busy-child", background: true });
+    await assertBusy();
+    session.subagents.clear();
+    for (const hidden of [session.hiddenSubagentTasks, session.ambientSubagentTasks]) {
+      hidden.add("busy-hidden-child");
+      await assertBusy();
+      hidden.clear();
+    }
+    const question = hostRequest("item/tool/requestUserInput", {}, undefined, releaseId);
+    await assertBusy();
+    const [questionId, request] = [...pendingHostRequests].find(([, pending]) => pending.session === session);
+    pendingHostRequests.delete(questionId);
+    request.resolve({ answers: {} });
+    await question;
+    watchSubagent(session, "untracked-child");
+    sessionAliases.set("release-old-alias", "release-middle-alias");
+    sessionAliases.set("release-middle-alias", releaseId);
+    const reply = await dispatch("session/release", { sessionId: "claude:release-old-alias" });
+    const repeated = await dispatch("session/release", { sessionId: releaseId });
+    if (!reply.released || reply.busy || !repeated.released || repeated.busy || sessions.has(releaseId)
+      || oldQuery.closeCalls !== 1 || !oldQueue.closed || session.query || session.queue || session.subagentWatch
+      || sessionAliases.has("release-old-alias") || sessionAliases.has("release-middle-alias")
+      || await readFile(releaseTranscriptPath, "utf8") !== releaseTranscript) {
+      throw new Error("Claude idle release did not clean live references while preserving its transcript");
+    }
+    const resumed = await dispatch("session/resume", { sessionId: releaseId, cwd: process.cwd() });
+    const resumedSession = lookupSession(releaseId);
+    if (resumed.id !== releaseId || !resumedSession || resumedSession === session
+      || resumedSession.query.options.resume !== releaseId
+      || !historyTurns(await sessionMessages(releaseId, process.cwd()))
+        .some((turn) => turn.items.some((item) => item.content?.[0]?.text === "해제 뒤에도 남을 대화"))) {
+      throw new Error("Claude released session could not resume its saved transcript");
+    }
+    oldQuery.events.push({ type: "system", subtype: "task_started", session_id: "stale-session-id", task_id: "stale-task" });
+    oldQuery.events.push({ type: "system", subtype: "task_started", session_id: releaseId,
+      task_id: "stale-task", task_type: "local_agent", subagent_type: "Explore", is_backgrounded: true });
+    oldQuery.events.close();
+    await oldConsumer;
+    if (lookupSession(releaseId) !== resumedSession || resumedSession.query.closeCalls || session.subagents.size
+      || sessions.has("stale-session-id")) throw new Error("Claude old consumer removed a resumed same-id query");
+    const resumedConsumer = resumedSession.consumer;
+    await dispatch("session/release", { sessionId: releaseId });
+    await resumedConsumer;
+    const { session: mainSession } = await createSession({ cwd: process.cwd() });
+    const mainQuery = mainSession.query;
+    const mainConsumer = mainSession.consumer;
+    let finishMetadata;
+    nextReleaseUsage = new Promise((resolve) => { finishMetadata = resolve; });
+    const metadataCreate = createSession({ cwd: process.cwd() });
+    await new Promise((resolve) => setImmediate(resolve));
+    const metadataSession = [...sessions.values()].find((candidate) => candidate !== mainSession);
+    const metadataConsumer = metadataSession?.consumer;
+    if (!metadataSession?.query || !metadataConsumer) throw new Error("Claude metadata-wait fixture did not start");
+    metadataSession.query.events.close();
+    await metadataConsumer;
+    finishMetadata({});
+    let metadataFailed = false;
+    try { await metadataCreate; } catch { metadataFailed = true; }
+    if (!metadataFailed || lookupSession(mainSession.id) !== mainSession || mainQuery.closeCalls) {
+      throw new Error("Claude closed initializing query returned success or pruned the previous query");
+    }
+    nextReleaseInitialization = Promise.reject(new Error("mock initialization failure"));
+    let initializationFailed = false;
+    try { await createSession({ cwd: process.cwd() }); } catch { initializationFailed = true; }
+    if (!initializationFailed || lookupSession(mainSession.id) !== mainSession || mainQuery.closeCalls) {
+      throw new Error("Claude failed new query closed the previous idle query");
+    }
+    let finishInitialization;
+    nextReleaseInitialization = new Promise((resolve) => { finishInitialization = resolve; });
+    const pendingCreate = createSession({ cwd: process.cwd() });
+    await new Promise((resolve) => setImmediate(resolve));
+    const initializingSession = [...sessions.values()].find((candidate) => candidate !== mainSession);
+    if (!initializingSession?.initializing || mainQuery.closeCalls) {
+      throw new Error("Claude initializing query prematurely closed the previous idle query");
+    }
+    const initializingQuery = initializingSession.query;
+    const { session: readySession } = await createSession({ cwd: process.cwd() });
+    await mainConsumer;
+    if (!mainQuery.closeCalls || lookupSession(mainSession.id) || !initializingSession.initializing
+      || initializingQuery.closeCalls) throw new Error("Claude ready query did not preserve another initializing query");
+    readySession.turn = { id: "main-active-turn" };
+    finishInitialization({ models: [], account: {} });
+    const { session: btwSession } = await pendingCreate;
+    if (lookupSession(readySession.id) !== readySession || readySession.query.closeCalls
+      || lookupSession(btwSession.id) !== btwSession) throw new Error("Claude auxiliary query closed its working parent");
+    readySession.turn = null;
+    const readyConsumer = readySession.consumer;
+    const btwConsumer = btwSession.consumer;
+    const { session: newestSession } = await createSession({ cwd: process.cwd() });
+    await Promise.all([readyConsumer, btwConsumer]);
+    if (lookupSession(readySession.id) || lookupSession(btwSession.id) || sessions.size !== 1) {
+      throw new Error("Claude successful new query retained idle main or auxiliary queries");
+    }
+    const newestConsumer = newestSession.consumer;
+    await dispatch("session/release", { sessionId: newestSession.id });
+    await newestConsumer;
+    if (releaseNotices.some((notice) => notice.method === "error"
+      || notice.method === "turn/subagents/updated")) {
+      throw new Error("Claude intended release or idle pruning emitted an error or revived a subagent row");
+    }
+    // 명시적으로 닫지 않은 실제 연결 실패는 기존 오류 통지를 유지한다.
+    const { session: failedSession } = await createSession({ cwd: process.cwd() });
+    const failedConsumer = failedSession.consumer;
+    failedSession.query.iteratorError = new Error("mock unexpected query failure");
+    failedSession.query.events.close();
+    await failedConsumer;
+    const unexpectedErrors = releaseNotices.filter((notice) => notice.method === "error");
+    if (unexpectedErrors.length !== 1 || unexpectedErrors[0].params.threadId !== failedSession.id
+      || unexpectedErrors[0].params.error.message !== "mock unexpected query failure") {
+      throw new Error("Claude unexpected open-query failure lost its error notification");
+    }
+    // 메인 MCP 요청처럼 턴 밖에서 await하는 실제 SDK 제어·조회 함수도 보호한다.
+    for (const kind of ["reconnect", "status", "toggle", "permission", "account", "skills", "output", "resume"]) {
+      const { session: requestSession } = await createSession({ cwd: process.cwd() });
+      const requestQuery = requestSession.query;
+      const requestConsumer = requestSession.consumer;
+      let finishRequest;
+      const pendingResult = new Promise((resolve) => { finishRequest = resolve; });
+      let requestPromise;
+      let result;
+      if (kind === "reconnect" || kind === "status") {
+        result = [{ name: "connected", status: "connected" }];
+        requestQuery.mcpServerStatus = () => pendingResult;
+        requestQuery.reconnectMcpServer = async () => {};
+        requestPromise = kind === "reconnect"
+          ? reconnectClaudeMcp(requestSession, "")
+          : dispatch("mcpServerStatus/list", { sessionId: requestSession.id });
+      } else if (kind === "toggle") {
+        requestQuery.toggleMcpServer = () => pendingResult;
+        requestPromise = dispatch("mcp/toggle", { sessionId: requestSession.id, name: "connected", enabled: true });
+      } else if (kind === "permission") {
+        requestSession.permissionModeVerified = false;
+        requestQuery.setPermissionMode = () => pendingResult;
+        requestPromise = applyPermissionMode(requestSession);
+      } else if (kind === "account" || kind === "resume") {
+        result = {};
+        requestQuery.accountInfo = () => pendingResult;
+        requestPromise = dispatch(kind === "account" ? "account/usage" : "session/resume", { sessionId: requestSession.id });
+      } else if (kind === "skills") {
+        result = [];
+        requestQuery.supportedCommands = () => pendingResult;
+        requestPromise = supportedClaudeSkills({ cwd: requestSession.cwd, forceReload: true });
+      } else {
+        result = { output: "saved task output" };
+        requestSession.rowTaskIds = new Map([["finished-row", "finished-task"]]);
+        requestQuery.getTaskOutput = () => pendingResult;
+        requestPromise = dispatch("session/taskOutput", { sessionId: requestSession.id, id: "finished-row" });
+      }
+      const blockedRelease = await dispatch("session/release", { sessionId: requestSession.id });
+      const { session: competingSession } = await createSession({ cwd: process.cwd() });
+      if (!blockedRelease.busy || blockedRelease.released || !requestSession.queryRequests
+        || lookupSession(requestSession.id) !== requestSession || requestQuery.closeCalls) {
+        throw new Error(`Claude active SDK ${kind} request was treated as idle`);
+      }
+      finishRequest(result);
+      await requestPromise;
+      if (requestSession.queryRequests || sessionHasLiveWork(requestSession)) {
+        throw new Error(`Claude completed SDK ${kind} request retained its busy guard`);
+      }
+      if (kind === "reconnect") {
+        requestQuery.reconnectMcpServer = async () => { throw new Error("mock reconnect failure"); };
+        let failedRequest = false;
+        try { await reconnectClaudeMcp(requestSession, "connected"); } catch { failedRequest = true; }
+        if (!failedRequest || requestSession.queryRequests || sessionHasLiveWork(requestSession)) {
+          throw new Error("Claude rejected SDK request retained its busy guard");
+        }
+      }
+      const { session: afterRequestSession } = await createSession({ cwd: process.cwd() });
+      await requestConsumer;
+      if (!requestQuery.closeCalls || lookupSession(requestSession.id) || lookupSession(competingSession.id)) {
+        throw new Error(`Claude completed SDK ${kind} request prevented later idle pruning`);
+      }
+      const afterRequestConsumer = afterRequestSession.consumer;
+      await dispatch("session/release", { sessionId: afterRequestSession.id });
+      await afterRequestConsumer;
+    }
+    if (releaseNotices.filter((notice) => notice.method === "error").length !== 1) {
+      throw new Error("Claude SDK request pruning emitted a false close error");
+    }
+  } finally {
+    const live = lookupSession(releaseId);
+    if (live) closeLiveSession(live);
+    for (const query of releaseQueries) query.events.close();
+    startAgentQuery = originalStartAgentQuery;
+    ensureClaudeExecutableChoice = originalEnsureExecutable;
+    if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
+    transcriptPaths.delete(releaseId);
+    transcriptCwds.delete(releaseId);
+    process.stdout.write = releaseStdoutWrite;
+    await rm(releaseConfigDir, { recursive: true, force: true });
+  }
   // A resumed transcript lists its Artifact pages once each at their latest
   // publish, read through the file's toolUseResult spelling.
   const artifactTranscript = [
@@ -5065,14 +5465,14 @@ async function runSelfTest() {
     || CLAUDE_TASK_TOOLS.some((tool) => !latestOptions.allowedTools.includes(tool))) {
     throw new Error(`Claude latest SDK options self-test failed: ${JSON.stringify(latestOptions.allowedTools)}`);
   }
-  const lookupSession = {
+  const taskLookupSession = {
     turn: { id: "task-get-turn" },
     tools: new Map(),
     tasks: new Map(),
     planCreatePending: false,
   };
-  processToolUse(lookupSession, { id: "task-get", name: "TaskGet", input: { taskId: "1" } });
-  if (lookupSession.tools.get("task-get")?.suppressed !== true) {
+  processToolUse(taskLookupSession, { id: "task-get", name: "TaskGet", input: { taskId: "1" } });
+  if (taskLookupSession.tools.get("task-get")?.suppressed !== true) {
     throw new Error("Claude TaskGet transcript suppression self-test failed");
   }
   const pluginCatalog = buildClaudePluginCatalog(
@@ -6216,6 +6616,114 @@ async function runSelfTest() {
       throw new Error(`Claude waiting subagent self-test failed: ${waitingKept} ${settledAfterChild} ${keptAgainstLate} ${nestedSession.subagents.size}`);
     }
     clearSubagents(nestedSession);
+    // 완료된 실행의 지연 프레임과 새 실행의 스냅숏을 함께 재생한다.
+    const lateSession = {
+      id: "late-run-self-test", turn: null, subagents: new Map(), knownSubagents: new Map(),
+      hiddenSubagentTasks: new Set(), ambientSubagentTasks: new Set(),
+    };
+    const lateEvent = (subtype, runId, extra = {}) => processSubagentSystemMessage(lateSession, {
+      type: "system", subtype, task_id: "agent-late", run_id: runId,
+      task_type: "local_agent", subagent_type: "Explore", is_backgrounded: true, ...extra,
+    });
+    const lateSnapshot = (runId) => syncBackgroundSubagents(lateSession, [{
+      task_id: "agent-late", run_id: runId, task_type: "local_agent",
+    }]);
+    const lateXml = (runId) => finishNotifiedSubagents(lateSession, [{
+      taskId: "agent-late", runId, summary: 'Agent "Explore" finished',
+    }]);
+    try {
+      lateEvent("task_started", "001", { tool_use_id: "toolu_late" });
+      lateEvent("task_notification", "001", { status: "completed" });
+      lateEvent("task_started", "002", { tool_use_id: "toolu_latest" });
+      lateEvent("task_progress", "002", { summary: "최신 진행", last_tool_name: "Read" });
+      const beforeLate = JSON.stringify([...lateSession.subagents]);
+      lateEvent("task_progress", "001", { tool_use_id: "toolu_old", summary: "예전 진행", last_tool_name: "Write" });
+      lateEvent("task_updated", "001", { patch: { is_backgrounded: true } });
+      lateEvent("task_started", "001", { tool_use_id: "toolu_old", skip_transcript: true });
+      lateSnapshot("001");
+      syncBackgroundSubagents(lateSession, [{
+        task_id: "agent-late", run_id: "001", task_type: "local_agent", ambient: true,
+      }]);
+      if (!sessionHasLiveWork(lateSession)) {
+        throw new Error("Claude stale ambient snapshot made a newer task idle");
+      }
+      lateXml("001");
+      lateEvent("task_notification", "001", { status: "completed" });
+      if (JSON.stringify([...lateSession.subagents]) !== beforeLate) {
+        throw new Error("Claude late run modified a newer subagent row");
+      }
+      lateEvent("task_notification", "002", { status: "completed" });
+      for (const runId of ["001", "002"]) {
+        lateEvent("task_progress", runId, { summary: "끝난 진행" });
+        lateEvent("task_started", runId);
+        lateSnapshot(runId);
+      }
+      if (lateSession.subagents.size) throw new Error("Claude late run resurrected a completed subagent");
+      lateSnapshot("003");
+      const fromSnapshot = findSubagent(lateSession, "agent-late");
+      lateEvent("task_notification", "002", { status: "completed" });
+      lateXml("002");
+      if (!fromSnapshot || fromSnapshot.runId !== "003" || lateSession.subagents.size !== 1) {
+        throw new Error("Claude late completion removed a newer snapshot run");
+      }
+      startSubagent(lateSession, { id: "toolu_merge", input: { name: "Explore" } });
+      keepBackgroundSubagent(lateSession, "toolu_merge", { isAsync: true, agentId: "agent-late" });
+      lateXml("002");
+      if (lateSession.subagents.size !== 1 || findSubagent(lateSession, "agent-late")?.runId !== "003") {
+        throw new Error("Claude placeholder merge forgot its newer run");
+      }
+      lateEvent("task_notification", "003", { status: "completed" });
+      resumeBackgroundSubagent(lateSession, "toolu_send_late", {}, { resumedAgentId: "agent-late" });
+      lateXml("003");
+      lateEvent("task_progress", "003", { summary: "재개 전 진행" });
+      lateEvent("task_started", "004", { tool_use_id: "toolu_send_late" });
+      if (lateSession.subagents.size !== 1 || findSubagent(lateSession, "agent-late")?.runId !== "004") {
+        throw new Error("Claude latest resumed run failed after a completed run");
+      }
+      lateXml("004");
+      if (lateSession.subagents.size) throw new Error("Claude latest resumed run did not finish");
+      // level/edge 순서가 뒤집혀 빈 스냅숏이 먼저 와도 같은 실행의 정상 진행은 복구된다.
+      lateEvent("task_started", "005");
+      syncBackgroundSubagents(lateSession, []);
+      lateEvent("task_progress", "005", { summary: "스냅숏 뒤 정상 진행" });
+      if (findSubagent(lateSession, "agent-late")?.description !== "스냅숏 뒤 정상 진행") {
+        throw new Error("Claude empty snapshot blocked the current run's progress");
+      }
+      syncBackgroundSubagents(lateSession, []);
+      lateSnapshot("005");
+      if (findSubagent(lateSession, "agent-late")?.runId !== "005") {
+        throw new Error("Claude empty snapshot blocked the current run's snapshot recovery");
+      }
+      lateEvent("task_notification", "005", { status: "completed" });
+      lateEvent("task_progress", "005", { summary: "완료 뒤 지연 진행" });
+      if (lateSession.subagents.size) throw new Error("Claude authoritative completion lost its tombstone");
+      // 실행 식별자는 표시용 글자가 아니므로 길이·줄바꿈을 바꾸지 않는다.
+      const longPrefix = "x".repeat(80);
+      const firstLongRun = `${longPrefix}a`;
+      const nextLongRun = `${longPrefix}b\nnext`;
+      lateEvent("task_started", firstLongRun);
+      lateXml(firstLongRun);
+      lateEvent("task_started", nextLongRun);
+      lateSnapshot(nextLongRun);
+      if (findSubagent(lateSession, "agent-late")?.runId !== nextLongRun) {
+        throw new Error("Claude truncated an opaque run identifier");
+      }
+      lateXml(firstLongRun);
+      if (!sessionHasLiveWork(lateSession)) throw new Error("Claude older long run removed its successor");
+      lateXml(nextLongRun);
+      if (lateSession.subagents.size) throw new Error("Claude latest long run did not finish");
+      syncBackgroundSubagents(lateSession, [{
+        task_id: "agent-late", run_id: `${longPrefix}c`, task_type: "local_agent", ambient: true,
+      }]);
+      syncBackgroundSubagents(lateSession, [{
+        task_id: "agent-late", run_id: firstLongRun, task_type: "local_agent", ambient: true,
+      }]);
+      if (!lateSession.ambientSubagentTasks.has("agent-late") || !sessionHasLiveWork(lateSession)) {
+        throw new Error("Claude stale ambient snapshot erased a newer ambient task");
+      }
+    } finally {
+      clearSubagents(lateSession);
+    }
     // 끝난 뒤 SDK가 같은 작업을 다시 돌리면 설명 없는 새 줄이 아니라 같은 줄로 돌아온다.
     startSubagent(nestedSession, { id: "toolu_again", input: { description: "3분 대기", subagent_type: "general-purpose" } });
     keepBackgroundSubagent(nestedSession, "toolu_again", { isAsync: true, agentId: "agent-again" });
@@ -6679,6 +7187,8 @@ async function runSelfTest() {
       throw new Error("Claude idle background subagent self-test failed");
     }
     structuredSession.subagents.clear();
+    // 턴 결과가 분리 실행한 계정 조회를 이 캡처 안에서 끝내 다음 표시 검사와 섞이지 않게 한다.
+    await new Promise((resolve) => setImmediate(resolve));
   } finally {
     process.stdout.write = stdoutWrite;
   }
@@ -7014,8 +7524,6 @@ lines.on("line", async (line) => {
 
 lines.on("close", () => {
   for (const session of sessions.values()) {
-    clearUsageLimitWait(session);
-    clearSubagents(session);
-    session.query.close();
+    closeLiveSession(session);
   }
 });

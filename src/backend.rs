@@ -199,8 +199,12 @@ impl BackendServer {
                 codex.shutdown().await;
             }
         }
-        if let Some(open_code) = &self.open_code {
-            let _ = open_code.initialize().await;
+        if let Some(open_code) = self.open_code.take() {
+            if let Err(error) = open_code.initialize().await {
+                open_code.shutdown().await;
+                return Err(error);
+            }
+            self.open_code = Some(open_code);
         }
         Ok(())
     }
@@ -686,17 +690,37 @@ impl BackendServer {
                 }
                 response
             }
-            // Only Claude can answer this today. An unknown runtime reports nothing
-            // so the host leaves its spinner alone rather than guessing.
             "turn/status" => {
                 let visible = thread_id(&params)?;
-                if self.route_kind(visible) != RuntimeKind::Claude {
-                    return Ok(json!({ "known": false }));
+                match self.route_kind(visible) {
+                    RuntimeKind::Claude => {
+                        let backing = self.backing_id(visible, RuntimeKind::Claude)?;
+                        self.claude
+                            .request("session/turnStatus", json!({ "sessionId": backing }))
+                            .await
+                    }
+                    RuntimeKind::Codex => {
+                        let backing = self.backing_id(visible, RuntimeKind::Codex)?;
+                        let response = self
+                            .codex()?
+                            .request(
+                                "thread/read",
+                                json!({ "threadId": backing, "includeTurns": true }),
+                            )
+                            .await?;
+                        Ok(codex_turn_status(
+                            &response,
+                            params.get("turnId").and_then(Value::as_str),
+                        ))
+                    }
+                    RuntimeKind::OpenCode => {
+                        let backing = self.backing_id(visible, RuntimeKind::OpenCode)?;
+                        Ok(self
+                            .open_code()?
+                            .turn_status(&backing, params.get("turnId").and_then(Value::as_str))
+                            .await)
+                    }
                 }
-                let backing = self.backing_id(visible, RuntimeKind::Claude)?;
-                self.claude
-                    .request("session/turnStatus", json!({ "sessionId": backing }))
-                    .await
             }
             "turn/interrupt" => {
                 let visible = thread_id(&params)?;
@@ -1040,6 +1064,7 @@ impl BackendServer {
         method: &str,
         params: Value,
     ) -> Result<Value> {
+        let params = self.integration_params(model, params)?;
         self.integration_client(model)
             .context(tr(
                 "현재 provider는 플러그인 관리를 지원하지 않습니다.",
@@ -1047,6 +1072,67 @@ impl BackendServer {
             ))?
             .request(method, params)
             .await
+    }
+
+    fn integration_params(&self, model: &str, mut params: Value) -> Result<Value> {
+        if is_claude_model(model) {
+            for key in ["threadId", "sessionId"] {
+                let Some(visible) = params.get(key).and_then(Value::as_str) else {
+                    continue;
+                };
+                if visible.is_empty() {
+                    continue;
+                }
+                let backing = self.claude_thread_id(visible).context(tr(
+                    "현재 대화의 Claude 세션이 아직 시작되지 않았습니다.",
+                    "The Claude session for this conversation hasn't started yet.",
+                ))?;
+                params[key] = json!(backing);
+            }
+        }
+        Ok(params)
+    }
+
+    pub fn claude_thread_id(&self, visible: &str) -> Option<String> {
+        if visible.is_empty() {
+            return None;
+        }
+        let visible = self.canonical_visible(visible);
+        match self.route(&visible) {
+            Some(route) => route.claude_id,
+            None => is_claude_thread(&visible).then(|| raw_thread_id(&visible).to_owned()),
+        }
+        .filter(|id| !id.is_empty())
+        .map(|id| raw_thread_id(&id).to_owned())
+        .filter(|id| !id.is_empty())
+    }
+
+    /// Releases only the live Claude query; all providers' transcripts and routes survive.
+    pub async fn release_thread(&self, visible: &str) -> Result<()> {
+        if visible.is_empty() {
+            return Ok(());
+        }
+        let Some(backing) = self
+            .route(&self.canonical_visible(visible))
+            .and_then(|route| route.claude_id)
+            .filter(|id| !raw_thread_id(id).is_empty())
+        else {
+            return Ok(());
+        };
+        let response = self
+            .claude
+            .request(
+                "session/release",
+                json!({ "sessionId": raw_thread_id(&backing) }),
+            )
+            .await?;
+        if response.get("busy").and_then(Value::as_bool) == Some(true) {
+            anyhow::bail!(tr(
+                "Claude가 작업 중이므로 대화를 전환할 수 없습니다. 작업을 중단한 뒤 다시 시도하세요.",
+                "Can't switch conversations while Claude is working. Stop the active turn and try again.",
+            ));
+        }
+        Ok(())
     }
 
     /// 첫 프롬프트 전에는 스레드 id가 비어 있다. 빈 id를 그대로 넘기면 app-server가
@@ -1330,12 +1416,12 @@ impl BackendServer {
             ));
         }
         if self.open_code.is_none() {
-            self.open_code = Some(OpenCodeServer::spawn(&self.open_code_path, &self.cwd).await?);
-            self.open_code
-                .as_ref()
-                .expect("OpenCode 서버를 방금 시작했습니다.")
-                .initialize()
-                .await?;
+            let open_code = OpenCodeServer::spawn(&self.open_code_path, &self.cwd).await?;
+            if let Err(error) = open_code.initialize().await {
+                open_code.shutdown().await;
+                return Err(error);
+            }
+            self.open_code = Some(open_code);
         }
         self.open_code()
     }
@@ -2897,6 +2983,40 @@ fn thread_id(params: &Value) -> Result<&str> {
         .context(tr("요청에 threadId가 없습니다.", "The request has no threadId."))
 }
 
+fn codex_turn_status(response: &Value, expected_turn: Option<&str>) -> Value {
+    match response
+        .pointer("/thread/status/type")
+        .and_then(Value::as_str)
+    {
+        Some("active") => json!({ "known": true, "running": true }),
+        Some("idle") => {
+            // A contradictory in-progress turn or an unsupported status must not
+            // turn a long-running request into a false completion.
+            if let Some(turns) = response.pointer("/thread/turns").and_then(Value::as_array) {
+                if turns
+                    .iter()
+                    .any(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))
+                {
+                    return json!({ "known": false });
+                }
+                if let Some(expected) = expected_turn.filter(|id| !id.is_empty())
+                    && let Some(turn) = turns
+                        .iter()
+                        .find(|turn| turn.get("id").and_then(Value::as_str) == Some(expected))
+                    && !matches!(
+                        turn.get("status").and_then(Value::as_str),
+                        Some("completed" | "interrupted" | "failed")
+                    )
+                {
+                    return json!({ "known": false });
+                }
+            }
+            json!({ "known": true, "running": false })
+        }
+        _ => json!({ "known": false }),
+    }
+}
+
 #[cfg(test)]
 #[path = "codex_question_tests.rs"]
 mod question_runtime_tests;
@@ -2904,6 +3024,272 @@ mod question_runtime_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn backend_with_routes(routes: HashMap<String, Route>) -> BackendServer {
+        let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        BackendServer {
+            codex: None,
+            codex_unavailable_reason: None,
+            open_code: None,
+            claude: ClaudeServer::new(Path::new("node"), Path::new("claude"), &cwd).unwrap(),
+            codex_path: PathBuf::from("codex"),
+            open_code_path: PathBuf::from("opencode"),
+            aliases: Arc::new(StdMutex::new(route_aliases(&routes))),
+            resume_ids: Arc::new(StdMutex::new(route_resume_ids(&routes))),
+            routes: Arc::new(StdMutex::new(routes)),
+            pending_events: Arc::new(StdMutex::new(VecDeque::new())),
+            route_store_path: None,
+            cwd,
+        }
+    }
+
+    #[test]
+    fn claude_integration_requests_resolve_the_backing_and_preserve_other_params() {
+        let server = backend_with_routes(HashMap::from([(
+            "visible-room".to_owned(),
+            route(
+                RuntimeKind::Codex,
+                Some("codex-backing"),
+                Some("claude-backing"),
+            ),
+        )]));
+        let params = json!({ "threadId": "visible-room", "sessionId": "visible-room", "name": "mcp", "enabled": false, "config": { "key": "value" } });
+        let rewritten = server
+            .integration_params("claude:sonnet", params.clone())
+            .unwrap();
+        assert_eq!(rewritten["threadId"], "claude-backing");
+        assert_eq!(rewritten["sessionId"], "claude-backing");
+        assert_eq!(rewritten["name"], params["name"]);
+        assert_eq!(rewritten["enabled"], params["enabled"]);
+        assert_eq!(rewritten["config"], params["config"]);
+        assert_eq!(
+            server.claude_thread_id("codex-backing").as_deref(),
+            Some("claude-backing")
+        );
+        assert_eq!(
+            server.claude_thread_id("claude-backing").as_deref(),
+            Some("claude-backing")
+        );
+        assert_eq!(
+            server.claude_thread_id("claude:native-id").as_deref(),
+            Some("native-id")
+        );
+        assert_eq!(
+            server
+                .integration_params("gpt-6-sol", params.clone())
+                .unwrap(),
+            params
+        );
+    }
+
+    #[test]
+    fn claude_integration_requests_keep_empty_ids_and_reject_missing_backings() {
+        let mut empty = route(RuntimeKind::Claude, Some("codex-backing"), None);
+        empty.open_code_id = Some("ses_backing".to_owned());
+        let server = backend_with_routes(HashMap::from([("visible-room".to_owned(), empty)]));
+        for params in [
+            json!({}),
+            json!({ "sessionId": "" }),
+            json!({ "threadId": "", "sessionId": "" }),
+            json!({ "config": { "mcpServers": {} } }),
+        ] {
+            assert_eq!(
+                server
+                    .integration_params("claude:sonnet", params.clone())
+                    .unwrap(),
+                params
+            );
+        }
+        for visible in [
+            "",
+            "claude:",
+            "visible-room",
+            "codex-backing",
+            "ses_backing",
+            "unregistered-codex-id",
+        ] {
+            assert!(server.claude_thread_id(visible).is_none(), "{visible}");
+        }
+        for key in ["threadId", "sessionId"] {
+            assert!(
+                server
+                    .integration_params("claude:sonnet", json!({ key: "visible-room" }))
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn releasing_an_absent_or_non_claude_thread_never_starts_the_bridge() {
+        let server = backend_with_routes(HashMap::from([(
+            "codex-room".to_owned(),
+            route(RuntimeKind::Codex, Some("codex-backing"), None),
+        )]));
+        for visible in ["", "absent", "claude:absent", "codex-room"] {
+            server.release_thread(visible).await.unwrap();
+        }
+        assert_eq!(
+            server.routes.lock().unwrap().len(),
+            1,
+            "정리 요청은 전사 라우트를 삭제하지 않는다"
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn integration_and_release_rpc_use_the_claude_backing_and_report_busy() {
+        let root = env::temp_dir().join(format!(
+            "dvz-backend-rpc-{}-{}",
+            process::id(),
+            store_timestamp()
+        ));
+        let bridge = root.join("npm/bridge/claude-agent-sdk-bridge.mjs");
+        fs::create_dir_all(bridge.parent().unwrap()).unwrap();
+        fs::write(
+            &bridge,
+            r#"
+import readline from 'node:readline';
+readline.createInterface({ input: process.stdin }).on('line', line => {
+  const request = JSON.parse(line);
+  if (request.method === 'shutdown') process.exit(0);
+  const result = request.method === 'session/release'
+    ? { busy: request.params.sessionId === 'busy-backing' }
+    : { method: request.method, params: request.params };
+  console.log(JSON.stringify({ id: request.id, result }));
+});
+"#,
+        )
+        .unwrap();
+        let mut server = backend_with_routes(HashMap::from([
+            (
+                "visible-room".to_owned(),
+                route(
+                    RuntimeKind::Codex,
+                    Some("codex-backing"),
+                    Some("claude-backing"),
+                ),
+            ),
+            (
+                "busy-room".to_owned(),
+                route(RuntimeKind::Claude, None, Some("busy-backing")),
+            ),
+        ]));
+        assert_eq!(crate::claude::resolve_bridge_path(&root).unwrap(), bridge,
+            "회귀 검사는 계정 없이 모의 브리지만 실행한다");
+        server.claude = ClaudeServer::new(Path::new("node"), Path::new("claude"), &root).unwrap();
+        for method in [
+            "mcpServerStatus/list",
+            "mcp/login",
+            "mcp/reconnect",
+            "mcp/toggle",
+        ] {
+            let response = server.integration_request("claude:sonnet", method,
+                json!({ "threadId": "visible-room", "sessionId": "visible-room", "name": "mcp", "enabled": false })).await.unwrap();
+            assert_eq!(response["method"], method);
+            assert_eq!(response["params"]["threadId"], "claude-backing");
+            assert_eq!(response["params"]["sessionId"], "claude-backing");
+            assert_eq!(response["params"]["enabled"], false);
+        }
+        server.release_thread("codex-backing").await.unwrap();
+        let error = server
+            .release_thread("busy-room")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("작업 중") || error.contains("while Claude is working"),
+            "{error}"
+        );
+        assert_eq!(server.routes.lock().unwrap().len(), 2);
+        server.shutdown().await;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_turn_status_only_confirms_supported_runtime_states() {
+        for (status, expected) in [
+            ("idle", json!({ "known": true, "running": false })),
+            ("active", json!({ "known": true, "running": true })),
+            ("notLoaded", json!({ "known": false })),
+            ("systemError", json!({ "known": false })),
+            ("unsupported", json!({ "known": false })),
+        ] {
+            assert_eq!(
+                codex_turn_status(&json!({ "thread": { "status": { "type": status } } }), None),
+                expected
+            );
+            assert_eq!(
+                codex_turn_status(
+                    &json!({ "thread": { "status": { "type": status } } }),
+                    Some("")
+                ),
+                expected
+            );
+        }
+        assert_eq!(
+            codex_turn_status(&json!({}), None),
+            json!({ "known": false })
+        );
+        assert_eq!(
+            codex_turn_status(&json!({ "thread": { "status": "idle" } }), None),
+            json!({ "known": false })
+        );
+    }
+
+    #[test]
+    fn codex_turn_status_cross_checks_the_requested_turn() {
+        for (turn_status, known) in [
+            ("completed", true),
+            ("interrupted", true),
+            ("failed", true),
+            ("inProgress", false),
+            ("unsupported", false),
+        ] {
+            let response = json!({ "thread": { "status": { "type": "idle" }, "turns": [{ "id": "current", "status": turn_status }] } });
+            assert_eq!(
+                codex_turn_status(&response, Some("current"))["known"],
+                known
+            );
+        }
+        let response = json!({ "thread": { "status": { "type": "active" }, "turns": [{ "id": "previous", "status": "completed" }] } });
+        assert_eq!(
+            codex_turn_status(&response, Some("previous")),
+            json!({ "known": true, "running": true })
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn failed_open_code_initialization_drops_the_runtime_before_retry() {
+        let mut server = backend_with_routes(HashMap::new());
+        server.open_code_path = PathBuf::from("where.exe");
+        for _ in 0..2 {
+            assert!(server.ensure_open_code().await.is_err());
+            assert!(
+                server.open_code.is_none(),
+                "실패한 인스턴스는 재시도에서 재사용하지 않는다"
+            );
+        }
+        server.shutdown().await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn failed_startup_open_code_initialization_is_reported_and_cleaned_up() {
+        let mut server = backend_with_routes(HashMap::new());
+        server.open_code = Some(
+            OpenCodeServer::spawn(Path::new("where.exe"), &server.cwd)
+                .await
+                .unwrap(),
+        );
+        assert!(
+            server.initialize().await.is_err(),
+            "시작 연결 오류를 숨기지 않는다"
+        );
+        assert!(server.open_code.is_none());
+        server.initialize().await.unwrap();
+        server.shutdown().await;
+    }
 
     fn route(active: RuntimeKind, codex_id: Option<&str>, claude_id: Option<&str>) -> Route {
         Route {
