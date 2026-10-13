@@ -3434,8 +3434,9 @@ impl Renderer {
         }
         self.subagent_view_lines = view.map(|view| {
             let mut lines = Vec::new();
+            // 계획(Updated Plan)은 메인 대화에서만 보인다.
             for block in visible_transcript_blocks(
-                view.blocks,
+                view.blocks.iter().filter(|block| !matches!(block.kind, BlockKind::Plan)),
                 self.shell_display_mode,
                 self.diff_display_mode,
             ) {
@@ -3703,6 +3704,7 @@ impl Renderer {
 
         let plan_lines = view
             .plan_summary
+            .filter(|_| self.subagent_view_lines.is_none())
             .map(|summary| {
                 fixed_plan_summary_lines(
                     summary,
@@ -3877,6 +3879,8 @@ impl Renderer {
     ) -> Result<()> {
         let composer_navigation_layout = frame.composer_layout.clone();
         let rows = height as usize;
+        // 하위 에이전트를 보는 동안 메인 계획은 본문에도 패널에도 그리지 않는다.
+        let plan_summary = plan_summary.filter(|_| self.subagent_view_lines.is_none());
         // The docked panel is where the plan lives while it is open, so the
         // transcript keeps its own full height and draws no card of its own.
         let plan_in_panel = self.side_panel.is_some();
@@ -10255,7 +10259,8 @@ fn plan_lines(block: &Block, width: u16) -> Vec<PaintLine> {
 /// panel's content-fit box instead of the full terminal width.
 fn notice_card_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     let title = block.title.trim_start_matches("✓ ").trim_start();
-    // An untitled note is a short outcome, printed as bare `◆` rows without the card.
+    // An untitled note is a short outcome, printed as bare `◆` rows without the
+    // card, in the accent that also marks `Context compacted`.
     if title.is_empty() {
         let mut lines = block
             .body
@@ -10263,7 +10268,7 @@ fn notice_card_lines(block: &Block, width: u16) -> Vec<PaintLine> {
             .enumerate()
             .flat_map(|(index, row)| {
                 let marker = if index == 0 { "◆ " } else { "  " };
-                wrapped_line(marker, Tone::Muted, row, Tone::Plain, false, width)
+                wrapped_line(marker, Tone::Accent, row, Tone::Accent, index == 0, width)
             })
             .collect::<Vec<_>>();
         lines.push(PaintLine::blank());
@@ -20384,7 +20389,10 @@ mod tests {
     fn viewing_a_subagent_swaps_the_body_lines_and_resets_the_scroll() {
         let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
         renderer.scroll_back = 7;
-        let blocks = [Block::new(BlockKind::Assistant, "Claude", "child answer")];
+        let blocks = [
+            Block::new(BlockKind::Plan, "작업 단계", "□ 1. 원인 확인"),
+            Block::new(BlockKind::Assistant, "Claude", "child answer"),
+        ];
         let shown = |renderer: &Renderer| {
             renderer
                 .subagent_view_lines
@@ -20398,6 +20406,10 @@ mod tests {
         );
         assert_eq!(renderer.scroll_back, 0);
         assert!(shown(&renderer));
+        assert!(
+            renderer.subagent_view_lines.as_ref().unwrap().iter().all(|line| !painted(line).contains("Updated Plan")),
+            "a subagent's plan stays off its body"
+        );
 
         renderer.update_subagent_view(
             Some(&SubagentTranscript { id: "toolu_1", revision: 1, blocks: &[] }),
@@ -21338,8 +21350,11 @@ mod tests {
 
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].prefix, "◆ ");
+        assert_eq!(lines[0].prefix_tone, Tone::Accent);
+        assert_eq!(lines[0].tone, Tone::Accent);
         assert_eq!(lines[0].text, "Reloaded plugins.");
         assert_eq!(lines[1].prefix, "  ");
+        assert_eq!(lines[1].tone, Tone::Accent);
         assert_eq!(lines[1].text, "Sign-in needed: github");
         assert!(lines[2] == PaintLine::blank());
     }
