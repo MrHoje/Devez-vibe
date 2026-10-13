@@ -2667,6 +2667,7 @@ function keepBackgroundSubagent(session, toolUseId, result) {
   }
   if (running.taskId) {
     session.knownSubagents.set(running.taskId, {
+      rowId: running.id,
       name: running.name,
       description: running.description,
       backgroundTask: running.backgroundTask === true,
@@ -2758,14 +2759,16 @@ function upsertStructuredSubagent(session, message) {
   if (!running && !subagentType && !isSubagentTaskType(message.task_type)) return null;
   if (!running) {
     const known = taskId ? session.knownSubagents.get(taskId) : null;
-    const id = toolUseId || `task:${taskId}`;
+    // 백그라운드 명령이 끝나 SDK가 같은 작업을 다시 돌리면, 끝난 줄과 같은 id·이름·설명으로
+    // 이어 붙여 설명 없는 새 줄이 따로 서지 않게 한다.
+    const id = known?.rowId || toolUseId || `task:${taskId}`;
     running = {
       id,
       toolUseId,
       taskId,
-      background: false,
-      name: subagentType || known?.name || "agent",
-      description: "",
+      background: message.is_backgrounded === true,
+      name: known?.name || subagentType || "agent",
+      description: known?.description || "",
       tool: "",
       startedAt: Date.now(),
       lastSeenAt: Date.now(),
@@ -2784,6 +2787,7 @@ function upsertStructuredSubagent(session, message) {
   running.lastSeenAt = Date.now();
   if (running.taskId) {
     session.knownSubagents.set(running.taskId, {
+      rowId: running.id,
       name: running.name,
       description: running.description,
       backgroundTask: running.backgroundTask === true,
@@ -2847,12 +2851,12 @@ function syncBackgroundSubagents(session, tasks) {
     const known = session.knownSubagents.get(taskId);
     if (!running) {
       running = {
-        id: `task:${taskId}`,
+        id: known?.rowId || `task:${taskId}`,
         toolUseId: "",
         taskId,
         background: true,
         name: known?.name || backgroundTaskName(task?.task_type),
-        description: "",
+        description: known?.description || "",
         tool: "",
         command: !isSubagentTaskType(task?.task_type),
         // 셸로 띄운 위임 에이전트도 있으므로 command와 별도로 표시 종류를 보존한다.
@@ -6182,6 +6186,23 @@ async function runSelfTest() {
     waitSnapshot([]);
     if (!waitingKept || nestedSession.subagents.size !== 0) {
       throw new Error(`Claude waiting subagent self-test failed: ${waitingKept} ${nestedSession.subagents.size}`);
+    }
+    clearSubagents(nestedSession);
+    // 끝난 뒤 SDK가 같은 작업을 다시 돌리면 설명 없는 새 줄이 아니라 같은 줄로 돌아온다.
+    startSubagent(nestedSession, { id: "toolu_again", input: { description: "3분 대기", subagent_type: "general-purpose" } });
+    keepBackgroundSubagent(nestedSession, "toolu_again", { isAsync: true, agentId: "agent-again" });
+    waitSnapshot([]);
+    processSubagentSystemMessage(nestedSession, {
+      type: "system",
+      subtype: "task_started",
+      task_id: "agent-again",
+      task_type: "local_agent",
+      subagent_type: "general-purpose",
+      is_backgrounded: true,
+    });
+    const again = [...nestedSession.subagents.values()];
+    if (again.length !== 1 || again[0].id !== "toolu_again" || again[0].description !== "3분 대기") {
+      throw new Error(`Claude resumed subagent row self-test failed: ${JSON.stringify(again)}`);
     }
     clearSubagents(nestedSession);
 

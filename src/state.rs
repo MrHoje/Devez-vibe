@@ -10246,8 +10246,15 @@ impl AppState {
                     .filter_map(|entry| {
                         let id = entry.get("id").and_then(Value::as_str)?;
                         let previous = before.iter().find(|running| running.id == id);
+                        // 끝난 줄이 같은 작업의 재실행으로 돌아오면 경과 시간을 이어 센다.
                         let started_at = previous
                             .map(|running| running.started_at)
+                            .or_else(|| {
+                                self.finished_subagents
+                                    .iter()
+                                    .find(|(row, _)| row.id == id)
+                                    .and_then(|(row, _)| Instant::now().checked_sub(row.elapsed))
+                            })
                             .unwrap_or_else(Instant::now);
                         let painted_elapsed_secs = previous
                             .map(|running| running.painted_elapsed_secs)
@@ -24033,6 +24040,17 @@ mod tests {
         state.handle_notification("turn/subagents/updated", &rows(json!([])));
         let view = state.view();
         assert!(view.subagents.len() == 1 && view.subagents[0].finished);
+
+        // 같은 작업이 다시 돌면 끝난 줄이 그 자리로 돌아오고 경과 시간을 이어 센다.
+        state.finished_subagents[0].0.elapsed = Duration::from_secs(190);
+        state.handle_notification(
+            "turn/subagents/updated",
+            &rows(json!([{ "id": "toolu_1", "taskId": "a1", "name": "general-purpose" }])),
+        );
+        let view = state.view();
+        assert_eq!(view.subagents.len(), 1);
+        assert!(!view.subagents[0].finished);
+        assert!(view.subagents[0].elapsed >= Duration::from_secs(190));
     }
 
     fn state_with_a_running_subagent() -> AppState {

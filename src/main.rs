@@ -2583,6 +2583,12 @@ fn renderer_mouse_action(
     on_click: impl FnOnce(MouseClick) -> Action,
 ) -> Action {
     let request = mouse_request(mouse);
+    // 이동 이벤트 없이 클릭만 전달하는 터미널에서도 같은 강조를 적용한다.
+    let hovered = if let MouseRequest::SelectionStart(column, row) = request {
+        renderer.hover_at(column, row)
+    } else {
+        false
+    };
     // Some embedded terminals deliver the press but swallow the matching
     // release.  Chrome controls must not depend on that release: activate a
     // known pick as soon as it is pressed, while plain text keeps the normal
@@ -2595,7 +2601,7 @@ fn renderer_mouse_action(
     {
         let cleared = renderer.clear_selection();
         return match on_click(MouseClick::Pick(pick)) {
-            Action::Tick(changed) => Action::Tick(changed || cleared),
+            Action::Tick(changed) => Action::Tick(changed || cleared || hovered),
             action => action,
         };
     }

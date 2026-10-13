@@ -1197,10 +1197,6 @@ const SIDE_PANEL_GAP: usize = 1;
 const SIDE_PANEL_MIN_MAIN_WIDTH: usize = SIDE_PANEL_MIN_WIDTH;
 /// Keeps section rules present without competing with the content above them.
 const SIDE_PANEL_DIVIDER_BLEND: u8 = 48;
-/// A quiet neutral lift that remains visible on the panel's secondary surface.
-const SIDE_PANEL_HOVER_BLEND: u8 = 24;
-/// A stronger lift makes the floating transcript control visibly interactive.
-const SCROLL_TO_BOTTOM_HOVER_BLEND: u8 = 48;
 
 fn devez_layout_signal(main_width: u16) -> String {
     format!("\x1b]777;devez-layout-v1;{main_width}\x07")
@@ -1282,24 +1278,6 @@ fn side_panel_background_style() -> CellStyle {
     }
 }
 
-fn side_panel_hover_background() -> Rgb {
-    let palette = theme::palette();
-    blend(palette.hover_bg, palette.foreground, SIDE_PANEL_HOVER_BLEND)
-}
-
-fn scroll_to_bottom_background(hovered: bool) -> Rgb {
-    let palette = theme::palette();
-    if hovered {
-        blend(
-            palette.hover_bg,
-            palette.foreground,
-            SCROLL_TO_BOTTOM_HOVER_BLEND,
-        )
-    } else {
-        palette.hover_bg
-    }
-}
-
 /// Paints one already-laid-out row of panel content at the panel's own left
 /// inset. The row is drawn through a scratch frame of the content width so the
 /// ordinary line painter can be reused without teaching it a column offset.
@@ -1323,16 +1301,13 @@ fn paint_panel_content_row(
         0,
         line,
         selected_columns.clone(),
-        None,
+        hovered_columns,
         Some(content_width + 1),
     );
     for column in 0..content_width {
         let mut cell = scratch.cell(column, 0).clone();
         let selected = range_overlaps(selected_columns.as_ref(), column, column + 1);
-        let hovered = !selected && range_overlaps(hovered_columns.as_ref(), column, column + 1);
-        if hovered {
-            cell.style.background = Some(side_panel_hover_background());
-        } else if selected {
+        if selected {
             // 글자가 있는 칸은 이미 칠해져 왔다. 남은 빈 칸까지 같은 색으로
             // 덮어야 고른 줄이 중간에 끊기지 않는다.
             cell.style.background = Some(theme::selection_bg());
@@ -4910,13 +4885,9 @@ fn paint_text_into_frame(
         let selected = range_overlaps(selected_columns, *column, end);
         let hovered = !selected && range_overlaps(hovered_columns, *column, end);
         let style = cell_style(
-            tone,
-            bold,
-            if hovered {
-                Some(theme::palette().hover_bg)
-            } else {
-                background
-            },
+            hover_tone(tone, hovered),
+            bold || hovered,
+            background,
             selected,
         );
         frame.write(*column, row, unit, style);
@@ -4932,13 +4903,10 @@ fn paint_line_into_frame(
     hovered_columns: Option<Range<usize>>,
     background_width: Option<usize>,
 ) {
-    let pointed_row;
-    let (line, hovered_columns) = if hovered_columns.is_some() && is_subagent_row(line) {
-        pointed_row = pointed_subagent_row(line);
-        (&pointed_row, None)
-    } else {
-        (line, hovered_columns)
-    };
+    let pointed_row = hovered_columns
+        .as_ref()
+        .map(|columns| pointed_hover_row(line, columns));
+    let line = pointed_row.as_ref().unwrap_or(line);
     let question_card = is_question_card_line(line);
     let background = if question_card { Some(theme::palette().user_prompt_bg) } else { row_background(line.tone) };
     let bubble_background = bubble_background(line);
@@ -4996,18 +4964,7 @@ fn paint_line_into_frame(
             .iter()
             .find_map(|(start, end, pick)| matches!(pick, Pick::History(_)).then_some(*start..*end))
     });
-    let history_hovered = hovered_columns.as_ref().is_some_and(|hovered| {
-        history_columns
-            .as_ref()
-            .is_some_and(|columns| range_overlaps(Some(hovered), columns.start, columns.end))
-    });
-    let history_background = history_columns.as_ref().map(|_| {
-        if history_hovered {
-            scroll_to_bottom_background(true)
-        } else {
-            theme::palette().user_prompt_bg
-        }
-    });
+    let history_background = history_columns.as_ref().map(|_| theme::palette().user_prompt_bg);
     if let (Some(columns), Some(background)) = (history_columns.as_ref(), history_background) {
         frame.fill(
             columns.start,
@@ -5020,9 +4977,7 @@ fn paint_line_into_frame(
             },
         );
     }
-    let text_hovered_columns = (!history_hovered)
-        .then_some(hovered_columns.as_ref())
-        .flatten();
+    let text_hovered_columns = hovered_columns.as_ref();
     let mut column = 0;
     let prefix_width = UnicodeWidthStr::width(line.prefix.as_str());
     let history_prefix_background = history_columns
@@ -6791,14 +6746,15 @@ fn subagent_lines(subagents: &[SubagentView], width: u16) -> Vec<PaintLine> {
 }
 
 /// 본문에 띄운 줄만 테마색으로 칠하고, 끝난 줄은 점을 완료 색으로 칠한다.
+/// 나머지 이름은 설명처럼 흐리게 두어 마우스를 올린 줄이 밝아지며 드러나게 한다.
 /// 점과 이름의 색을 돌려준다.
 fn subagent_row_tones(selected: bool, finished: bool) -> (Tone, Tone) {
     if selected {
         (Tone::Accent, Tone::Accent)
     } else if finished {
-        (Tone::Success, Tone::Plain)
+        (Tone::Success, Tone::Muted)
     } else {
-        (Tone::Muted, Tone::Plain)
+        (Tone::Muted, Tone::Muted)
     }
 }
 
@@ -6823,20 +6779,47 @@ fn is_subagent_row(line: &PaintLine) -> bool {
     })
 }
 
-/// 하단 하위 에이전트 줄은 순정 Claude Code처럼 배경 대신 앞의 `❯`와 굵고 밝은
-/// 글씨로 마우스가 올라간 줄을 가리킨다.
-fn pointed_subagent_row(line: &PaintLine) -> PaintLine {
-    let brighten = |tone| if tone == Tone::Muted { Tone::Plain } else { tone };
-    let mut line = line.clone();
-    if line.prefix.starts_with(' ') {
-        line.prefix.replace_range(..1, "❯");
+fn hover_tone(tone: Tone, hovered: bool) -> Tone {
+    if hovered && tone == Tone::Muted {
+        Tone::Plain
+    } else {
+        tone
     }
-    line.prefix_tone = brighten(line.prefix_tone);
-    line.tone = brighten(line.tone);
-    line.bold = true;
-    for span in &mut line.tail {
-        span.tone = brighten(span.tone);
-        span.bold = true;
+}
+
+/// 하위 에이전트와 선택 목록은 기존 마커 자리에 `❯`를 표시한다. 글자 폭과
+/// 클릭 영역은 그대로 두고, 나머지 강조는 공통 글자 렌더링에서 처리한다.
+fn pointed_hover_row(line: &PaintLine, columns: &Range<usize>) -> PaintLine {
+    let mut line = line.clone();
+    let marker = if is_subagent_row(&line) {
+        columns.start
+    } else if line.pick.as_ref().is_some_and(|regions| {
+        regions.0.iter().any(|(start, end, pick)| {
+            matches!(pick, Pick::Row(_) | Pick::Suggestion(_))
+                && range_overlaps(Some(columns), *start, *end)
+        })
+    }) {
+        columns.start.saturating_add(1)
+    } else {
+        return line;
+    };
+    if !columns.contains(&marker) {
+        return line;
+    }
+    let mut column = 0;
+    'spans: for text in std::iter::once(&mut line.prefix)
+        .chain(std::iter::once(&mut line.text))
+        .chain(line.tail.iter_mut().map(|span| &mut span.text))
+    {
+        for (offset, ch) in text.char_indices() {
+            if column == marker {
+                if ch == ' ' {
+                    text.replace_range(offset..offset + 1, "❯");
+                }
+                break 'spans;
+            }
+            column += UnicodeWidthChar::width(ch).unwrap_or(0);
+        }
     }
     line
 }
@@ -6919,7 +6902,7 @@ const SUBAGENT_NAME_MIN_WIDTH: usize = 8;
 /// 순정 Claude Code처럼 경과 시간은 행 오른쪽, `right_edge` 열 앞에서 끝난다.
 fn subagent_line(subagent: &SubagentView, right_edge: usize) -> PaintLine {
     let label = subagent_label_prefix(subagent);
-    let elapsed = format_subagent_elapsed(subagent.elapsed.as_secs());
+    let elapsed = format_subagent_elapsed(subagent);
     let elapsed_width = UnicodeWidthStr::width(elapsed.as_str());
     // 측면 패널 행과 같은 고정 점이라 경과 초가 바뀔 때만 다시 그린다.
     let glyph = "•";
@@ -6974,7 +6957,12 @@ fn subagent_line(subagent: &SubagentView, right_edge: usize) -> PaintLine {
     }
 }
 
-fn format_subagent_elapsed(seconds: u64) -> String {
+/// 끝난 줄은 경과 시간 대신 `idle`을 보인다.
+fn format_subagent_elapsed(subagent: &SubagentView) -> String {
+    if subagent.finished {
+        return "idle".to_owned();
+    }
+    let seconds = subagent.elapsed.as_secs();
     let minutes = seconds / 60;
     let seconds = seconds % 60;
     if minutes == 0 {
@@ -10942,7 +10930,7 @@ fn side_panel_subagent_lines(
     let mut lines = vec![heading, PaintLine::blank(), subagent_main_line(subagents, "")];
     for subagent in subagents.iter().take(SIDE_PANEL_SUBAGENT_LIMIT) {
         let label = subagent_label_prefix(subagent);
-        let elapsed = format!(" · {}", format_subagent_elapsed(subagent.elapsed.as_secs()));
+        let elapsed = format!(" · {}", format_subagent_elapsed(subagent));
         let fixed = UnicodeWidthStr::width("• ")
             + UnicodeWidthStr::width(label)
             + UnicodeWidthStr::width(elapsed.as_str());
@@ -14344,8 +14332,8 @@ fn paint_scroll_to_bottom_into_frame(
         &control.text,
         cell_style(
             control.tone,
-            false,
-            Some(scroll_to_bottom_background(hovered)),
+            hovered,
+            Some(theme::palette().hover_bg),
             false,
         ),
     );
@@ -14408,9 +14396,7 @@ fn is_box_drawing(glyph: &str) -> bool {
         .is_some_and(|ch| matches!(u32::from(ch), 0x2500..=0x259f))
 }
 
-/// Whether a piece of the row painted across `start..end` falls under the
-/// hovered columns. Every clickable span was measured off the painted row, so a
-/// piece is either inside the highlight or outside it, never half-lit.
+/// 한 글자 묶음의 배경과 글자 색·굵기를 설정한다.
 fn set_piece_style(
     out: &mut impl Write,
     background: Option<Rgb>,
@@ -14429,10 +14415,7 @@ fn set_piece_style(
     Ok(())
 }
 
-/// Prints one run of a row, split where the hover highlight starts and stops. A
-/// run is not an all-or-nothing unit the way a selection block is: the highlight
-/// reaches a column past the text it belongs to, and the separator column it
-/// reaches into must light up by that one column and no further.
+/// 호버 영역만 굵고 밝게 표시하며 원래 배경과 드래그 선택을 보존한다.
 fn print_hovered_chunks(
     out: &mut impl Write,
     text: &str,
@@ -14448,23 +14431,18 @@ fn print_hovered_chunks(
         return print_selected_chunks(out, text, column, selected_columns, tone, bold, background);
     }
 
-    let hover_bg = theme::palette().hover_bg;
     for chunk in selection_chunks(text, *column, hovered_columns.cloned()) {
-        let chunk_background = if chunk.selected {
-            Some(hover_bg)
-        } else {
-            background
-        };
-        set_piece_style(out, chunk_background, tone, bold)?;
-        print_selected_chunks(
-            out,
-            &chunk.text,
-            column,
-            selected_columns,
-            tone,
-            bold,
-            chunk_background,
-        )?;
+        for piece in selection_chunks(&chunk.text, *column, selected_columns.cloned()) {
+            let hovered = chunk.selected && !piece.selected;
+            let tone = hover_tone(tone, hovered);
+            let bold = bold || hovered;
+            set_piece_style(out, background, tone, bold)?;
+            if piece.selected {
+                set_selection_style(out, true, tone, bold, background)?;
+            }
+            queue!(out, Print(&piece.text))?;
+            *column += UnicodeWidthStr::width(piece.text.as_str());
+        }
     }
     Ok(())
 }
@@ -14506,8 +14484,7 @@ fn word_background(tone: Tone) -> Option<Rgb> {
         Tone::AssistantBubble | Tone::AssistantBubbleHalf => assistant_bubble_background(),
         Tone::DiffAddedWord => palette.diff_add_word_bg,
         Tone::DiffRemovedWord => palette.diff_remove_word_bg,
-        // The status-line model reading stays flat at rest; only the hover pass
-        // paints a band behind it.
+        // 상태줄은 호버할 때도 원래 배경을 유지한다.
         _ => return None,
     })
 }
@@ -14531,6 +14508,10 @@ fn print_line_with_selection_bounded(
     hovered_columns: Option<Range<usize>>,
     background_width: Option<usize>,
 ) -> Result<()> {
+    let pointed_row = hovered_columns
+        .as_ref()
+        .map(|columns| pointed_hover_row(line, columns));
+    let line = pointed_row.as_ref().unwrap_or(line);
     let question_card = is_question_card_line(line);
     let background = if question_card { Some(theme::palette().user_prompt_bg) } else { row_background(line.tone) };
     let bubble_background = bubble_background(line);
@@ -16460,7 +16441,7 @@ mod tests {
     }
 
     #[test]
-    fn bash_hover_background_starts_after_the_disclosure_arrow() {
+    fn bash_hover_bolds_the_heading_without_changing_its_background() {
         theme::set_current(ThemeKind::Dark);
         let block = Block::new(BlockKind::Tool, "Shell · cargo test", "");
         let line = block_lines(&block, 80).remove(0);
@@ -16473,10 +16454,11 @@ mod tests {
         let hover_escape = format!("\x1b[48;2;{};{};{}m", hover.0, hover.1, hover.2);
 
         let arrow = painted.find("▸ ").expect("arrow");
-        let background = painted.find(&hover_escape).expect("hover background");
+        let bold = painted[arrow..].find("\x1b[1m").expect("bold heading") + arrow;
         let title = painted.find("Shell").expect("title");
-        assert!(arrow < background);
-        assert!(background < title);
+        assert!(arrow < bold);
+        assert!(bold < title);
+        assert!(!painted.contains(&hover_escape));
     }
 
     #[test]
@@ -20528,6 +20510,17 @@ mod tests {
         assert_eq!(painted(&panel[3]), "• Plan · Find auth code · 4s");
     }
 
+    /// 끝난 줄은 이름을 흐리게 두고 경과 시간 대신 `idle`을 보인다.
+    #[test]
+    fn a_finished_subagent_row_reads_idle_instead_of_elapsed() {
+        let mut done = test_subagent("Explore", "", "", 190);
+        done.finished = true;
+        let lines = subagent_lines(&[done], 60);
+        assert!(painted(&lines[1]).trim_end().ends_with("idle"));
+        assert!(!painted(&lines[1]).contains("3m"));
+        assert_eq!((lines[1].tone, lines[1].tail[0].tone), (Tone::Success, Tone::Muted));
+    }
+
     /// 목록 맨 위에 `main`이 서고, 본문에 띄운 줄만 테마색이다. 줄 전체가 클릭 대상이며
     /// 백그라운드 명령 줄은 누를 곳이 없다.
     #[test]
@@ -20542,7 +20535,7 @@ mod tests {
 
         assert_eq!(painted(&lines[0]), "  • main");
         assert_eq!(pick_on(&lines[0], "main"), Some(Pick::ViewSubagent(None)));
-        assert_eq!((lines[0].prefix_tone, lines[0].tone), (Tone::Muted, Tone::Plain));
+        assert_eq!((lines[0].prefix_tone, lines[0].tone), (Tone::Muted, Tone::Muted));
         assert_eq!((lines[1].tone, lines[1].tail[0].tone), (Tone::Accent, Tone::Accent));
         assert_eq!(
             pick_on(&lines[1], "4s"),
@@ -23780,9 +23773,9 @@ mod tests {
         paint_scroll_to_bottom_into_frame(&mut frame, 0, &control, true);
         assert_eq!(
             frame.cell(start, 0).style.background,
-            Some(scroll_to_bottom_background(true))
+            Some(theme::palette().hover_bg)
         );
-        assert_ne!(scroll_to_bottom_background(true), theme::palette().hover_bg);
+        assert!(frame.cell(start + 1, 0).style.bold);
         assert_eq!(scroll_to_bottom_overlay_row(12, Some(7)), Some(16));
 
         renderer.scroll_to_bottom();
@@ -27733,11 +27726,8 @@ mod tests {
         }));
     }
 
-    /// The cells a painted row actually carries the hover tint on, read back off
-    /// the escapes it printed.
-    fn hovered_cells(painted: &str) -> String {
-        let hover = theme::palette().hover_bg;
-        let hover_escape = format!("48;2;{};{};{}", hover.0, hover.1, hover.2);
+    /// ANSI 출력을 읽어 굵게 표시한 글자를 확인한다.
+    fn bold_cells(painted: &str) -> String {
         let mut cells = String::new();
         let mut hovered = false;
         let mut chars = painted.chars().peekable();
@@ -27755,13 +27745,9 @@ mod tests {
                     break;
                 }
             }
-            if sequence.contains(&hover_escape) {
+            if sequence == "[1m" {
                 hovered = true;
-            } else if sequence.starts_with("[48;2;")
-                || sequence == "[49m"
-                || sequence == "[0m"
-                || sequence.contains("[39m")
-            {
+            } else if sequence == "[22m" || sequence == "[0m" {
                 hovered = false;
             }
         }
@@ -27798,7 +27784,166 @@ mod tests {
         print_line_with_selection(&mut output, &line, None, Some(hovered)).expect("paint");
 
         let painted = String::from_utf8(output).expect("utf-8 escapes");
-        assert_eq!(hovered_cells(&painted), "GPT-5.6 Sol");
+        assert_eq!(bold_cells(&painted), "GPT-5.6 Sol");
+    }
+
+    #[test]
+    fn mouse_hover_preserves_backgrounds_and_selection_on_every_theme() {
+        let mode = test_mode("Full Access", ModeAccent::Danger, true);
+        let slider = EffortSlider {
+            efforts: ["low", "medium", "high"].map(ToOwned::to_owned).to_vec(),
+            selected: 1,
+            detail: None,
+        };
+        for theme in ThemeKind::ALL {
+            theme::set_current(theme);
+            let lines = [
+                status_line_row(
+                    Some(StatusLineView {
+                        agent: AgentMode::Standard,
+                        shell_mode: false,
+                        model: Some("GPT-5.6 Sol".to_owned()),
+                        effort: Some("high".to_owned()),
+                        fast: false,
+                        context: None,
+                        five_hour_percent: None,
+                        five_hour_remaining: None,
+                        weekly_percent: None,
+                        notice: None,
+                        update_notice: None,
+                        background_tasks: Some("2 shells".to_owned()),
+                    }),
+                    "",
+                    120,
+                    false,
+                ),
+                input_top_line(120, "", Some(&mode)),
+                effort_step_lines(&slider, 120).remove(1),
+            ];
+            for line in &lines {
+                for (_, _, pick) in &line.pick.as_ref().expect("clickable controls").0 {
+                    let columns = Renderer::hover_columns(line, None, Some(pick)).unwrap();
+                    let mut idle = CellFrame::new(120, 1);
+                    let mut hovered = CellFrame::new(120, 1);
+                    paint_line_into_frame(&mut idle, 0, line, None, None, None);
+                    paint_line_into_frame(&mut hovered, 0, line, None, Some(columns.clone()), None);
+                    for column in 0..120 {
+                        assert_eq!(idle.cell(column, 0).glyph, hovered.cell(column, 0).glyph);
+                        assert_eq!(idle.cell(column, 0).style.background, hovered.cell(column, 0).style.background);
+                        if !columns.contains(&column) {
+                            assert_eq!(idle.cell(column, 0), hovered.cell(column, 0));
+                        } else {
+                            assert!(hovered.cell(column, 0).style.bold);
+                        }
+                    }
+                    let mut selected_idle = CellFrame::new(120, 1);
+                    let mut selected_hovered = CellFrame::new(120, 1);
+                    paint_line_into_frame(&mut selected_idle, 0, line, Some(columns.clone()), None, None);
+                    paint_line_into_frame(&mut selected_hovered, 0, line, Some(columns.clone()), Some(columns.clone()), None);
+                    assert_eq!(selected_idle.cells, selected_hovered.cells);
+                }
+            }
+        }
+        theme::set_current(ThemeKind::Dark);
+    }
+
+    #[test]
+    fn clicking_shells_without_a_move_event_updates_hover_and_repaints() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let line = status_line_row(
+            Some(StatusLineView {
+                agent: AgentMode::Standard,
+                shell_mode: false,
+                model: None,
+                effort: None,
+                fast: false,
+                context: None,
+                five_hour_percent: None,
+                five_hour_remaining: None,
+                weekly_percent: None,
+                notice: None,
+                update_notice: None,
+                background_tasks: Some("2 shells".to_owned()),
+            }),
+            "",
+            120,
+            false,
+        );
+        let column = line.pick.as_ref().unwrap().columns_of(&Pick::BackgroundTasks).unwrap().start;
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.previous_lines = vec![line];
+        let action = crate::renderer_mouse_action(
+            &mut renderer,
+            &MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: column as u16,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            |click| {
+                assert!(matches!(click, crate::MouseClick::Pick(Pick::BackgroundTasks)));
+                crate::Action::Tick(false)
+            },
+        );
+        assert!(matches!(action, crate::Action::Tick(true)));
+        assert_eq!(renderer.hovered_pick, Some(Pick::BackgroundTasks));
+        assert!(!renderer.hover_at(column as u16, 0));
+    }
+
+    #[test]
+    fn hovered_picker_rows_show_the_existing_marker_without_background_tint() {
+        for (title, style) in [
+            ("Model", OverlayStyle::Picker),
+            ("Provider", OverlayStyle::CompactPanel),
+            ("Options", OverlayStyle::Panel),
+        ] {
+            let frame = overlay_frame(
+                &[],
+                OverlayView {
+                    closable: true,
+                    title: title.to_owned(),
+                    lines: vec![OverlayLine {
+                        text: "1. 항목\u{1f}설명".to_owned(),
+                        selected: false,
+                        muted: false,
+                    }],
+                    slider: None,
+                    hint: "Enter select".to_owned(),
+                    style,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
+                },
+                None,
+                StatusArea {
+                    fallback: String::new(),
+                    line: None,
+                    diff_reference_lines: None,
+                    side_panel_open: false,
+                    composer_notice: None,
+                    composer_mode: None,
+                },
+                80,
+            );
+            let line = frame.lines.iter().find(|line| pick_on(line, "항목") == Some(Pick::Row(0))).unwrap();
+            let columns = Renderer::hover_columns(line, None, Some(&Pick::Row(0))).unwrap();
+            let mut hovered = CellFrame::new(80, 1);
+            paint_line_into_frame(&mut hovered, 0, line, None, Some(columns), None);
+            assert_eq!(hovered.cell(2, 0).glyph, "❯", "{title}");
+            assert!(hovered.cell(2, 0).style.bold);
+            assert!((0..80).all(|column| hovered.cell(column, 0).style.background.is_none()));
+            let mut output = Vec::new();
+            print_line_with_selection(&mut output, line, None, Renderer::hover_columns(line, None, Some(&Pick::Row(0)))).unwrap();
+            assert!(String::from_utf8(output).unwrap().contains('❯'));
+            assert!(!painted(line).contains('❯'));
+
+            let boxed = box_split_pane_line(line.clone(), 80);
+            let columns = Renderer::hover_columns(&boxed, None, Some(&Pick::Row(0))).unwrap();
+            let mut split_hovered = CellFrame::new(84, 1);
+            paint_line_into_frame(&mut split_hovered, 0, &boxed, None, Some(columns), None);
+            assert_eq!(split_hovered.cell(4, 0).glyph, "❯");
+            assert_eq!(split_hovered.cell(0, 0).glyph, "│");
+        }
     }
 
     /// Only the piece under the pointer lights up, and it lights up wherever the
@@ -28679,21 +28824,7 @@ mod tests {
     }
 
     #[test]
-    fn clickable_side_panel_text_uses_a_subdued_hover_surface() {
-        let distance = |left: Rgb, right: Rgb| {
-            u16::from(left.0.abs_diff(right.0))
-                + u16::from(left.1.abs_diff(right.1))
-                + u16::from(left.2.abs_diff(right.2))
-        };
-        for theme in ThemeKind::ALL {
-            theme::set_current(theme);
-            let palette = theme::palette();
-            let hover = side_panel_hover_background();
-            let divider = tone_rgb(Tone::SidePanelDivider).expect("divider color");
-            assert_ne!(hover, palette.hover_bg);
-            assert!(distance(palette.hover_bg, hover) < distance(palette.hover_bg, divider));
-        }
-
+    fn clickable_side_panel_text_bolds_without_changing_its_background() {
         theme::set_current(ThemeKind::Dark);
         let layout =
             side_panel_layout(100, SIDE_PANEL_MIN_WIDTH).expect("100 columns carry the panel");
@@ -28720,8 +28851,9 @@ mod tests {
         let heading_width = painted_line_width(&heading);
         assert_eq!(
             frame.cell(layout.content_left(), 1).style.background,
-            Some(side_panel_hover_background())
+            Some(theme::palette().hover_bg)
         );
+        assert!(frame.cell(layout.content_left(), 1).style.bold);
         assert_eq!(
             frame
                 .cell(layout.content_left() + heading_width, 1)
@@ -29139,7 +29271,7 @@ mod tests {
     }
 
     #[test]
-    fn history_on_prompt_keeps_the_right_margin_and_hovers_the_whole_background() {
+    fn history_on_prompt_keeps_the_right_margin_and_original_background_on_hover() {
         theme::set_current(ThemeKind::Dark);
         let prompt = Block::new(
             BlockKind::User,
@@ -29220,7 +29352,7 @@ mod tests {
             for column in hovered {
                 assert_eq!(
                     frame.cell(column, 0).style.background,
-                    Some(scroll_to_bottom_background(true))
+                    Some(theme::palette().user_prompt_bg)
                 );
             }
             assert_eq!(frame.cell(79, 0).style.background, None);
@@ -29426,7 +29558,7 @@ mod tests {
     }
 
     #[test]
-    fn non_chat_history_hover_colours_the_space_after_the_model_border() {
+    fn non_chat_history_hover_keeps_the_background_after_the_model_border() {
         theme::set_current(ThemeKind::Dark);
         let prompt = Block::new(BlockKind::User, "gpt-5.6-sol", "보낸 프롬프트");
         let history_id = 99;
@@ -29448,7 +29580,7 @@ mod tests {
         paint_line_into_frame(&mut frame, 0, line, None, Some(hovered), None);
         assert_eq!(
             frame.cell(1, 0).style.background,
-            Some(scroll_to_bottom_background(true))
+            Some(theme::palette().user_prompt_bg)
         );
     }
 
