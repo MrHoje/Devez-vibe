@@ -1747,6 +1747,12 @@ enum PendingInteraction {
     /// Reached from the plugin picker, so cancelling it returns there instead of
     /// closing the overlay outright.
     MarketplacePicker(MarketplacePicker),
+    /// The `/mcp` and `/plugins` panel opens at once and says it is loading
+    /// while the provider answers, instead of the screen standing still.
+    IntegrationLoading {
+        title: &'static str,
+        started: Instant,
+    },
     ProviderLoading,
     ProviderPicker(ProviderPicker),
     ProviderOAuthCode {
@@ -7071,6 +7077,20 @@ impl AppState {
         self.pending = Some(PendingInteraction::ProviderLoading);
     }
 
+    pub fn open_integration_loading(&mut self, title: &'static str) {
+        self.pending = Some(PendingInteraction::IntegrationLoading {
+            title,
+            started: Instant::now(),
+        });
+    }
+
+    /// A load that failed leaves nothing to show, so its panel closes.
+    pub fn close_integration_loading(&mut self) {
+        if matches!(self.pending, Some(PendingInteraction::IntegrationLoading { .. })) {
+            self.pending = None;
+        }
+    }
+
     pub fn open_provider_oauth(
         &mut self,
         provider_id: String,
@@ -12244,8 +12264,9 @@ impl AppState {
                 MarketplacePickerResult::Remove(name) => Action::ConfirmMarketplaceRemove(name),
                 MarketplacePickerResult::UpgradeAll => Action::UpgradeMarketplaces,
             },
-            PendingInteraction::ProviderLoading => {
-                self.pending = Some(PendingInteraction::ProviderLoading);
+            loading @ (PendingInteraction::ProviderLoading
+            | PendingInteraction::IntegrationLoading { .. }) => {
+                self.pending = Some(loading);
                 Action::None
             }
             PendingInteraction::ProviderPicker(mut picker) => match picker.handle_key(key) {
@@ -13333,6 +13354,9 @@ impl AppState {
             PendingInteraction::McpPicker(picker) => Some(picker.overlay_view()),
             PendingInteraction::PluginPicker(picker) => Some(picker.overlay_view()),
             PendingInteraction::MarketplacePicker(picker) => Some(picker.overlay_view()),
+            PendingInteraction::IntegrationLoading { title, started } => {
+                Some(crate::integrations::loading_view(title, *started))
+            }
             PendingInteraction::ProviderLoading => Some(OverlayView {
                 title: "Connect OpenCode provider".to_owned(),
                 lines: vec![OverlayLine {
@@ -20851,6 +20875,18 @@ mod tests {
             }
         ));
         assert_eq!(view.input.expect("search editor").text(), "");
+    }
+
+    #[test]
+    fn integration_loading_panel_shows_until_a_failed_load_closes_it() {
+        let mut state = test_state();
+        state.open_integration_loading("Plugins");
+        let view = state.view().overlay.expect("loading panel");
+        assert_eq!(view.title, "Plugins");
+        assert!(view.lines[0].text.starts_with("Loading"));
+
+        state.close_integration_loading();
+        assert!(state.view().overlay.is_none());
     }
 
     #[test]

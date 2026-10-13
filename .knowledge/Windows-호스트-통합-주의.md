@@ -13,6 +13,7 @@
 - 데스크톱에서는 Computer Use가 되지만 Vibe에서는 `native pipe` 연결이 실패함: 「Computer Use의 데스크톱 연결 수명」.
 - Claude Computer Use가 터미널에 입력함·사용자 화면 노출 없이 검증해야 함: 「Claude Computer Use(`devez-computer`)」.
 - dvz 화면 동작을 사용자 창 없이 시험해야 함·디버그 빌드가 시작 직후 스택 넘침으로 죽음: 「ConPTY로 실제 화면 시험」.
+- DevezCode에서 dvz 세션을 삭제할 때 화면이 잠시 멈춤: 「DevezCode 세션 삭제 시 화면 멈춤」.
 
 아래 배포·미배포 표현은 당시 기록이다. 비동기 질문 변경의 최종 배포는 같은 절의 Vibe 1.8.23·DevezCode 1.27.2 기록을 함께 읽는다. 현재 확인 위치는 [src/devezcode.rs](../src/devezcode.rs), [src/input_hub.rs](../src/input_hub.rs), [호스트 상태 검사](../scripts/test-devezcode-question-state.mjs)다.
 
@@ -113,6 +114,15 @@ Sixel 모서리 관련 `#[ignore]` 시험(`live_native_terminal_metrics`, `live_
 - ConPTY로 보낸 Ctrl+C는 누름 뒤 놓기 이벤트도 온다. 대기 중 키를 따로 처리하는 곳에서 놓기를 미뤄 두면 뒤늦게 기본 처리(종료 안내 등)가 켜진다.
 - 글자를 보낸 직후 0.15초 안에 Enter를 보내면 제출되지 않고 줄바꿈으로 들어간 사례가 있었다(원인 미확인). 입력과 Enter 사이에 0.5초 이상 둔다.
 - 사용자가 띄운 dvz(`%LOCALAPPDATA%\DevezVibe\versions\...\dvz.exe`)가 함께 돌고 있을 수 있으니 프로세스 정리는 경로로 구분한다.
+- DevezCode 세션 안에서 시험 dvz를 띄우면 `DEVEZCODE_ROOM_ID`·`DEVEZCODE_TRACKING_AGENT`·`DEVEZCODE_BRIDGE_*`·`DEVEZ_VIBE_SCREEN_LOG`가 상속돼 지금 쓰는 방의 상태 파일과 브리지에 기록할 수 있다. 상속 대신 최소 환경 블록을 넘긴다.
+- 콘솔 프로그램이 `CreatePseudoConsole` 자식을 직접 띄울 때 `STARTF_USESTDHANDLES`와 빈 표준 핸들을 주지 않으면, 부모의 표준 출력이 리다이렉트된 경우 자식이 그 핸들을 물려받아 화면이 의사 콘솔이 아니라 부모 출력으로 샌다. 그 상태의 종료 시간 측정은 무효다. GUI인 DevezCode는 해당하지 않는다.
+
+## DevezCode 세션 삭제 시 화면 멈춤 — 2026-10-12
+
+- 판정은 DevezCode 쪽이다. 삭제(`MainWindow.RemoveSessionSubtree`)는 ConPTY·작업 개체 정리, 대화 파일 탐색·삭제, 설정·작업공간 저장(디스크 플러시 완료까지 대기), 이웃 탭 활성화(`ActivateSession`)를 모두 UI 스레드에서 동기로 실행한다.
+- dvz 종료는 지연 요인이 아니다. dvz.exe에는 콘솔 종료 처리기가 없고 백엔드는 `CREATE_NO_WINDOW`로 의사 콘솔에서 분리된다. npm 래퍼 `dvz.js`가 `SIGHUP`을 구독하지만, 실제 체인(cmd → `dvz.cmd` → node `dvz.js` → dvz.exe)을 DevezCode `TerminalSession.Dispose` 순서로 닫아도 Windows 11 26200에서는 `ClosePseudoConsole`이 바로 반환됐다. 24H2 이전 Windows는 확인하지 않았다.
+- 실사용 판별: `C:\devezLog\diag.log`에서 `CloseTerminal room=<삭제 방>`부터 다음 `ActivateSession begin`까지가 삭제 처리, 이어지는 `ActivateSession '<이웃>' took Nms`가 이웃 자동 활성화다. `UI-STALL: dispatcher blocked ~Nms`는 500ms 심장박동이 2초 넘게 밀린 구간이다. 그 구간의 `[web] [dbg] out` 양이 적으면 dvz 출력 폭주가 아니다.
+- 당시 기록: 삭제 처리 43~416ms, 삭제 뒤 이웃 활성화 최대 1,030ms와 `UI-STALL` 2,687ms. 같은 `ActivateSession` 지연이 일반 탭 전환에서도 338회 중 23회 250ms를 넘었고 최대 6,143ms였다. 활성화 안에서 정확히 어느 호출이 막히는지는 계측이 없어 미확인이다.
 
 ## DevezCode 재개 인자와 기억된 모델 — 2026-09-23
 

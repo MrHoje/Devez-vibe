@@ -23,16 +23,14 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "`/rename`으로 세션 이름을 바꿀 수 있고, Claude·Codex 새 세션은 첫 프롬프트로 20자 내외 이름이 자동으로 붙습니다.",
-    "`/model`에서 모델을 고르면 effort를 먼저 고른 뒤 적용 범위를 선택합니다.",
-    "새 세션의 첫 프롬프트에 이미지를 붙여 보내면 세션이 열리는 동안 입력란에 `[Image #1]`이 남아 있던 문제를 고쳤습니다.",
+    "`/mcp`·`/plugins`는 불러오는 동안 화면이 멈추지 않고 바로 패널로 바뀌어 Loading을 표시합니다.",
+    "컴포저 아래 하위 에이전트·백그라운드 작업 줄에서 라벨 오타를 고치고, 이름을 대문자로 시작하게 표시합니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "`/rename` renames the session, and new Claude and Codex sessions are named automatically from the first prompt in about 20 characters.",
-    "In `/model`, picking a model now asks for its effort first, then where to apply it.",
-    "Fixed `[Image #1]` staying in the composer while a new session opened after a first prompt with an attached image.",
+    "`/mcp` and `/plugins` switch to their panel at once and show Loading instead of freezing the screen while they load.",
+    "Fixed a label typo on the subagent and background task rows under the composer, and their names now start with a capital letter.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

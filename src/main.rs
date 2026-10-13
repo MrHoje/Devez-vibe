@@ -3404,18 +3404,22 @@ async fn execute_action(
             ),
             Err(error) => state.push_notice(BlockKind::Error, "Rename failed", error.to_string()),
         },
-        Action::OpenMcp(notice) => match list_mcp_servers(server, state).await {
-            Ok(response) => {
-                let model = state.selected_model_name().to_owned();
-                state.update_mcp_servers_for_model(&response, &model);
-                state.open_mcp_picker(McpServerInfo::list_from_value(&response), notice);
+        Action::OpenMcp(notice) => {
+            open_integration_loading(state, renderer, "MCP")?;
+            match await_integration_panel(state, renderer, list_mcp_servers(server, state)).await? {
+                Ok(response) => {
+                    let model = state.selected_model_name().to_owned();
+                    state.update_mcp_servers_for_model(&response, &model);
+                    state.open_mcp_picker(McpServerInfo::list_from_value(&response), notice);
+                }
+                Err(error) => {
+                    state.close_integration_loading();
+                    let model = state.selected_model_name().to_owned();
+                    state.note_mcp_query_error_for_model(error.to_string(), &model);
+                    state.push_notice(BlockKind::Error, "MCP list failed", error.to_string());
+                }
             }
-            Err(error) => {
-                let model = state.selected_model_name().to_owned();
-                state.note_mcp_query_error_for_model(error.to_string(), &model);
-                state.push_notice(BlockKind::Error, "MCP list failed", error.to_string());
-            }
-        },
+        }
         Action::ReconnectMcp(name) => {
             let provider = SkillProvider::from_model(state.selected_model_name());
             let client = server.integration_client(provider.model_hint());
@@ -3688,16 +3692,20 @@ async fn execute_action(
             Ok(_) => state.apply_logout(),
             Err(error) => state.push_notice(BlockKind::Error, "Sign-out failed", error.to_string()),
         },
-        Action::OpenPlugins { scope, notice } => match list_plugins(server, state).await {
-            Ok(response) => {
-                let catalog = PluginCatalog::from_value(&response);
-                state.update_plugins(&response);
-                state.open_plugin_picker(catalog, scope, notice);
+        Action::OpenPlugins { scope, notice } => {
+            open_integration_loading(state, renderer, "Plugins")?;
+            match await_integration_panel(state, renderer, list_plugins(server, state)).await? {
+                Ok(response) => {
+                    let catalog = PluginCatalog::from_value(&response);
+                    state.update_plugins(&response);
+                    state.open_plugin_picker(catalog, scope, notice);
+                }
+                Err(error) => {
+                    state.close_integration_loading();
+                    state.push_notice(BlockKind::Error, "Plugin list failed", error.to_string())
+                }
             }
-            Err(error) => {
-                state.push_notice(BlockKind::Error, "Plugin list failed", error.to_string())
-            }
-        },
+        }
         Action::OpenPluginDetail { target, origin } => {
             let params = if let Some(path) = target.marketplace_path.as_deref() {
                 json!({
@@ -3712,13 +3720,17 @@ async fn execute_action(
                     "cwds": [state.cwd]
                 })
             };
+            open_integration_loading(state, renderer, "Plugin")?;
             // The catalogue is refetched alongside the detail so the page shows
             // the plugin's current install state, not the state it had when the
             // list was drawn.
-            let (detail, list) = tokio::join!(
-                integration_request(server, state, "plugin/read", params),
-                list_plugins(server, state)
-            );
+            let (detail, list) = await_integration_panel(state, renderer, async {
+                tokio::join!(
+                    integration_request(server, state, "plugin/read", params),
+                    list_plugins(server, state)
+                )
+            })
+            .await?;
             match (detail, list) {
                 (Ok(detail), Ok(list)) => {
                     let catalog = PluginCatalog::from_value(&list);
@@ -3729,11 +3741,14 @@ async fn execute_action(
                         origin,
                     );
                 }
-                (Err(error), _) | (_, Err(error)) => state.push_notice(
-                    BlockKind::Error,
-                    "Failed to load plugin details",
-                    error.to_string(),
-                ),
+                (Err(error), _) | (_, Err(error)) => {
+                    state.close_integration_loading();
+                    state.push_notice(
+                        BlockKind::Error,
+                        "Failed to load plugin details",
+                        error.to_string(),
+                    )
+                }
             }
         }
         Action::ConfirmPluginInstall(plugin) => state.confirm_plugin_install(&plugin),
@@ -3920,16 +3935,22 @@ async fn execute_action(
                 }
             }
         }
-        Action::OpenMarketplaces(notice) => match list_plugins(server, state).await {
-            Ok(response) => {
-                state.open_marketplace_picker(&PluginCatalog::from_value(&response), notice);
+        Action::OpenMarketplaces(notice) => {
+            open_integration_loading(state, renderer, "Marketplaces")?;
+            match await_integration_panel(state, renderer, list_plugins(server, state)).await? {
+                Ok(response) => {
+                    state.open_marketplace_picker(&PluginCatalog::from_value(&response), notice);
+                }
+                Err(error) => {
+                    state.close_integration_loading();
+                    state.push_notice(
+                        BlockKind::Error,
+                        "Failed to load marketplaces",
+                        error.to_string(),
+                    )
+                }
             }
-            Err(error) => state.push_notice(
-                BlockKind::Error,
-                "Failed to load marketplaces",
-                error.to_string(),
-            ),
-        },
+        }
         Action::ConfirmMarketplaceAdd(source) => state.confirm_marketplace_add(source.trim()),
         Action::ConfirmMarketplaceRemove(name) => state.confirm_marketplace_remove(name.trim()),
         Action::AddMarketplace(source) => {
@@ -4435,6 +4456,31 @@ async fn open_provider_connection(
         Err(error) => state.provider_connection_failed(error.to_string()),
     }
     Ok(())
+}
+
+/// Switches to the `/mcp` or `/plugins` panel before its data is requested, so
+/// the screen answers the key at once.
+fn open_integration_loading(
+    state: &mut AppState,
+    renderer: &mut Renderer,
+    title: &'static str,
+) -> Result<()> {
+    state.open_integration_loading(title);
+    draw(state, renderer)
+}
+
+/// Keeps the loading panel's dots moving until `request` answers. Nothing but
+/// the panel changes meanwhile, so it repaints from the same shared borrow the
+/// request holds; keys stay queued for the panel that replaces it.
+async fn await_integration_panel<T>(
+    state: &AppState,
+    renderer: &mut Renderer,
+    request: impl Future<Output = T>,
+) -> Result<T> {
+    await_with_ticks(request, Duration::from_millis(250), false, |_| {
+        renderer.render(&[], state.view())
+    })
+    .await
 }
 
 /// Clears the screen back to the welcome panel without opening a session. The next

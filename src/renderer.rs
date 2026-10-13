@@ -376,6 +376,10 @@ pub enum OverlayStyle {
     CompactPanel,
     /// A compact panel whose rows respond to keys but do not handle pointer selection.
     KeyboardOnlyCompactPanel,
+    /// A keyboard-only compact panel that takes the whole dock: its input, if
+    /// any, sits inside the panel's top edge, and neither the composer nor the
+    /// status line is drawn under it.
+    ManagementPanel,
     Picker,
     SearchPicker {
         /// Whether the embedded search field owns the keyboard focus, and with
@@ -6697,9 +6701,9 @@ const SUBAGENT_DESCRIPTION_SEPARATOR: &str = " · ";
 
 fn subagent_label_prefix(subagent: &SubagentView) -> &'static str {
     if subagent.is_background_task {
-        "background task: "
+        "Background task: "
     } else {
-        "sub agnet: "
+        "Sub agent: "
     }
 }
 
@@ -6721,9 +6725,15 @@ fn subagent_description_span(description: &str, available: usize) -> Option<Pain
 
 /// Codex는 `/root/eghis2_daily_popup`처럼 경로형 식별자를, Claude는 `devez-reviewer`처럼
 /// 하이픈 식별자를 이름으로 주므로 두 제공자 행이 같은 낱말 형태로 읽히게 정리한다.
+/// 첫 글자는 라벨처럼 대문자로 세운다.
 fn subagent_display_name(name: &str) -> String {
     let name = name.trim().strip_prefix("/root/").unwrap_or(name.trim());
-    name.replace(['_', '-'], " ")
+    let name = name.replace(['_', '-'], " ");
+    let mut chars = name.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 /// What a subagent launched sits under its row, two columns in per level. The
@@ -6744,7 +6754,7 @@ fn subagent_line(subagent: &SubagentView, index: usize, width: u16, phase: f32) 
     // first and the call description takes only what the name leaves behind.
     let fixed = 1
         + UnicodeWidthStr::width(glyph)
-        + 2
+        + 1
         + UnicodeWidthStr::width(label)
         + UnicodeWidthStr::width(elapsed.as_str());
     let indent = subagent_indent(
@@ -6760,7 +6770,7 @@ fn subagent_line(subagent: &SubagentView, index: usize, width: u16, phase: f32) 
 
     let mut picks = vec![(0, Pick::Subagent(index)), (1, Pick::Subagent(index))];
     let mut tail = vec![PaintSpan {
-        text: format!("  {label}{name}"),
+        text: format!(" {label}{name}"),
         tone: Tone::Plain,
         bold: false,
     }];
@@ -7874,6 +7884,44 @@ fn pick_panel_interior(mut line: PaintLine, panel_width: usize, pick: Pick) -> P
     line
 }
 
+/// An input drawn inside a panel's top edge, centred and at most as wide as the
+/// model search. It keeps only a plain nested border and its editor; passing no
+/// mode deliberately leaves out the composer's chrome colour. Returns the rows
+/// and the cursor's row and column within them.
+fn panel_search_lines(
+    editor: &Editor,
+    overlay: &OverlayView<'_>,
+    composer_preedit: &str,
+    panel_width: usize,
+) -> (Vec<PaintLine>, usize, usize) {
+    const SEARCH_MAX_WIDTH: usize = 48;
+    let search_width = panel_width.saturating_sub(3).min(SEARCH_MAX_WIDTH);
+    let input_width = (search_width + 1).min(u16::MAX as usize) as u16;
+    let left_inset = panel_width
+        .saturating_sub(2 + search_width)
+        .saturating_div(2);
+    let (input, cursor_line, cursor_col, _) = input_lines_with_controls(
+        editor,
+        &[],
+        composer_preedit,
+        &[],
+        input_width,
+        overlay.input_label,
+        overlay.input_placeholder,
+        None,
+        None,
+        None,
+    );
+    let lines = input
+        .into_iter()
+        .map(|mut line| {
+            line.prefix.insert_str(0, &" ".repeat(left_inset));
+            panelize_content_line(line, panel_width)
+        })
+        .collect();
+    (lines, cursor_line, cursor_col + left_inset + 1)
+}
+
 fn panelize_content_line(mut line: PaintLine, panel_width: usize) -> PaintLine {
     line.prefix.insert(0, '│');
     line.prefix_tone = Tone::Border;
@@ -8496,7 +8544,13 @@ fn overlay_frame_with_expansion(
     let mut cursor_line = lines.len();
     let mut cursor_col = 0;
     let mut composer_index = None;
-    let mut embedded_search_active = false;
+    // Set to whether the input owns the cursor once it is drawn inside the panel.
+    let mut embedded_search = None;
+    // These panels own the input, so the composer and status line stay away.
+    let docked = matches!(
+        overlay.style,
+        OverlayStyle::SearchPicker { .. } | OverlayStyle::ManagementPanel
+    );
 
     match overlay.style {
         OverlayStyle::Picker | OverlayStyle::SearchPicker { .. } => {
@@ -8520,36 +8574,14 @@ fn overlay_frame_with_expansion(
             if let OverlayStyle::SearchPicker { input_focused } = overlay.style
                 && let Some(editor) = overlay.input
             {
-                // Search belongs to the model group, not to the composer. Keep
-                // only a plain nested border and its editor; passing no mode
-                // deliberately removes the selected model's chrome colour.
-                const MODEL_SEARCH_MAX_WIDTH: usize = 48;
-                let search_width = panel_width.saturating_sub(3).min(MODEL_SEARCH_MAX_WIDTH);
-                let input_width = (search_width + 1).min(u16::MAX as usize) as u16;
-                let left_inset = panel_width
-                    .saturating_sub(2 + search_width)
-                    .saturating_div(2);
-                let (input, input_cursor_line, input_cursor_col, _) = input_lines_with_controls(
-                    editor,
-                    &[],
-                    composer_preedit,
-                    &[],
-                    input_width,
-                    overlay.input_label,
-                    overlay.input_placeholder,
-                    None,
-                    None,
-                    None,
-                );
-                if input_focused {
-                    cursor_line = lines.len() + input_cursor_line;
-                    cursor_col = input_cursor_col + left_inset + 1;
-                    embedded_search_active = true;
-                }
-                lines.extend(input.into_iter().map(|mut line| {
-                    line.prefix.insert_str(0, &" ".repeat(left_inset));
-                    panelize_content_line(line, panel_width)
-                }));
+                let (input, input_cursor_line, input_cursor_col) =
+                    panel_search_lines(editor, &overlay, composer_preedit, panel_width);
+                // Typing reaches the search even while the list holds the focus,
+                // so a hidden cursor still waits there for an IME composition.
+                cursor_line = lines.len() + input_cursor_line;
+                cursor_col = input_cursor_col;
+                embedded_search = Some(input_focused);
+                lines.extend(input);
                 lines.push(panel_padding_row(panel_width));
             }
 
@@ -8652,7 +8684,9 @@ fn overlay_frame_with_expansion(
             lines.push(panel_padding_row(panel_width));
             lines.push(panel_rule_row("╰─ ", &overlay.hint, '╯', panel_width));
         }
-        OverlayStyle::CompactPanel | OverlayStyle::KeyboardOnlyCompactPanel => {
+        OverlayStyle::CompactPanel
+        | OverlayStyle::KeyboardOnlyCompactPanel
+        | OverlayStyle::ManagementPanel => {
             let mouse_rows = overlay.style == OverlayStyle::CompactPanel;
             /// Blank columns kept before the right border so a truncated row
             /// never crowds the box.
@@ -8667,6 +8701,18 @@ fn overlay_frame_with_expansion(
                 overlay.closable,
             ));
             lines.push(panel_padding_row(panel_width));
+            if overlay.style == OverlayStyle::ManagementPanel
+                && let Some(editor) = overlay.input
+            {
+                // Typing always edits this field, so it always holds the cursor.
+                let (input, input_cursor_line, input_cursor_col) =
+                    panel_search_lines(editor, &overlay, composer_preedit, panel_width);
+                cursor_line = lines.len() + input_cursor_line;
+                cursor_col = input_cursor_col;
+                embedded_search = Some(true);
+                lines.extend(input);
+                lines.push(panel_padding_row(panel_width));
+            }
             for (row_index, row) in overlay.lines.iter().enumerate() {
                 let marker = if row.selected { "❯" } else { " " };
                 let mut line = panel_line_keep_left_inset(
@@ -8962,9 +9008,9 @@ fn overlay_frame_with_expansion(
         cursor_line = line;
         cursor_col = column;
         true
-    } else if embedded_search_active {
-        true
-    } else if let Some(editor) = overlay.input {
+    } else if let Some(focused) = embedded_search {
+        focused
+    } else if let Some(editor) = overlay.input.filter(|_| !docked) {
         // The composer rule reads as part of the picker without this gap.
         lines.push(PaintLine::blank());
         // A picker's own input is not the composer, so a drag over it stays a
@@ -8994,7 +9040,7 @@ fn overlay_frame_with_expansion(
     } else {
         0
     };
-    if status.fallback != HIDDEN_STATUS_LINE {
+    if status.fallback != HIDDEN_STATUS_LINE && !docked {
         lines.push(PaintLine::blank());
         lines.push(status_line_row(
             status.line,
@@ -20000,11 +20046,11 @@ mod tests {
         child.depth = 1;
         assert_eq!(
             painted(&subagent_line(&parent, 0, 80, 0.0)),
-            " ⠋  sub agnet: explore · 40s"
+            " ⠋ Sub agent: Explore · 40s"
         );
         assert_eq!(
             painted(&subagent_line(&child, 1, 80, 0.0)),
-            "   ⠋  background task: Bash · npm run dev · 12s"
+            "   ⠋ Background task: Bash · npm run dev · 12s"
         );
         // A deep chain stops at four levels, and on a narrow row the indent
         // gives way before the name does.
@@ -20014,15 +20060,15 @@ mod tests {
                 .starts_with(&format!(" {}⠋", " ".repeat(8)))
         );
         let deep = subagent_line(&child, 1, 32, 0.0);
-        assert!(painted(&deep).starts_with(" ⠋  background task: Bash"));
+        assert!(painted(&deep).starts_with(" ⠋ Background task: Bash"));
         assert!(painted_line_width(&deep) <= 32);
         let deep_panel = side_panel_subagent_lines(&[child.clone()], 30);
-        assert!(painted(&deep_panel[2]).starts_with("• background task: Bash"));
+        assert!(painted(&deep_panel[2]).starts_with("• Background task: Bash"));
         assert!(painted_line_width(&deep_panel[2]) <= 30);
         child.depth = 1;
         let panel = side_panel_subagent_lines(&[parent, child], 80);
-        assert_eq!(painted(&panel[2]), "• sub agnet: explore · 40s");
-        assert_eq!(painted(&panel[3]), "  • background task: Bash · npm run dev · 12s");
+        assert_eq!(painted(&panel[2]), "• Sub agent: Explore · 40s");
+        assert_eq!(painted(&panel[3]), "  • Background task: Bash · npm run dev · 12s");
     }
 
     #[test]
@@ -20033,22 +20079,22 @@ mod tests {
             let line = subagent_line(&task, 0, 80, 0.0);
             assert_eq!(
                 painted(&line),
-                format!(" ⠋  background task: {name} · npm test · 29s")
+                format!(" ⠋ Background task: {name} · npm test · 29s")
             );
-            assert_eq!(pick_on(&line, "background task:"), Some(Pick::Subagent(0)));
+            assert_eq!(pick_on(&line, "Background task:"), Some(Pick::Subagent(0)));
             assert_eq!(pick_on(&line, "npm test"), Some(Pick::Subagent(0)));
             assert_eq!(pick_on(&line, "29s"), None);
             let lines = side_panel_subagent_lines(&[task.clone()], 80);
             assert_eq!(
                 painted(&lines[2]),
-                format!("• background task: {name} · npm test · 29s")
+                format!("• Background task: {name} · npm test · 29s")
             );
             let narrow = subagent_line(&task, 0, 32, 0.0);
-            assert!(painted(&narrow).starts_with(" ⠋  background task: "));
+            assert!(painted(&narrow).starts_with(" ⠋ Background task: "));
             assert!(painted(&narrow).ends_with(" · 29s"));
             assert!(painted_line_width(&narrow) <= 32);
             let narrow_panel = side_panel_subagent_lines(&[task], 32);
-            assert!(painted(&narrow_panel[2]).starts_with("• background task: "));
+            assert!(painted(&narrow_panel[2]).starts_with("• Background task: "));
             assert!(painted(&narrow_panel[2]).ends_with(" · 29s"));
             assert!(painted_line_width(&narrow_panel[2]) <= 32);
         }
@@ -20117,8 +20163,8 @@ mod tests {
                 .map(painted)
                 .collect::<Vec<_>>(),
             [
-                " ⠋  sub agnet: Explore · Find auth code · 1m 33s",
-                " ⠋  sub agnet: developer · Fix the parser · 3s",
+                " ⠋ Sub agent: Explore · Find auth code · 1m 33s",
+                " ⠋ Sub agent: Developer · Fix the parser · 3s",
             ]
         );
     }
@@ -20129,7 +20175,7 @@ mod tests {
 
         assert_eq!(
             painted(&subagent_line(&subagent, 0, 80, 0.0)),
-            " ⠋  sub agnet: Explore · 4s"
+            " ⠋ Sub agent: Explore · 4s"
         );
     }
 
@@ -20140,11 +20186,11 @@ mod tests {
 
         assert_eq!(
             painted(&subagent_line(&codex, 0, 80, 0.0)),
-            " ⠋  sub agnet: eghis2 daily popup · 28s"
+            " ⠋ Sub agent: Eghis2 daily popup · 28s"
         );
         assert_eq!(
             painted(&subagent_line(&claude, 1, 80, 0.0)),
-            " ⠋  sub agnet: devez reviewer · 변경 검토 · 3s"
+            " ⠋ Sub agent: Devez reviewer · 변경 검토 · 3s"
         );
     }
 
@@ -20160,12 +20206,12 @@ mod tests {
         let line = subagent_line(&subagent, 0, 30, 0.0);
 
         assert!(!painted(&line).contains("hidden"));
-        assert!(painted(&line).starts_with(" ⠋  sub agnet: "));
+        assert!(painted(&line).starts_with(" ⠋ Sub agent: "));
         assert!(painted(&line).ends_with(" · 1m 33s"));
         assert!(painted_line_width(&line) <= 30);
 
         let lines = side_panel_subagent_lines(&[subagent], 30);
-        assert!(painted(&lines[2]).starts_with("• sub agnet: "));
+        assert!(painted(&lines[2]).starts_with("• Sub agent: "));
         assert!(painted(&lines[2]).ends_with(" · 1m 33s"));
         assert!(painted_line_width(&lines[2]) <= 30);
     }
@@ -20193,10 +20239,10 @@ mod tests {
         );
 
         assert_eq!(pick_on(&lines[0], "⠋"), Some(Pick::Subagent(0)));
-        assert_eq!(pick_on(&lines[0], "sub agnet:"), Some(Pick::Subagent(0)));
+        assert_eq!(pick_on(&lines[0], "Sub agent:"), Some(Pick::Subagent(0)));
         assert_eq!(pick_on(&lines[0], "Explore"), Some(Pick::Subagent(0)));
         assert_eq!(pick_on(&lines[0], "Find auth code"), Some(Pick::Subagent(0)));
-        assert_eq!(pick_on(&lines[1], "developer"), Some(Pick::Subagent(1)));
+        assert_eq!(pick_on(&lines[1], "Developer"), Some(Pick::Subagent(1)));
         assert_eq!(pick_on(&lines[0], "4s"), None);
     }
 
@@ -20213,15 +20259,15 @@ mod tests {
         assert!(lines[1] == PaintLine::blank());
         assert_eq!(
             painted(&lines[2]),
-            "• sub agnet: Explore · Find auth c… · 1m 33s"
+            "• Sub agent: Explore · Find auth c… · 1m 33s"
         );
         assert_eq!(
             painted(&lines[3]),
-            "• sub agnet: developer · Fix the parser · 3s"
+            "• Sub agent: Developer · Fix the parser · 3s"
         );
         assert_eq!(pick_on(&lines[2], "Explore"), Some(Pick::Subagent(0)));
         assert_eq!(pick_on(&lines[2], "1m 33s"), Some(Pick::Subagent(0)));
-        assert_eq!(pick_on(&lines[3], "developer"), Some(Pick::Subagent(1)));
+        assert_eq!(pick_on(&lines[3], "Developer"), Some(Pick::Subagent(1)));
         assert!(lines[4] == PaintLine::blank());
         assert_eq!(lines[5].tone, Tone::SidePanelDivider);
         assert!(lines.iter().all(|line| painted_line_width(line) <= 44));
@@ -26718,6 +26764,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn docked_panels_keep_their_input_on_top_and_end_at_the_bottom_edge() {
+        let mut editor = Editor::default();
+        editor.insert_str("zzz");
+        for style in [
+            OverlayStyle::ManagementPanel,
+            OverlayStyle::SearchPicker {
+                input_focused: false,
+            },
+        ] {
+            let frame = overlay_frame(
+                &[],
+                OverlayView {
+                    closable: false,
+                    title: "MCP".to_owned(),
+                    lines: vec![OverlayLine {
+                        text: "github".to_owned(),
+                        selected: true,
+                        muted: false,
+                    }],
+                    slider: None,
+                    hint: "Close Esc".to_owned(),
+                    style,
+                    input: Some(&editor),
+                    input_label: "",
+                    input_placeholder: "Search by server or tool name…",
+                },
+                None,
+                StatusArea {
+                    fallback: String::new(),
+                    line: None,
+                    diff_reference_lines: None,
+                    side_panel_open: false,
+                    composer_notice: None,
+                    composer_mode: None,
+                },
+                80,
+            );
+            let painted_lines = frame.lines.iter().map(painted).collect::<Vec<_>>();
+            let search = painted_lines
+                .iter()
+                .position(|line| line.contains("zzz"))
+                .expect("search inside the panel");
+            let row = painted_lines
+                .iter()
+                .position(|line| line.contains("github"))
+                .expect("panel row");
+
+            assert!(search < row);
+            assert!(painted_lines[search].starts_with('│'));
+            assert_eq!(frame.composer_index, None);
+            assert!(
+                painted_lines.last().expect("rows").contains('╰'),
+                "no composer or status line follows the panel"
+            );
+            // Typing reaches the search either way; the model list only hides
+            // the cursor while it holds the focus.
+            assert_eq!(frame.show_cursor, style == OverlayStyle::ManagementPanel);
+            assert_eq!(frame.cursor_line, search);
+        }
+    }
+
     /// A picker docks over the transcript, so opening `/model`, `/effort` or
     /// `/resume` used to blank the welcome card for as long as it was up.
     #[test]
@@ -26977,11 +27085,10 @@ mod tests {
 
     #[test]
     fn every_overlay_keeps_exactly_one_blank_row_before_the_statusline() {
+        // Docked panels draw no status line; see
+        // `docked_panels_keep_their_input_on_top_and_end_at_the_bottom_edge`.
         for style in [
             OverlayStyle::Picker,
-            OverlayStyle::SearchPicker {
-                input_focused: true,
-            },
             OverlayStyle::Panel,
             OverlayStyle::KeyboardOnlyPanel,
             OverlayStyle::CompactPanel,

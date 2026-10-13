@@ -6,6 +6,8 @@
 //! then reopened with fresh data. Keeping RPC out of here is what lets every
 //! navigation and filtering rule be unit-tested without a live server.
 
+use std::time::Instant;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::Value;
 use crate::terminal_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -63,6 +65,29 @@ fn pad_management_rows(lines: &mut Vec<OverlayLine>) {
         selected: false,
         muted: true,
     });
+}
+
+/// The panel shown while its list is still loading, as tall as the list it
+/// becomes. The dots step four times a second from `started`.
+pub fn loading_view(title: &str, started: Instant) -> OverlayView<'static> {
+    let dots = (started.elapsed().as_millis() / 250 % 4) as usize;
+    let mut lines = vec![OverlayLine {
+        text: format!("Loading{}", ".".repeat(dots)),
+        selected: false,
+        muted: false,
+    }];
+    pad_management_rows(&mut lines);
+    OverlayView {
+        closable: false,
+        title: title.to_owned(),
+        lines,
+        slider: None,
+        hint: "Please wait…".to_owned(),
+        style: OverlayStyle::ManagementPanel,
+        input: None,
+        input_label: "",
+        input_placeholder: "",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -377,8 +402,9 @@ impl McpPicker {
                 .selected_server()
                 .map(|server| McpPickerResult::Reconnect(server.name.clone()))
                 .unwrap_or(McpPickerResult::None),
+            // Letters belong to the search field here; sign-in lives on the
+            // detail page, where nothing is typed.
             KeyCode::Char(' ') => self.toggle_selected(),
-            KeyCode::Char('l') => self.login_selected(),
             KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
                 McpPickerResult::None
@@ -611,8 +637,8 @@ impl McpPicker {
             hint: self
                 .notice
                 .clone()
-                .unwrap_or_else(|| "Move ↑↓  ·  Toggle Space  ·  Details Enter  ·  Sign in L  ·  Reconnect Ctrl+R  ·  Close Esc".to_owned()),
-            style: OverlayStyle::KeyboardOnlyCompactPanel,
+                .unwrap_or_else(|| "Move ↑↓  ·  Toggle Space  ·  Details Enter  ·  Reconnect Ctrl+R  ·  Close Esc".to_owned()),
+            style: OverlayStyle::ManagementPanel,
             input: Some(&self.query),
             input_label: "",
             input_placeholder: "Search by server or tool name…",
@@ -631,7 +657,7 @@ impl McpPicker {
                 }],
                 slider: None,
                 hint: "Esc Back".to_owned(),
-                style: OverlayStyle::KeyboardOnlyPanel,
+                style: OverlayStyle::ManagementPanel,
                 input: None,
                 input_label: "",
                 input_placeholder: "",
@@ -739,7 +765,7 @@ impl McpPicker {
             lines,
             slider: None,
             hint,
-            style: OverlayStyle::KeyboardOnlyCompactPanel,
+            style: OverlayStyle::ManagementPanel,
             input: None,
             input_label: "",
             input_placeholder: "",
@@ -1616,7 +1642,7 @@ impl PluginPicker {
                 .unwrap_or_else(|| {
                     "Move ↑↓  ·  Open Enter  ·  Marketplaces M  ·  Close Esc".to_owned()
                 }),
-            style: OverlayStyle::KeyboardOnlyCompactPanel,
+            style: OverlayStyle::ManagementPanel,
             input: None,
             input_label: "",
             input_placeholder: "",
@@ -1685,7 +1711,7 @@ impl PluginPicker {
                 .notice
                 .clone()
                 .unwrap_or_else(|| "Move ↑↓  ·  Toggle Space  ·  Details Enter  ·  Back Esc".to_owned()),
-            style: OverlayStyle::KeyboardOnlyCompactPanel,
+            style: OverlayStyle::ManagementPanel,
             input: Some(&self.query),
             input_label: "",
             input_placeholder: "Search plugins…",
@@ -1817,7 +1843,7 @@ impl PluginPicker {
                 }],
                 slider: None,
                 hint: "Esc Back".to_owned(),
-                style: OverlayStyle::KeyboardOnlyPanel,
+                style: OverlayStyle::ManagementPanel,
                 input: None,
                 input_label: "",
                 input_placeholder: "",
@@ -1853,7 +1879,7 @@ impl PluginPicker {
             lines,
             slider: None,
             hint: self.notice.clone().unwrap_or_else(|| actions.join("  ")),
-            style: OverlayStyle::KeyboardOnlyCompactPanel,
+            style: OverlayStyle::ManagementPanel,
             input: None,
             input_label: "",
             input_placeholder: "",
@@ -2048,7 +2074,7 @@ impl MarketplacePicker {
                     .notice
                     .clone()
                     .unwrap_or_else(|| "Enter Add  Esc Cancel".to_owned()),
-                style: OverlayStyle::KeyboardOnlyPanel,
+                style: OverlayStyle::ManagementPanel,
                 input: Some(source),
                 input_label: "Source",
                 input_placeholder: "owner/repo or ./path",
@@ -2094,7 +2120,7 @@ impl MarketplacePicker {
             hint: self.notice.clone().unwrap_or_else(|| {
                 "A Add  X Remove  U Refresh all Git marketplaces  Esc Back".to_owned()
             }),
-            style: OverlayStyle::KeyboardOnlyCompactPanel,
+            style: OverlayStyle::ManagementPanel,
             input: None,
             input_label: "",
             input_placeholder: "",
@@ -2224,7 +2250,7 @@ mod tests {
         assert_eq!(mcp.lines.len(), MANAGEMENT_ROWS);
         assert!(matches!(
             mcp.style,
-            OverlayStyle::KeyboardOnlyCompactPanel
+            OverlayStyle::ManagementPanel
         ));
         assert!(mcp.lines[0].text.contains("1 tool"));
         assert!(mcp.lines.iter().all(|line| !line.text.contains('\n')));
@@ -2237,7 +2263,7 @@ mod tests {
         assert_eq!(plugins.lines.len(), MANAGEMENT_ROWS);
         assert!(matches!(
             plugins.style,
-            OverlayStyle::KeyboardOnlyCompactPanel
+            OverlayStyle::ManagementPanel
         ));
         assert!(plugins.lines.iter().all(|line| !line.text.contains('\n')));
 
@@ -2247,7 +2273,7 @@ mod tests {
         assert_eq!(marketplaces.lines.len(), MANAGEMENT_ROWS);
         assert!(matches!(
             marketplaces.style,
-            OverlayStyle::KeyboardOnlyCompactPanel
+            OverlayStyle::ManagementPanel
         ));
         assert!(
             marketplaces
@@ -2454,6 +2480,32 @@ mod tests {
         assert_eq!(picker.selected, 0);
         assert_eq!(picker.filtered().len(), 1);
         assert_eq!(picker.filtered()[0].name, "chrome-devtools");
+    }
+
+    #[test]
+    fn mcp_list_types_letters_into_search_instead_of_signing_in() {
+        let mut picker = McpPicker::new(McpServerInfo::list_from_value(&mcp_response()));
+        // github needs a sign-in, which `l` used to start from the list.
+        picker.handle_key(press(KeyCode::Down));
+        assert!(matches!(
+            picker.handle_key(press(KeyCode::Char('l'))),
+            McpPickerResult::None
+        ));
+        assert_eq!(picker.query.text(), "l");
+    }
+
+    #[test]
+    fn loading_panel_is_as_tall_as_the_list_it_becomes() {
+        let view = loading_view("MCP", Instant::now());
+        assert_eq!(view.title, "MCP");
+        assert_eq!(view.lines.len(), MANAGEMENT_ROWS);
+        assert_eq!(view.lines[0].text, "Loading");
+        assert!(matches!(view.style, OverlayStyle::ManagementPanel));
+
+        let started = Instant::now()
+            .checked_sub(std::time::Duration::from_millis(875))
+            .expect("uptime");
+        assert_eq!(loading_view("MCP", started).lines[0].text, "Loading...");
     }
 
     #[test]
