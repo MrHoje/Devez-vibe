@@ -1067,8 +1067,8 @@ mod tests {
             bridge.contains("if (SUBAGENT_TOOLS.includes(name)) startSubagent(session, block);")
         );
         assert!(bridge.contains("recordSubagentMessage(session, message)"));
-        assert!(bridge.contains("recordSubagentResult(session, message)"));
-        assert!(bridge.contains("notify(\"turn/subagent/line\""));
+        // A row's `x` stops that task alone, by the SDK task id the row resolves to.
+        assert!(bridge.contains("await session.query.stopTask(running.taskId);"));
         // The artifact row under the status line listens for this method name.
         assert!(bridge.contains("notify(\"turn/artifact/published\""));
         // A resume replays the transcript's published pages into that row.

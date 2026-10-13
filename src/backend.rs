@@ -714,6 +714,35 @@ impl BackendServer {
                     self.codex()?.request(method, params).await
                 }
             }
+            // 하위 에이전트 행의 x. 행 id는 Claude에서는 브리지가 아는 작업 행,
+            // Codex에서는 자식 스레드 id다.
+            "subagent/stop" => {
+                let visible = thread_id(&params)?;
+                let id = params.get("id").and_then(Value::as_str).unwrap_or_default();
+                match self.route_kind(visible) {
+                    RuntimeKind::Claude => {
+                        let backing = self.backing_id(visible, RuntimeKind::Claude)?;
+                        self.claude
+                            .request("session/stopTask", json!({ "sessionId": backing, "id": id }))
+                            .await
+                    }
+                    // 순정 TUI처럼 자식 스레드의 진행 중 턴을 중단한다. 턴 id는 화면이
+                    // 자식의 `turn/started`에서 받아 둔 것이다.
+                    RuntimeKind::Codex => {
+                        let turn = params.get("turnId").and_then(Value::as_str).context(tr(
+                            "하위 에이전트의 진행 중인 턴을 찾지 못했습니다.",
+                            "Couldn't find the subagent's turn in progress.",
+                        ))?;
+                        self.codex()?
+                            .request("turn/interrupt", json!({ "threadId": id, "turnId": turn }))
+                            .await
+                    }
+                    RuntimeKind::OpenCode => Err(anyhow::anyhow!(tr(
+                        "OpenCode provider는 하위 에이전트 하나만 멈추는 기능을 지원하지 않습니다.",
+                        "The OpenCode provider can't stop a single subagent.",
+                    ))),
+                }
+            }
             "thread/fork" => {
                 let visible = thread_id(&params)?;
                 let cwd = request_cwd(&params)

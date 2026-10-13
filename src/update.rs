@@ -23,14 +23,18 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "`/mcp`·`/plugins`는 불러오는 동안 화면이 멈추지 않고 바로 패널로 바뀌어 Loading을 표시합니다.",
-    "컴포저 아래 하위 에이전트·백그라운드 작업 줄에서 라벨 오타를 고치고, 이름을 대문자로 시작하게 표시합니다.",
+    "Codex 세션을 포크하거나 재개할 때 추론 수준이 초기화되던 문제를 고쳤습니다.",
+    "목록·대기 프롬프트·diff 인용이 떠도 상태 줄이 컴포저 바로 위에 남습니다.",
+    "하위 에이전트·백그라운드 작업 줄의 `x`로 그 작업만 멈춥니다. 활동 기록 창은 없앴습니다.",
+    "Claude Code가 비정상 종료돼도 다음 요청에서 대화를 자동으로 이어 갑니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "`/mcp` and `/plugins` switch to their panel at once and show Loading instead of freezing the screen while they load.",
-    "Fixed a label typo on the subagent and background task rows under the composer, and their names now start with a capital letter.",
+    "Fixed forked or resumed Codex sessions resetting their reasoning effort.",
+    "Status rows stay right above the composer when lists, queued prompts or diff quotes appear.",
+    "The `x` on a subagent or background task row stops just that task. The activity log window is gone.",
+    "When Claude Code exits abnormally, the next request continues the conversation automatically.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

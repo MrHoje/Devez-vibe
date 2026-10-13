@@ -1949,6 +1949,15 @@ async function createSession(params, resumeId) {
       clearUsageLimitWait(session);
       if (session.turn) finishTurn(session, new Error("Claude 연결이 종료되었습니다."));
       clearSubagents(session);
+      // A crashed CLI (Windows reports an access violation as exit code
+      // 3221225477) leaves a query that rejects every later request. Dropping
+      // the session makes the next prompt fail as missing, which the host answers
+      // by resuming it from the transcript instead of the user reopening it.
+      if (sessions.get(session.id) === session) {
+        sessions.delete(session.id);
+        session.queue.close();
+        session.query.close();
+      }
     });
   session.consumer = consumer;
   let initialization;
@@ -2766,7 +2775,7 @@ function upsertStructuredSubagent(session, message) {
   return running;
 }
 
-function finishStructuredSubagent(session, message, kind, text) {
+function finishStructuredSubagent(session, message) {
   const taskId = firstLine(message.task_id || "", 80);
   const toolUseId = firstLine(message.tool_use_id || "", 80);
   const wasTranscriptHidden = taskId
@@ -2779,7 +2788,6 @@ function finishStructuredSubagent(session, message, kind, text) {
   const running = (toolUseId && findSubagent(session, toolUseId))
     || (taskId && findSubagent(session, taskId));
   if (!running) return wasHidden;
-  emitSubagentLine(session, running.id, { kind, text });
   session.subagents.delete(running.id);
   emitSubagents(session);
   return true;
@@ -2879,25 +2887,14 @@ function processSubagentSystemMessage(session, message) {
     if (!running) return false;
     const tool = firstLine(message.last_tool_name || "", 80);
     if (tool) running.tool = tool;
-    const summary = firstLine(message.summary || "", 200);
-    if (summary && summary !== running.lastSummary) {
-      running.lastSummary = summary;
-      emitSubagentLine(session, running.id, { kind: "result", text: summary });
-    }
     emitSubagents(session);
     return true;
   }
   if (message.subtype === "task_updated") {
     const taskId = firstLine(message.task_id || "", 80);
     const patch = message.patch || {};
-    const status = patch.status;
-    if (["completed", "failed", "killed"].includes(status)) {
-      return finishStructuredSubagent(
-        session,
-        message,
-        status === "completed" ? "result" : "error",
-        firstLine(patch.error || status, 200),
-      );
+    if (["completed", "failed", "killed"].includes(patch.status)) {
+      return finishStructuredSubagent(session, message);
     }
     const running = taskId && findSubagent(session, taskId);
     if (!running) return false;
@@ -2914,13 +2911,7 @@ function processSubagentSystemMessage(session, message) {
       session.ambientSubagentTasks ||= new Set();
       session.ambientSubagentTasks.add(firstLine(message.task_id, 80));
     }
-    const status = firstLine(message.status || "completed", 40);
-    return finishStructuredSubagent(
-      session,
-      message,
-      status === "completed" ? "result" : "error",
-      firstLine(message.summary || status, 200),
-    );
+    return finishStructuredSubagent(session, message);
   }
   if (message.subtype === "background_tasks_changed") {
     syncBackgroundSubagents(session, message.tasks);
@@ -2929,59 +2920,22 @@ function processSubagentSystemMessage(session, message) {
   return false;
 }
 
-// 서브에이전트가 실제로 무엇을 했는지는 자식 메시지에만 남는다. 열람용 기록은 여기서
-// 한 줄씩 흘려보내고, 목록 행에 쓸 현재 도구만 따로 갱신한다.
+// 서브에이전트가 지금 무슨 도구를 돌리는지는 자식 메시지에만 남는다. 목록 행에 쓸
+// 현재 도구만 갱신한다.
 // 메시지의 agent_id는 그 하위 에이전트 작업의 task_id라 재개 뒤에도 같은 행을 찾는다.
-function messageSubagent(session, message) {
-  return findSubagent(session, message.parent_tool_use_id)
-    || (message.agent_id ? findSubagent(session, message.agent_id) : undefined);
-}
-
 function recordSubagentMessage(session, message) {
-  const running = messageSubagent(session, message);
+  const running = findSubagent(session, message.parent_tool_use_id)
+    || (message.agent_id ? findSubagent(session, message.agent_id) : undefined);
   if (!running) return;
   running.lastSeenAt = Date.now();
   const content = Array.isArray(message.message?.content) ? message.message.content : [];
   let toolChanged = false;
   for (const block of content) {
-    if (block.type === "text") {
-      const text = String(block.text || "").trim();
-      if (text) emitSubagentLine(session, running.id, { kind: "text", text });
-    } else if (block.type === "tool_use") {
-      running.tool = subagentToolLabel(block);
-      toolChanged = true;
-      emitSubagentLine(session, running.id, {
-        kind: "tool",
-        text: running.tool,
-        toolUseId: block.id,
-      });
-    }
+    if (block.type !== "tool_use") continue;
+    running.tool = subagentToolLabel(block);
+    toolChanged = true;
   }
   if (toolChanged) emitSubagents(session);
-}
-
-function recordSubagentResult(session, message) {
-  const running = messageSubagent(session, message);
-  if (!running) return;
-  running.lastSeenAt = Date.now();
-  const content = Array.isArray(message.message?.content) ? message.message.content : [];
-  for (const block of content) {
-    if (block.type !== "tool_result") continue;
-    emitSubagentLine(session, running.id, {
-      kind: block.is_error ? "error" : "result",
-      text: firstLine(toolOutput(block.content, message.tool_use_result), 200),
-      toolUseId: block.tool_use_id,
-    });
-  }
-}
-
-function emitSubagentLine(session, parentToolUseId, line) {
-  notify("turn/subagent/line", {
-    threadId: session.id,
-    turnId: session.turn?.id,
-    parentToolUseId,
-    line,
-  });
 }
 
 function subagentToolLabel(block) {
@@ -3167,10 +3121,6 @@ function finishNotifiedSubagents(session, notifications) {
       }
     }
     if (!running) continue;
-    emitSubagentLine(session, running.id, {
-      kind: notification.status === "completed" ? "result" : "error",
-      text: notification.summary || notification.status || "완료됨",
-    });
     session.subagents.delete(running.id);
     emitSubagents(session);
   }
@@ -3181,11 +3131,8 @@ function processUser(session, message) {
   // prompts. Re-processing their notification XML would invent a new turn.
   if (message.isReplay === true) return;
   // 자식 tool_result의 tool_use_id는 부모 세션의 것과 다른 공간이므로, 부모 흐름에
-  // 섞이기 전에 서브에이전트 기록으로 보낸다.
-  if (message.parent_tool_use_id) {
-    recordSubagentResult(session, message);
-    return;
-  }
+  // 섞이지 않게 버린다.
+  if (message.parent_tool_use_id) return;
   const notifications = taskNotifications(message);
   if (notifications.length) {
     if (!session.turn) {
@@ -4482,6 +4429,15 @@ async function dispatch(method, params = {}) {
     }
     return {};
   }
+  // 하위 에이전트 행의 x. 행은 도구 호출 id로 알려도 stop_task는 작업 id를 받으므로,
+  // task_started가 아직 오지 않은 행은 멈출 수 없다. 행은 종료 통지가 거둔다.
+  if (method === "session/stopTask") {
+    const session = lookupSession(params.sessionId);
+    const running = session && findSubagent(session, String(params.id || ""));
+    if (!running?.taskId) throw new Error("아직 멈출 수 있는 작업 정보가 없습니다. 잠시 후 다시 시도하세요.");
+    await session.query.stopTask(running.taskId);
+    return {};
+  }
   if (method === "session/compact") {
     return startPrompt({ ...params, input: [{ type: "text", text: "/compact" }] });
   }
@@ -5571,6 +5527,24 @@ async function runSelfTest() {
     await dispatch("session/interrupt", { sessionId: limitSession.id });
     resumeAfterUsageLimit(limitSession, cancelledWait, cancelledWait.resetsAt);
     if (limitSession.turn || retryInputs.length !== 1) throw new Error("Cancelled usage limit resumed");
+    // 행의 x는 행 id가 아니라 SDK 작업 id로 멈춘다. 작업 id를 아직 모르는 행은 거절한다.
+    const stoppedTasks = [];
+    const stopSession = {
+      id: "stop-task-self-test",
+      query: { async stopTask(taskId) { stoppedTasks.push(taskId); } },
+      subagents: new Map([
+        ["toolu_stop", { id: "toolu_stop", toolUseId: "toolu_stop", taskId: "agent-stop" }],
+        ["toolu_pending", { id: "toolu_pending", toolUseId: "toolu_pending", taskId: "" }],
+      ]),
+    };
+    sessions.set(stopSession.id, stopSession);
+    await dispatch("session/stopTask", { sessionId: stopSession.id, id: "toolu_stop" });
+    const pendingStop = await dispatch("session/stopTask", { sessionId: stopSession.id, id: "toolu_pending" })
+      .then(() => null, (error) => error);
+    sessions.delete(stopSession.id);
+    if (stoppedTasks.join() !== "agent-stop" || !pendingStop) {
+      throw new Error(`Claude per-task stop self-test failed: ${stoppedTasks}`);
+    }
     // Ultracode rides with each prompt's effort; a steer that becomes a turn keeps it.
     const flagCalls = [];
     const ultracodeSession = {
@@ -6498,9 +6472,7 @@ async function runSelfTest() {
       && event.params.item.text === "automatic summary one")
     || !lifecycleEvents.some((event) => event.method === "item/completed"
       && event.params?.item?.type === "agentMessage"
-      && event.params.item.text === "automatic summary two")
-    || !lifecycleEvents.some((event) => event.method === "turn/subagent/line"
-      && event.params?.line?.kind === "error")) {
+      && event.params.item.text === "automatic summary two")) {
     throw new Error(`Claude subagent lifecycle events self-test failed: ${lifecycleMethods}`);
   }
   const openingSession = {

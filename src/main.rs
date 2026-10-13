@@ -403,6 +403,7 @@ async fn start_session(
         thread,
         read_runtime_account_plan(server, requested_model_name),
         None,
+        false,
     )
     .await?;
     let Startup::Ready {
@@ -499,9 +500,7 @@ async fn run_after_startup(
 
     if let Some(text) = queued {
         draw(state, renderer)?;
-        if !state.thread_pending() || open_pending_thread(server, state, renderer).await? {
-            start_turn(server, state, renderer, text, None).await?;
-        }
+        start_turn(server, state, renderer, text, None).await?;
     }
     event_loop(server, state, renderer, update_rx).await
 }
@@ -640,10 +639,14 @@ async fn open_pending_thread(
         state.claude_permission_mode_setting().wire(),
         state.selected_effort(),
     );
+    // Building a session can take seconds — Claude starts its CLI first — so the
+    // screen stays live meanwhile.
     let response =
-        match await_with_activity(state, renderer, server.request("thread/start", params)).await? {
-            Ok(response) => response,
-            Err(error) => {
+        match await_session_request(server, state, renderer, "thread/start", params).await? {
+            Some(Ok(response)) => response,
+            // The input stream closed; the event loop ends on its next read.
+            None => return Ok(false),
+            Some(Err(error)) => {
                 state.set_request_failed(tr(
                     format!("세션을 시작하지 못했습니다: {error}"),
                     format!("Couldn't start the session: {error}"),
@@ -687,7 +690,9 @@ async fn open_pending_thread(
 
 /// Runs the full UI while `thread/start` is still in flight: the screen is live,
 /// the composer accepts typing, and the account plan drops in as soon as it lands.
-/// Used both at launch and by `/new`, so the wait always looks the same.
+/// Used both at launch and by `/new`, so the wait always looks the same. With
+/// `hold_session_keys`, the keys that act on the session wait for it instead
+/// (see [`waits_for_session`]), so nothing is sent while it is being built.
 async fn await_thread(
     server: &BackendServer,
     state: &mut AppState,
@@ -695,6 +700,7 @@ async fn await_thread(
     thread: impl Future<Output = Result<Value>>,
     plan: impl Future<Output = AccountPlan>,
     mut side_exit_key_guard: Option<Instant>,
+    hold_session_keys: bool,
 ) -> Result<Startup> {
     let mut composer_paste = ComposerPasteBuffer::new();
     let mut preedit_capture = PreeditCapture::default();
@@ -702,6 +708,7 @@ async fn await_thread(
     let mut spinner_tick = tokio::time::interval(Duration::from_millis(120));
     spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut queued = None;
+    let mut held: Option<Vec<input_hub::Incoming>> = hold_session_keys.then(Vec::new);
     let mut plan_pending = true;
     let mut redraw = true;
     tokio::pin!(thread);
@@ -714,10 +721,15 @@ async fn await_thread(
         let paste_deadline = composer_paste.flush_deadline();
         let action = tokio::select! {
             thread_response = &mut thread => {
-                flush_composer_paste(state, &mut composer_paste, Instant::now());
+                // The buffer ends with this wait, so text still being classified
+                // lands now rather than with it.
+                flush_composer_paste_now(state, &mut composer_paste);
                 // In practice the plan lands first, but never drop it on the floor.
                 if plan_pending {
                     state.set_account_plan(plan.as_mut().await);
+                }
+                for event in held.take().into_iter().flatten() {
+                    input_hub::defer(event);
                 }
                 return Ok(Startup::Ready {
                     thread_response: thread_response?,
@@ -731,6 +743,61 @@ async fn await_thread(
             }
             event = input_hub::next_event() => {
                 match event {
+                    // Once the session exists, Esc takes back the prompt being sent
+                    // at once, as it does while any other turn opens.
+                    Some(Ok(Event::Key(key)))
+                        if held.as_ref().is_some_and(Vec::is_empty)
+                            && is_wait_interrupt_key(&key)
+                            && state.esc_takes_back_prompt()
+                            && state.note_interrupt_while_sending() =>
+                    {
+                        Action::Tick(true)
+                    }
+                    Some(event)
+                        if held.as_ref().is_some_and(|held| {
+                            !held.is_empty()
+                                || waits_for_session(&event, state.has_pending_interaction())
+                        }) =>
+                    {
+                        if let Some(held) = held.as_mut() {
+                            hold_for_session(held, state, &mut alt_code, event);
+                        }
+                        Action::Tick(false)
+                    }
+                    Some(Ok(Event::Key(key)))
+                        if held.is_some() && matches!(key.code, KeyCode::Enter | KeyCode::Tab) =>
+                    {
+                        renderer.clear_selection();
+                        let expected = state.editor.collapsed_paste_text();
+                        let (text, passes) = split_session_key(
+                            &mut composer_paste,
+                            key,
+                            expected.as_deref(),
+                            Instant::now(),
+                        );
+                        let action = apply_composer_inputs_with_scroll(state, renderer, text);
+                        // Tab picks the role the turn opens with, and a slash or shell
+                        // command needs the session, so those wait for it. Any other
+                        // Enter acts now — a line break, a queued prompt, or a steer
+                        // that goes out once its turn has an id.
+                        let sends = !key
+                            .modifiers
+                            .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT);
+                        if !passes {
+                            action
+                        } else if key.code == KeyCode::Tab || sends && !state.enter_steers() {
+                            if let Some(held) = held.as_mut() {
+                                hold_for_session(held, state, &mut alt_code, Ok(Event::Key(key)));
+                            }
+                            action
+                        } else {
+                            apply_composer_inputs_with_scroll(
+                                state,
+                                renderer,
+                                vec![ComposerInput::Key(key)],
+                            )
+                        }
+                    }
                     Some(Ok(Event::Key(key))) if preedit_capture.claims(&key) => {
                         match preedit_capture.observe(alt_code.normalize(key)) {
                             PreeditInput::Update(text) => apply_composer_preedit_update(
@@ -825,6 +892,19 @@ async fn await_thread(
         let force_paint = composer_paste.take_force_paint();
         redraw = force_paint
             || (!matches!(&action, Action::Tick(false)) && !composer_paste.is_buffering());
+        let action = match action {
+            // Its card is already on screen; it goes out once its turn has an id,
+            // or with the session the user already picked to switch to.
+            Action::Steer(text) if held.is_some() => {
+                if state.has_deferred_resume() {
+                    state.defer_prompt(&text);
+                } else {
+                    state.defer_steer(text);
+                }
+                Action::None
+            }
+            action => action,
+        };
         match hold_until_thread(state, action, &mut queued) {
             // Listing sessions is the one server call the wait makes itself. It goes
             // straight to the RPC rather than through `execute_action`, which would
@@ -846,6 +926,115 @@ async fn await_thread(
             None => {}
         }
     }
+}
+
+/// Waits out a request the first prompt of a new session makes, with the screen
+/// live (see [`await_thread`]). The inner result is the request's own answer,
+/// kept apart from a failure of the screen; `None` when the input stream closed.
+async fn await_session_request(
+    server: &BackendServer,
+    state: &mut AppState,
+    renderer: &mut Renderer,
+    method: &str,
+    params: Value,
+) -> Result<Option<Result<Value>>> {
+    let plan = std::future::ready(state.account_plan().clone());
+    let mut answer = None;
+    let request = async {
+        answer = Some(server.request(method, params).await);
+        Ok(Value::Null)
+    };
+    let waited = await_thread(server, state, renderer, request, plan, None, true).await?;
+    Ok(match waited {
+        Startup::Ready { queued, .. } => {
+            // Sends steer while a session opens (see `defer_steer`); none queue.
+            debug_assert!(queued.is_none(), "a held wait queued {queued:?}");
+            answer
+        }
+        Startup::Quit => None,
+    })
+}
+
+/// The keys and clicks that act on the session rather than on the composer
+/// text: cancel, quit, role and mode switches, and every key an open dialog
+/// takes. They keep waiting for the session as before, and so does everything
+/// after the first of them, so the event loop still sees the order they were
+/// typed in. Pasting and word edits stay live, and `Enter` and `Tab` are sorted
+/// where [`split_session_key`] is used.
+fn waits_for_session(event: &input_hub::Incoming, interacting: bool) -> bool {
+    match event {
+        Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
+            let chord = key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+            let word_edit = key.modifiers == KeyModifiers::CONTROL
+                && matches!(
+                    key.code,
+                    KeyCode::Backspace | KeyCode::Delete | KeyCode::Left | KeyCode::Right
+                );
+            interacting
+                || matches!(key.code, KeyCode::Esc | KeyCode::BackTab | KeyCode::F(_))
+                // Shifted arrows pick the model and effort the session opens on.
+                || key.modifiers.contains(KeyModifiers::SHIFT)
+                    && matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right)
+                || chord && key.code != KeyCode::Enter && !word_edit && !is_paste_shortcut(key)
+        }
+        Ok(Event::Mouse(mouse)) => !matches!(
+            mouse.kind,
+            MouseEventKind::Moved
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+        ),
+        _ => false,
+    }
+}
+
+/// Feeds an `Enter` or `Tab` through the paste run it may belong to. Returns
+/// the text the run let go and whether the key passes on as a key — a send, a
+/// line break or a role switch — rather than as a line of the paste.
+fn split_session_key(
+    buffer: &mut ComposerPasteBuffer,
+    key: KeyEvent,
+    expected_paste: Option<&str>,
+    now: Instant,
+) -> (Vec<ComposerInput>, bool) {
+    let (keys, text): (Vec<_>, Vec<_>) = buffer
+        .observe_expected(key, now, expected_paste)
+        .into_iter()
+        .partition(|input| matches!(input, ComposerInput::Key(_)));
+    (text, !keys.is_empty())
+}
+
+/// Sets an event aside for the event loop, as [`await_with_activity`] does. The
+/// release of a key this wait already typed is dropped instead: replayed alone,
+/// it would read as an Alt code and type the character a second time.
+fn hold_for_session(
+    held: &mut Vec<input_hub::Incoming>,
+    state: &mut AppState,
+    alt_code: &mut AltCodeKeys,
+    event: input_hub::Incoming,
+) {
+    let typed = match &event {
+        Ok(Event::Key(key)) if key.kind == KeyEventKind::Release => {
+            if matches!(key.code, KeyCode::Char(_))
+                && alt_code.normalize(*key).kind == KeyEventKind::Release
+            {
+                return;
+            }
+            false
+        }
+        Ok(Event::Key(key)) => key.code != KeyCode::Esc,
+        Ok(Event::Paste(_)) => true,
+        _ => false,
+    };
+    // Held keys land after a failure has put the sent prompt back, and would be
+    // glued onto it.
+    if typed {
+        state.forget_unsent_prompt();
+    }
+    held.push(event);
 }
 
 /// Splits actions into what can run before the session exists and what cannot.
@@ -1522,31 +1711,13 @@ async fn execute_split_conversation_action(
         }
         Action::Steer(text) => {
             let Some(turn_id) = state.turn_id.clone() else {
-                // The prompt before this one is still opening its turn; it isn't unsent.
-                state.forget_unsent_prompt();
-                state.set_request_failed(tr(
-                    "활성 turn ID가 없어 추가 입력을 보낼 수 없습니다.",
-                    "There is no active turn ID, so the follow-up input can't be sent.",
-                ));
+                // The prompt before this one is still opening its turn; this one
+                // steers it once that turn has an id.
+                state.defer_steer(text);
                 return Ok(false);
             };
-            devezcode::note_prompt(&text);
-            let input = state.turn_input(text);
-            if let Err(error) = server
-                .request(
-                    "turn/steer",
-                    json!({
-                        "threadId": state.thread_id,
-                        "expectedTurnId": turn_id,
-                        "input": input,
-                        "additionalContext": {
-                            "devez-vibe-knowledge": auto_knowledge_context(state.auto_knowledge())
-                        }
-                    }),
-                )
-                .await
-            {
-                state.push_notice(BlockKind::Error, "Follow-up input failed", error.to_string());
+            let input = state.turn_input(text.clone());
+            if !steer_turn(server, state, turn_id, &text, input, false).await {
                 state.restore_unsent_steer();
             }
             Ok(false)
@@ -1596,6 +1767,13 @@ async fn event_loop(
     loop {
         if let Some(thread_id) = state.take_cost_restore() {
             cost_restore_rx = Some(start_cost_restore(thread_id));
+        }
+        let mut steered = send_early_steers(server, state, true).await;
+        if let Some(btw) = btw_state.as_mut() {
+            steered |= send_early_steers(server, btw, false).await;
+        }
+        if steered {
+            draw_conversations(state, &mut btw_state, split_focus, renderer)?;
         }
         let subagent_probes = state.take_codex_subagent_probes();
         if !subagent_probes.is_empty() {
@@ -2551,7 +2729,7 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
         Pick::AgentMode => state.click_agent_mode(),
         Pick::Model => state.run_command("/model"),
         Pick::EffortSetting => state.run_command("/effort"),
-        Pick::Subagent(index) => state.open_subagent(index),
+        Pick::StopSubagent(id) => state.stop_subagent(id),
         Pick::ScrollToBottom => Action::ScrollToBottom,
         Pick::History(_) => Action::None,
         Pick::Prompt(block_id) => Action::ScrollToPrompt(block_id),
@@ -2881,42 +3059,18 @@ async fn execute_action(
             // first prompt after a provider switch — would otherwise hold the frame
             // for the whole round trip and read as a stall in the composer.
             draw(state, renderer)?;
-            // A session that does not exist yet is built here, by the prompt that
-            // needs it, so it is named after the runtime this prompt runs on.
-            if state.thread_pending() && !open_pending_thread(server, state, renderer).await? {
-                return Ok(false);
-            }
             start_turn(server, state, renderer, text, Some(handoff)).await?
         }
         Action::Steer(text) => {
             renderer.scroll_to_bottom();
             let Some(turn_id) = state.turn_id.clone() else {
-                // The prompt before this one is still opening its turn; it isn't unsent.
-                state.forget_unsent_prompt();
-                state.set_request_failed(tr(
-                    "활성 turn ID가 없어 추가 입력을 보낼 수 없습니다.",
-                    "There is no active turn ID, so the follow-up input can't be sent.",
-                ));
+                // The prompt before this one is still opening its turn; this one
+                // steers it once that turn has an id.
+                state.defer_steer(text);
                 return Ok(false);
             };
-            devezcode::note_prompt(&text);
-            let input = state.turn_input(text);
-            let mut params = json!({
-                "threadId": state.thread_id,
-                "expectedTurnId": turn_id,
-                "input": input,
-                "additionalContext": {
-                    "devez-vibe-knowledge": auto_knowledge_context(state.auto_knowledge())
-                }
-            });
-            // The running turn keeps its own role, but the turn this input lands
-            // in may be a fresh one the backend had to reopen. Carrying the role's
-            // write restriction along is what keeps a read-only role read-only then.
-            if let Some(policy) = state.agent_mode().tool_policy() {
-                params["toolPolicy"] = policy;
-            }
-            if let Err(error) = server.request("turn/steer", params).await {
-                state.push_notice(BlockKind::Error, "Follow-up input failed", error.to_string());
+            let input = state.turn_input(text.clone());
+            if !steer_turn(server, state, turn_id, &text, input, true).await {
                 state.restore_unsent_steer();
             }
         }
@@ -2924,6 +3078,18 @@ async fn execute_action(
         Action::RunUpdate => start_self_update(management_tx.clone()),
         Action::Interrupt => {
             interrupt_turn(server, state).await;
+        }
+        // 행은 런타임의 종료 알림이 걷는다. 여기서는 실패만 알린다.
+        Action::StopSubagent { id, turn } => {
+            if let Err(error) = server
+                .request(
+                    "subagent/stop",
+                    json!({ "threadId": state.thread_id, "id": id, "turnId": turn }),
+                )
+                .await
+            {
+                state.push_notice(BlockKind::Error, "Subagent stop failed", error.to_string());
+            }
         }
         // Claude's bridge understands cancellation. Codex's typed answer does
         // not: interrupt its turn without ever releasing an empty answer.
@@ -2993,6 +3159,7 @@ async fn execute_action(
                         },
                         std::future::ready(account_plan),
                         None,
+                        false,
                     )
                     .await;
                     state.set_host_loading(false);
@@ -3010,7 +3177,6 @@ async fn execute_action(
                             state.push_notice(BlockKind::System, "Worktree ready", path.to_string_lossy());
                             if !state.has_deferred_resume()
                                 && let Some(text) = queued
-                                && (!state.thread_pending() || open_pending_thread(server, state, renderer).await?)
                             {
                                 start_turn(server, state, renderer, text, None).await?;
                             }
@@ -4757,6 +4923,7 @@ async fn await_switch(
         request,
         read_runtime_account_plan(server, &model),
         side_exit_key_guard,
+        false,
     )
     .await
     {
@@ -6333,16 +6500,24 @@ async fn start_turn(
     text: String,
     provider_handoff: Option<Value>,
 ) -> Result<()> {
+    // Fixed before a session is built for it: the screen stays live while it
+    // opens, and nothing typed meanwhile may reach this prompt's attachments.
+    let input = state.turn_input(text.clone());
+    // A session that does not exist yet is built here, by the prompt that needs
+    // it, so it is named after the runtime this prompt runs on.
+    if state.thread_pending() && !open_pending_thread(server, state, renderer).await? {
+        return Ok(());
+    }
     devezcode::note_prompt(&text);
     let model = state.selected_model_name().to_owned();
     let effort = state.selected_effort().to_owned();
-    if state.take_untitled_thread() {
+    let first_turn = state.take_untitled_thread();
+    if first_turn {
         let title_model = state.codex_title_model().unwrap_or(&model);
         server.title_new_thread(&state.thread_id, title_model, &text);
     }
     state.note_pending_turn_model(&model);
     state.note_pending_turn_effort(&effort);
-    let input = state.turn_input(text);
     let agent_mode = state.agent_mode();
     let mut params = json!({
         "threadId": state.thread_id,
@@ -6368,13 +6543,85 @@ async fn start_turn(
         params["toolPolicy"] = policy;
     }
     // The response reserves an id, but the app-server makes it interruptible
-    // only after the subsequent `turn/started` notification.
-    if let Err(error) =
+    // only after the subsequent `turn/started` notification. A new session's
+    // first turn can take seconds to open, like the session itself.
+    let response = if first_turn {
+        match await_session_request(server, state, renderer, "turn/start", params).await? {
+            Some(response) => response,
+            None => return Ok(()),
+        }
+    } else {
         await_with_activity(state, renderer, server.request("turn/start", params)).await?
-    {
+    };
+    if let Err(error) = response {
         state.set_request_failed(error.to_string());
     }
     Ok(())
+}
+
+/// Sends follow-up input into the running turn. The split view's side chat
+/// carries no role policy of its own. False when the runtime refused it; the
+/// caller hands the input back.
+async fn steer_turn(
+    server: &BackendServer,
+    state: &mut AppState,
+    turn_id: String,
+    text: &str,
+    input: Vec<Value>,
+    with_role_policy: bool,
+) -> bool {
+    devezcode::note_prompt(text);
+    let mut params = json!({
+        "threadId": state.thread_id,
+        "expectedTurnId": turn_id,
+        "input": input,
+        "additionalContext": {
+            "devez-vibe-knowledge": auto_knowledge_context(state.auto_knowledge())
+        }
+    });
+    // The running turn keeps its own role, but the turn this input lands
+    // in may be a fresh one the backend had to reopen. Carrying the role's
+    // write restriction along is what keeps a read-only role read-only then.
+    if with_role_policy && let Some(policy) = state.agent_mode().tool_policy() {
+        params["toolPolicy"] = policy;
+    }
+    match server.request("turn/steer", params).await {
+        Ok(_) => true,
+        Err(error) => {
+            state.push_notice(
+                BlockKind::Error,
+                "Follow-up input failed",
+                error.to_string(),
+            );
+            false
+        }
+    }
+}
+
+/// Sends the follow-ups `state` held while its turn was opening, once that turn
+/// has an id — however `turn/started` reached it — as one steer, so a refusal
+/// hands them all back together. True when there were any.
+async fn send_early_steers(
+    server: &BackendServer,
+    state: &mut AppState,
+    with_role_policy: bool,
+) -> bool {
+    let steers = state.take_early_steers();
+    if steers.is_empty() {
+        return false;
+    }
+    let count = steers.len();
+    let text = steers
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let input = steers.into_iter().flat_map(|(_, input)| input).collect();
+    let turn_id = state.turn_id.clone().unwrap_or_default();
+    if !steer_turn(server, state, turn_id, &text, input, with_role_policy).await {
+        state.restore_last_unsent(count);
+    }
+    true
 }
 
 fn attach_clipboard_image(state: &mut AppState) -> bool {
@@ -7704,6 +7951,104 @@ mod tests {
 
     fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    /// While a sent prompt waits for its session, typing, pasting and scrolling
+    /// go through, the keys and clicks that act on the prompt wait, and once
+    /// waiting starts only the release of a key already typed is dropped.
+    #[test]
+    fn a_sent_prompt_holds_its_own_keys_and_lets_typing_through() {
+        use crossterm::event::KeyEventState;
+        fn key(code: KeyCode, modifiers: KeyModifiers) -> input_hub::Incoming {
+            Ok(Event::Key(press(code, modifiers)))
+        }
+        fn release(ch: char) -> input_hub::Incoming {
+            Ok(Event::Key(KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Release,
+                state: KeyEventState::NONE,
+            }))
+        }
+        fn mouse(kind: MouseEventKind) -> input_hub::Incoming {
+            Ok(Event::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }))
+        }
+
+        for live in [
+            key(KeyCode::Char('a'), KeyModifiers::NONE),
+            key(KeyCode::Char('가'), KeyModifiers::SHIFT),
+            key(KeyCode::Backspace, KeyModifiers::NONE),
+            key(KeyCode::Up, KeyModifiers::NONE),
+            key(KeyCode::Char('v'), KeyModifiers::CONTROL),
+            key(KeyCode::Backspace, KeyModifiers::CONTROL),
+            key(KeyCode::Left, KeyModifiers::CONTROL),
+            release('★'),
+            mouse(MouseEventKind::ScrollUp),
+            Ok(Event::Paste("붙여넣기".to_owned())),
+        ] {
+            assert!(!waits_for_session(&live, false), "{live:?}");
+        }
+        for waiting in [
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            key(KeyCode::BackTab, KeyModifiers::SHIFT),
+            key(KeyCode::Up, KeyModifiers::SHIFT),
+            key(KeyCode::Right, KeyModifiers::SHIFT),
+            // Alt+V also switches the vibe preset, which needs the session to save.
+            key(KeyCode::Char('v'), KeyModifiers::ALT),
+            key(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            mouse(MouseEventKind::Down(MouseButton::Left)),
+        ] {
+            assert!(waits_for_session(&waiting, false), "{waiting:?}");
+        }
+        assert!(waits_for_session(
+            &key(KeyCode::Char('a'), KeyModifiers::NONE),
+            true
+        ));
+
+        // A typed Enter passes on as a key; one inside a paste run is a line.
+        let now = Instant::now();
+        let enter = press(KeyCode::Enter, KeyModifiers::NONE);
+        let mut typed = ComposerPasteBuffer::new();
+        let (text, passes) = split_session_key(&mut typed, enter, None, now);
+        assert!(text.is_empty() && passes);
+        let mut pasting = ComposerPasteBuffer::new();
+        for ch in ['a', 'b'] {
+            pasting.observe_expected(press(KeyCode::Char(ch), KeyModifiers::NONE), now, None);
+        }
+        let (text, passes) = split_session_key(&mut pasting, enter, None, now);
+        assert!(text.is_empty() && !passes);
+
+        let mut state = starting_state();
+        let mut alt_code = AltCodeKeys::default();
+        let mut held = Vec::new();
+        alt_code.normalize(press(KeyCode::Char('a'), KeyModifiers::NONE));
+        for event in [
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            release('a'),
+            release('★'),
+        ] {
+            hold_for_session(&mut held, &mut state, &mut alt_code, event);
+        }
+        let held = held
+            .into_iter()
+            .map(|event| match event {
+                Ok(Event::Key(key)) => (key.code, key.kind),
+                other => panic!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            held,
+            [
+                (KeyCode::Enter, KeyEventKind::Press),
+                (KeyCode::Char('★'), KeyEventKind::Release),
+            ]
+        );
     }
 
     #[test]

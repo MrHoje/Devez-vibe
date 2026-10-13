@@ -519,7 +519,7 @@ pub struct SteeredPromptView {
 /// One running provider subagent or ordinary background task.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubagentView {
-    /// The parent `Task` tool-use id: what the transcript panel is keyed on.
+    /// The provider's id for the row: what its `x` asks the provider to stop.
     pub id: String,
     pub name: String,
     pub is_background_task: bool,
@@ -528,6 +528,8 @@ pub struct SubagentView {
     pub elapsed: Duration,
     /// Levels below the subagent that launched it.
     pub depth: usize,
+    /// Whether the runtime can stop this one row; only then is the `x` drawn.
+    pub stoppable: bool,
 }
 
 /// One page this session published as a claude.ai Artifact, listed under the
@@ -6203,8 +6205,8 @@ pub enum Pick {
     Model,
     /// The status line's effort reading: opens `/effort`.
     EffortSetting,
-    /// A running-subagent row under the status line: opens its transcript panel.
-    Subagent(usize),
+    /// The `x` on a running-subagent row: stops the subagent with this id.
+    StopSubagent(String),
     /// The fullscreen transcript control that returns to its newest row.
     ScrollToBottom,
     /// A completed response's progress disclosure, hosted by its user prompt.
@@ -6689,8 +6691,7 @@ fn steer_preview_lines(prompts: &[SteeredPromptView], width: u16) -> Vec<PaintLi
 fn subagent_lines(subagents: &[SubagentView], width: u16, phase: f32) -> Vec<PaintLine> {
     subagents
         .iter()
-        .enumerate()
-        .map(|(index, subagent)| subagent_line(subagent, index, width, phase))
+        .map(|subagent| subagent_line(subagent, width, phase))
         .collect()
 }
 
@@ -6698,13 +6699,43 @@ fn subagent_lines(subagents: &[SubagentView], width: u16, phase: f32) -> Vec<Pai
 /// 잘린 설명은 무엇을 시켰는지 알려 주지 못한 채 폭만 먹는다.
 const SUBAGENT_DESCRIPTION_MIN_WIDTH: usize = 12;
 const SUBAGENT_DESCRIPTION_SEPARATOR: &str = " · ";
+const SUB_AGENT_LABEL: &str = "Sub agent: ";
+const BACKGROUND_TASK_LABEL: &str = "Background task: ";
+/// Columns the stop mark takes at the end of a row: a two-column gap and the `x`.
+const SUBAGENT_STOP_WIDTH: usize = 3;
 
 fn subagent_label_prefix(subagent: &SubagentView) -> &'static str {
     if subagent.is_background_task {
-        "Background task: "
+        BACKGROUND_TASK_LABEL
     } else {
-        "Sub agent: "
+        SUB_AGENT_LABEL
     }
+}
+
+fn subagent_stop_width(subagent: &SubagentView) -> usize {
+    if subagent.stoppable {
+        SUBAGENT_STOP_WIDTH
+    } else {
+        0
+    }
+}
+
+/// Ends a row the runtime can stop with an `x`: Claude Code's stop key for the
+/// row, drawn as a click target the way the artifact row draws its dismiss key.
+/// The gap is its own span so only the mark takes the click.
+fn with_subagent_stop(mut line: PaintLine, subagent: &SubagentView) -> PaintLine {
+    if !subagent.stoppable {
+        return line;
+    }
+    for text in ["  ", "x"] {
+        line.tail.push(PaintSpan {
+            text: text.to_owned(),
+            tone: Tone::Muted,
+            bold: false,
+        });
+    }
+    let mark = line.tail.len();
+    line.with_picks(&[(mark, Pick::StopSubagent(subagent.id.clone()))])
 }
 
 /// 이름 옆에 그 호출로 무엇을 시켰는지 붙인다. 자리가 모자라면 None을 돌려
@@ -6745,18 +6776,19 @@ fn subagent_indent(subagent: &SubagentView, room: usize) -> String {
 /// Indent gives way first on a narrow row, so the name keeps this much.
 const SUBAGENT_NAME_MIN_WIDTH: usize = 8;
 
-fn subagent_line(subagent: &SubagentView, index: usize, width: u16, phase: f32) -> PaintLine {
+fn subagent_line(subagent: &SubagentView, width: u16, phase: f32) -> PaintLine {
     let label = subagent_label_prefix(subagent);
     let elapsed = format!(" · {}", format_subagent_elapsed(subagent.elapsed.as_secs()));
     // 계획의 진행 중 단계와 같은 스피너가 점 자리에서 돈다.
     let glyph = working_spinner_frame(phase);
-    // The gutter, glyph, label, and elapsed reading are fixed, so the name is compacted
-    // first and the call description takes only what the name leaves behind.
+    // The gutter, glyph, label, elapsed reading, and stop mark are fixed, so the name
+    // is compacted first and the call description takes only what the name leaves behind.
     let fixed = 1
         + UnicodeWidthStr::width(glyph)
         + 1
         + UnicodeWidthStr::width(label)
-        + UnicodeWidthStr::width(elapsed.as_str());
+        + UnicodeWidthStr::width(elapsed.as_str())
+        + subagent_stop_width(subagent);
     let indent = subagent_indent(
         subagent,
         usize::from(width).saturating_sub(fixed + 1 + SUBAGENT_NAME_MIN_WIDTH),
@@ -6768,47 +6800,40 @@ fn subagent_line(subagent: &SubagentView, index: usize, width: u16, phase: f32) 
         available.saturating_sub(UnicodeWidthStr::width(name.as_str())),
     );
 
-    let mut picks = vec![(0, Pick::Subagent(index)), (1, Pick::Subagent(index))];
     let mut tail = vec![PaintSpan {
         text: format!(" {label}{name}"),
         tone: Tone::Plain,
         bold: false,
     }];
-    if let Some(description) = description {
-        // 클릭 영역 색인은 본문 다음에 tail이 이어지므로 tail 위치보다 하나 크다.
-        picks.push((tail.len() + 1, Pick::Subagent(index)));
-        tail.push(description);
-    }
+    tail.extend(description);
     tail.push(PaintSpan {
         text: elapsed,
         tone: Tone::Muted,
         bold: false,
     });
 
-    PaintLine {
-        prefix: format!(" {indent}"),
-        prefix_tone: Tone::Muted,
-        text: glyph.to_owned(),
-        tone: Tone::Accent,
-        bold: false,
-        tool_heading: None,
-        pick: None,
-        tail,
-    }
-    // The spinner, agent name, and its description open the same panel; the
-    // elapsed reading is left alone so the row's right edge stays quiet.
-    .with_picks(&picks)
+    with_subagent_stop(
+        PaintLine {
+            prefix: format!(" {indent}"),
+            prefix_tone: Tone::Muted,
+            text: glyph.to_owned(),
+            tone: Tone::Accent,
+            bold: false,
+            tool_heading: None,
+            pick: None,
+            tail,
+        },
+        subagent,
+    )
 }
 
-/// A running-subagent row under the composer: its spinner opens the row's
-/// panel. The animation path advances only that glyph between full frames.
+/// A running-subagent row under the composer, told apart by its label. The
+/// animation path advances only its spinner between full frames.
 fn is_subagent_spinner_row(line: &PaintLine) -> bool {
     WORKING_SPINNER.contains(&line.text.as_str())
-        && line.pick.as_ref().is_some_and(|picks| {
-            picks
-                .0
-                .iter()
-                .any(|(_, _, pick)| matches!(pick, Pick::Subagent(_)))
+        && line.tail.first().is_some_and(|span| {
+            let label = span.text.trim_start();
+            label.starts_with(SUB_AGENT_LABEL) || label.starts_with(BACKGROUND_TASK_LABEL)
         })
 }
 
@@ -7449,18 +7474,39 @@ fn normal_frame_with_expansion(
     let activity_composer_notice = status.composer_notice.as_deref();
     let mut composer_notice = status.composer_notice.as_deref();
     let mut composer_controls_mode = composer_mode;
-    let activity_uses_composer_spacer = activity.is_some() && suggestions.is_empty();
+    let activity_uses_composer_spacer = activity.is_some();
     // A suggestion panel still leaves the spacer above the composer, so the
     // controls keep that row instead of dropping onto the composer rule the
     // moment `/`, `@` or `$` opens the list.
     let idle_controls_can_use_composer_spacer = activity.is_none() && composer_mode.is_some();
     let mut activity_index = None;
+    // Working and Completed share one spacer. A completed transcript also
+    // normalizes its own trailing separator to one row, so session history,
+    // scrolling, and paragraph endings cannot add a second visible gap.
+    if activity.is_some() {
+        reserve_activity_top_spacer(&mut lines);
+    }
     // Transient rows stay in the pinned dock instead of scrolling away with the
-    // conversation. Activity leads any command suggestions.
+    // conversation. Queued prompts, the diff citation and command suggestions
+    // all dock above the activity row, so that row and its controls stay
+    // directly on top of the composer.
+    lines.extend(queue_preview_lines(
+        queued_prompts,
+        composer_mode.map(|mode| mode.model.as_str()),
+        width,
+    ));
+    // 인용해 둔 patch는 컴포저에 글자로 들어가지 않으므로, 무엇이 딸려 갈지는
+    // 컴포저 가까이 한 줄이 대신 알린다.
+    if let Some(count) = status.diff_reference_lines {
+        lines.push(diff_reference_line(count, width));
+    }
+    if !suggestions.is_empty() {
+        if !queued_prompts.is_empty() || status.diff_reference_lines.is_some() {
+            lines.push(PaintLine::blank());
+        }
+        lines.extend(suggestion_lines(suggestions, width));
+    }
     if let Some(activity) = activity {
-        // Working and Completed share one spacer. A completed transcript also
-        // normalizes its own trailing separator to one row, so session history,
-        // scrolling, and paragraph endings cannot add a second visible gap.
         reserve_activity_top_spacer(&mut lines);
         let mut activity_rows = activity_lines_with_progress(
             activity,
@@ -7493,12 +7539,6 @@ fn normal_frame_with_expansion(
         // turn — they are clickable settings, not decoration.
         activity_index = Some(lines.len());
         lines.extend(activity_rows);
-        if !suggestions.is_empty() {
-            lines.push(PaintLine::blank());
-        }
-    }
-    if !suggestions.is_empty() {
-        lines.extend(suggestion_lines(suggestions, width));
     }
     // Keep the spacer directly above the composer reserved so a notice appearing
     // on the bottom rule never resizes the frame or moves the transcript.
@@ -7529,26 +7569,6 @@ fn normal_frame_with_expansion(
             lines.push(spacer);
         }
     }
-    // Compaction's activity row carries a progress bar, so a queued prompt
-    // directly beneath it reads as part of that block. One blank row separates
-    // them.
-    if !queued_prompts.is_empty()
-        && activity.is_some_and(|activity| activity.starts_with(COMPACTING_LABEL))
-        && lines.last() != Some(&PaintLine::blank())
-    {
-        lines.push(PaintLine::blank());
-    }
-    lines.extend(queue_preview_lines(
-        queued_prompts,
-        composer_mode.map(|mode| mode.model.as_str()),
-        width,
-    ));
-    // 인용해 둔 patch는 컴포저에 글자로 들어가지 않으므로, 무엇이 딸려 갈지는
-    // 컴포저 바로 위 한 줄이 대신 알린다.
-    if let Some(count) = status.diff_reference_lines {
-        lines.push(diff_reference_line(count, width));
-    }
-
     // Recalled history is labelled on the composer rule, so the position stays
     // visible for as long as the entry does.
     let recalled = editor
@@ -10760,12 +10780,14 @@ fn side_panel_subagent_lines(subagents: &[SubagentView], content_width: usize) -
         },
         PaintLine::blank(),
     ];
-    for (index, subagent) in subagents.iter().take(SIDE_PANEL_SUBAGENT_LIMIT).enumerate() {
+    for subagent in subagents.iter().take(SIDE_PANEL_SUBAGENT_LIMIT) {
         let label = subagent_label_prefix(subagent);
         let elapsed = format!(" · {}", format_subagent_elapsed(subagent.elapsed.as_secs()));
+        let stop = subagent_stop_width(subagent);
         let fixed = UnicodeWidthStr::width("• ")
             + UnicodeWidthStr::width(label)
-            + UnicodeWidthStr::width(elapsed.as_str());
+            + UnicodeWidthStr::width(elapsed.as_str())
+            + stop;
         let prefix = format!(
             "{}• ",
             subagent_indent(
@@ -10776,7 +10798,8 @@ fn side_panel_subagent_lines(subagents: &[SubagentView], content_width: usize) -
         let available = content_width.saturating_sub(
             UnicodeWidthStr::width(prefix.as_str())
                 + UnicodeWidthStr::width(label)
-                + UnicodeWidthStr::width(elapsed.as_str()),
+                + UnicodeWidthStr::width(elapsed.as_str())
+                + stop,
         );
         let name = compact_right(&subagent_display_name(&subagent.name), available);
         let description = subagent_description_span(
@@ -10790,15 +10813,17 @@ fn side_panel_subagent_lines(subagents: &[SubagentView], content_width: usize) -
             tone: Tone::Muted,
             bold: false,
         });
-        lines.push(PaintLine {
-            prefix,
-            prefix_tone: Tone::Accent,
-            text: format!("{label}{name}"),
-            tone: Tone::Plain,
-            tail,
-            pick: Some(PickRegions::span(0, content_width, Pick::Subagent(index))),
-            ..PaintLine::plain("")
-        });
+        lines.push(with_subagent_stop(
+            PaintLine {
+                prefix,
+                prefix_tone: Tone::Accent,
+                text: format!("{label}{name}"),
+                tone: Tone::Plain,
+                tail,
+                ..PaintLine::plain("")
+            },
+            subagent,
+        ));
     }
     let hidden = subagents.len().saturating_sub(SIDE_PANEL_SUBAGENT_LIMIT);
     if hidden > 0 {
@@ -20035,6 +20060,7 @@ mod tests {
             tool: tool.to_owned(),
             elapsed: Duration::from_secs(secs),
             depth: 0,
+            stoppable: false,
         }
     }
 
@@ -20045,21 +20071,21 @@ mod tests {
         child.is_background_task = true;
         child.depth = 1;
         assert_eq!(
-            painted(&subagent_line(&parent, 0, 80, 0.0)),
+            painted(&subagent_line(&parent, 80, 0.0)),
             " ⠋ Sub agent: Explore · 40s"
         );
         assert_eq!(
-            painted(&subagent_line(&child, 1, 80, 0.0)),
+            painted(&subagent_line(&child, 80, 0.0)),
             "   ⠋ Background task: Bash · npm run dev · 12s"
         );
         // A deep chain stops at four levels, and on a narrow row the indent
         // gives way before the name does.
         child.depth = 9;
         assert!(
-            painted(&subagent_line(&child, 1, 80, 0.0))
+            painted(&subagent_line(&child, 80, 0.0))
                 .starts_with(&format!(" {}⠋", " ".repeat(8)))
         );
-        let deep = subagent_line(&child, 1, 32, 0.0);
+        let deep = subagent_line(&child, 32, 0.0);
         assert!(painted(&deep).starts_with(" ⠋ Background task: Bash"));
         assert!(painted_line_width(&deep) <= 32);
         let deep_panel = side_panel_subagent_lines(&[child.clone()], 30);
@@ -20076,20 +20102,17 @@ mod tests {
         for name in ["Bash", "Workflow", "Monitor"] {
             let mut task = test_subagent(name, "npm test", "", 29);
             task.is_background_task = true;
-            let line = subagent_line(&task, 0, 80, 0.0);
+            let line = subagent_line(&task, 80, 0.0);
             assert_eq!(
                 painted(&line),
                 format!(" ⠋ Background task: {name} · npm test · 29s")
             );
-            assert_eq!(pick_on(&line, "Background task:"), Some(Pick::Subagent(0)));
-            assert_eq!(pick_on(&line, "npm test"), Some(Pick::Subagent(0)));
-            assert_eq!(pick_on(&line, "29s"), None);
             let lines = side_panel_subagent_lines(&[task.clone()], 80);
             assert_eq!(
                 painted(&lines[2]),
                 format!("• Background task: {name} · npm test · 29s")
             );
-            let narrow = subagent_line(&task, 0, 32, 0.0);
+            let narrow = subagent_line(&task, 32, 0.0);
             assert!(painted(&narrow).starts_with(" ⠋ Background task: "));
             assert!(painted(&narrow).ends_with(" · 29s"));
             assert!(painted_line_width(&narrow) <= 32);
@@ -20174,7 +20197,7 @@ mod tests {
         let subagent = test_subagent("Explore", "", "Grep(fn login)", 4);
 
         assert_eq!(
-            painted(&subagent_line(&subagent, 0, 80, 0.0)),
+            painted(&subagent_line(&subagent, 80, 0.0)),
             " ⠋ Sub agent: Explore · 4s"
         );
     }
@@ -20185,11 +20208,11 @@ mod tests {
         let claude = test_subagent("devez-reviewer", "변경 검토", "", 3);
 
         assert_eq!(
-            painted(&subagent_line(&codex, 0, 80, 0.0)),
+            painted(&subagent_line(&codex, 80, 0.0)),
             " ⠋ Sub agent: Eghis2 daily popup · 28s"
         );
         assert_eq!(
-            painted(&subagent_line(&claude, 1, 80, 0.0)),
+            painted(&subagent_line(&claude, 80, 0.0)),
             " ⠋ Sub agent: Devez reviewer · 변경 검토 · 3s"
         );
     }
@@ -20203,7 +20226,7 @@ mod tests {
             93,
         );
 
-        let line = subagent_line(&subagent, 0, 30, 0.0);
+        let line = subagent_line(&subagent, 30, 0.0);
 
         assert!(!painted(&line).contains("hidden"));
         assert!(painted(&line).starts_with(" ⠋ Sub agent: "));
@@ -20220,34 +20243,50 @@ mod tests {
     fn a_narrow_subagent_row_drops_the_description_before_the_name() {
         let subagent = test_subagent("Explore", "Find the auth code path", "", 4);
 
-        let line = subagent_line(&subagent, 0, 36, 0.0);
+        let line = subagent_line(&subagent, 36, 0.0);
 
         assert!(painted(&line).contains("Explore"));
         assert!(!painted(&line).contains("Find"));
         assert!(painted_line_width(&line) <= 36);
     }
 
+    /// Claude Code stops the selected row with `x`. Here that `x` is a click
+    /// target on rows the runtime can stop, and the rest of the row takes no click.
     #[test]
-    fn a_subagent_row_opens_its_own_panel_but_its_elapsed_reading_does_not() {
-        let lines = subagent_lines(
-            &[
-                test_subagent("Explore", "Find auth code", "", 4),
-                test_subagent("developer", "Fix the parser", "", 1),
-            ],
-            80,
-            0.0,
-        );
+    fn a_stoppable_subagent_row_ends_with_an_x_that_stops_it() {
+        let mut subagent = test_subagent("Plan", "Find auth code", "", 4);
+        subagent.stoppable = true;
+        let stop = Some(Pick::StopSubagent("toolu_Plan".to_owned()));
 
-        assert_eq!(pick_on(&lines[0], "⠋"), Some(Pick::Subagent(0)));
-        assert_eq!(pick_on(&lines[0], "Sub agent:"), Some(Pick::Subagent(0)));
-        assert_eq!(pick_on(&lines[0], "Explore"), Some(Pick::Subagent(0)));
-        assert_eq!(pick_on(&lines[0], "Find auth code"), Some(Pick::Subagent(0)));
-        assert_eq!(pick_on(&lines[1], "Developer"), Some(Pick::Subagent(1)));
-        assert_eq!(pick_on(&lines[0], "4s"), None);
+        let line = subagent_line(&subagent, 80, 0.0);
+        assert_eq!(painted(&line), " ⠋ Sub agent: Plan · Find auth code · 4s  x");
+        assert_eq!(pick_on(&line, "x"), stop);
+        for label in ["⠋", "Sub agent:", "Plan", "Find auth code", "4s"] {
+            assert_eq!(pick_on(&line, label), None, "{label}");
+        }
+        assert!(is_subagent_spinner_row(&line));
+        let narrow = subagent_line(&subagent, 30, 0.0);
+        assert!(painted(&narrow).ends_with(" · 4s  x"));
+        assert!(painted_line_width(&narrow) <= 30);
+
+        let panel = side_panel_subagent_lines(&[subagent.clone()], 44);
+        assert_eq!(painted(&panel[2]), "• Sub agent: Plan · Find auth code · 4s  x");
+        assert_eq!(pick_on(&panel[2], "x"), stop);
+        assert_eq!(pick_on(&panel[2], "Plan"), None);
+        let narrow_panel = side_panel_subagent_lines(&[subagent], 30);
+        assert!(painted(&narrow_panel[2]).ends_with(" · 4s  x"));
+        assert!(painted_line_width(&narrow_panel[2]) <= 30);
+
+        // A runtime that cannot stop one row gets no mark and no click target,
+        // but its spinner still turns.
+        let plain = subagent_line(&test_subagent("Plan", "", "", 4), 80, 0.0);
+        assert_eq!(painted(&plain), " ⠋ Sub agent: Plan · 4s");
+        assert!(plain.pick.is_none());
+        assert!(is_subagent_spinner_row(&plain));
     }
 
     #[test]
-    fn the_side_panel_lists_running_subagents_as_clickable_rows() {
+    fn the_side_panel_lists_running_subagents() {
         let subagents = [
             test_subagent("Explore", "Find auth code", "Grep(fn login)", 93),
             test_subagent("developer", "Fix the parser", "", 3),
@@ -20265,9 +20304,6 @@ mod tests {
             painted(&lines[3]),
             "• Sub agent: Developer · Fix the parser · 3s"
         );
-        assert_eq!(pick_on(&lines[2], "Explore"), Some(Pick::Subagent(0)));
-        assert_eq!(pick_on(&lines[2], "1m 33s"), Some(Pick::Subagent(0)));
-        assert_eq!(pick_on(&lines[3], "Developer"), Some(Pick::Subagent(1)));
         assert!(lines[4] == PaintLine::blank());
         assert_eq!(lines[5].tone, Tone::SidePanelDivider);
         assert!(lines.iter().all(|line| painted_line_width(line) <= 44));
@@ -20354,13 +20390,13 @@ mod tests {
         );
     }
 
-    /// Compaction's activity row carries a progress bar, so a queued prompt gets
-    /// a blank row of its own. An ordinary turn keeps the queue tight.
+    /// Queued prompts and the diff citation dock above the row that carries the
+    /// composer controls, so that row never leaves the composer.
     #[test]
-    fn a_queued_prompt_clears_the_compaction_progress_row() {
-        let queue_index = |activity: &str| {
+    fn queue_and_diff_citation_keep_the_controls_row_on_the_composer() {
+        let frame = |activity: Option<&str>| {
             let editor = Editor::default();
-            let frame = normal_frame_with_expansion(
+            normal_frame_with_expansion(
                 Vec::new(),
                 &editor,
                 &[],
@@ -20373,30 +20409,44 @@ mod tests {
                 "",
                 None,
                 &[],
-                Some(activity),
+                activity,
                 None,
                 0.5,
                 0.5,
                 StatusArea {
                     fallback: String::new(),
                     line: None,
-                    diff_reference_lines: None,
+                    diff_reference_lines: Some(3),
                     side_panel_open: false,
                     composer_notice: None,
-                    composer_mode: None,
+                    composer_mode: Some(test_mode("Full Access", ModeAccent::Danger, false)),
                 },
-                80,
-            );
-            let index = frame
+                160,
+            )
+        };
+        let find = |frame: &Frame, text: &str| {
+            frame
                 .lines
                 .iter()
-                .position(|line| painted(line).contains("Queue :"))
-                .expect("queue row");
-            (frame.lines[index - 1] == PaintLine::blank(), index)
+                .position(|line| painted(line).contains(text))
+                .unwrap_or_else(|| panic!("{text} row"))
         };
 
-        assert!(queue_index("Compacting.. (4s)").0);
-        assert!(!queue_index("Working.. (4s)").0);
+        for activity in ["Compacting.. (4s)", "Working.. (4s)"] {
+            let frame = frame(Some(activity));
+            let label = activity.split('.').next().unwrap();
+            let activity_row = find(&frame, label);
+            assert!(find(&frame, "Queue :") < find(&frame, "from diff view"));
+            assert!(find(&frame, "from diff view") < activity_row);
+            assert!(frame.lines[activity_row - 1] == PaintLine::blank());
+            assert!(painted(&frame.lines[activity_row]).contains("Vibe"));
+            assert_eq!(frame.composer_index, Some(activity_row + 1));
+        }
+
+        let idle = frame(None);
+        let controls = find(&idle, "Vibe");
+        assert!(find(&idle, "from diff view") < controls);
+        assert_eq!(idle.composer_index, Some(controls + 1));
     }
 
     #[test]
@@ -20989,7 +21039,7 @@ mod tests {
     }
 
     #[test]
-    fn activity_sits_above_slash_suggestions() {
+    fn activity_stays_on_the_composer_below_slash_suggestions() {
         let mut editor = Editor::default();
         editor.set_text("/");
         let suggestions = vec![SuggestionView {
@@ -21028,10 +21078,9 @@ mod tests {
             .position(|line| line.text == "Commands ")
             .expect("suggestions header");
 
-        assert!(activity > 0);
+        assert!(suggestions < activity);
         assert!(frame.lines[activity - 1] == PaintLine::blank());
-        assert!(frame.lines[activity + 1] == PaintLine::blank());
-        assert!(activity < suggestions);
+        assert_eq!(frame.composer_index, Some(activity + 1));
     }
 
     #[test]
@@ -26315,7 +26364,9 @@ mod tests {
         renderer.last_width = 80;
         renderer.last_total_width = 80;
         renderer.previous_lines = vec![PaintLine::blank(); 24];
-        let row = subagent_line(&test_subagent("Workflow", "조사", "", 5), 0, 80, 0.0);
+        let mut subagent = test_subagent("Workflow", "조사", "", 5);
+        subagent.stoppable = true;
+        let row = subagent_line(&subagent, 80, 0.0);
         renderer.previous_lines[20] = row.clone();
 
         let animated = renderer

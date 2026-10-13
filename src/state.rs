@@ -1191,6 +1191,12 @@ pub enum Action {
     /// 업데이트 알림을 눌렀을 때 백그라운드로 도는 `dvz update`.
     RunUpdate,
     Interrupt,
+    /// 하위 에이전트 행의 x: 그 행 하나만 멈춘다. Codex는 자식 스레드의 턴을
+    /// 중단하므로 그 턴 id가 함께 간다.
+    StopSubagent {
+        id: String,
+        turn: Option<String>,
+    },
     NewThread,
     Worktree(Option<String>),
     OpenResume,
@@ -1684,13 +1690,6 @@ enum PendingInteraction {
     /// is sent under. Moving the cursor previews nothing; Enter commits.
     AgentPicker {
         selected: usize,
-    },
-    /// A subagent's recorded work, opened from its row under the composer. Read
-    /// only: closing it hands the main thread straight back.
-    SubagentTranscript {
-        id: String,
-        /// First visible line, so a long record can be walked with Up/Down.
-        offset: usize,
     },
     SettingPicker {
         setting: DisplaySetting,
@@ -3237,7 +3236,6 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
             | PendingInteraction::VibeModePicker { .. }
             | PendingInteraction::StatusLinePicker { .. }
             | PendingInteraction::SkillsPicker { .. }
-            | PendingInteraction::SubagentTranscript { .. }
             | PendingInteraction::SessionPicker(_)
             | PendingInteraction::HistoryPicker(_)
             | PendingInteraction::ProviderPicker(_)
@@ -3723,6 +3721,9 @@ struct CodexSubagent {
     has_run: bool,
     terminal: bool,
     probe_failures: u8,
+    /// 자식 스레드의 마지막 `turn/started`. 행의 x는 이 턴을 중단한다. 임시
+    /// 스레드는 `thread/turns/list`를 거부하므로 알림에서 받아 둔다.
+    turn_id: Option<String>,
 }
 
 impl CodexSubagent {
@@ -3754,20 +3755,9 @@ impl CodexSubagent {
     }
 }
 
-/// One recorded line of a subagent's work, as shown in its transcript panel.
-#[derive(Clone, Debug)]
-struct SubagentLogLine {
-    text: String,
-    muted: bool,
-}
-
-/// A long-running subagent can emit far more than a panel will ever show, so the
-/// oldest lines are dropped rather than held for the rest of the session.
-const SUBAGENT_LOG_LIMIT: usize = 400;
-
 /// 턴이 끝난 뒤 하위 에이전트 행이 아무 갱신 없이 버틸 수 있는 시간. Claude는
 /// 5초마다, OpenCode는 1초마다 목록을 다시 알려 주므로 이 유예에 걸리는 행은
-/// 생존 신호를 여러 번 연속 놓친 것뿐이다. 살아 있는 행은 로그와 목록 갱신이
+/// 생존 신호를 여러 번 연속 놓친 것뿐이다. 살아 있는 행은 활동과 목록 갱신이
 /// 유예를 계속 미뤄서 여기 걸리지 않는다.
 const SUBAGENT_LINGER_GRACE: Duration = Duration::from_secs(15);
 /// Codex child liveness is re-read from the app-server before a quiet row is
@@ -3890,6 +3880,10 @@ pub struct AppState {
     /// Set when the user interrupts after `turn/start` answers but before the
     /// app-server has announced that the turn is active.
     pending_interrupt: bool,
+    /// Follow-ups sent while the turn they steer was still opening, each with the
+    /// input it was sent with. They go out once that turn has an id; a turn that
+    /// never gets one hands them back to the composer.
+    early_steers: Vec<(String, Vec<Value>)>,
     turn_interrupted: bool,
     /// Only an explicit Esc on a running response may resume the local queue.
     resume_queue_after_interrupt: bool,
@@ -4001,10 +3995,6 @@ pub struct AppState {
     /// itself (DevezCode). An external terminal paints its own preedit and loses
     /// it whenever the cursor hides, so there idle rows wait for the next second.
     idle_row_spinner: bool,
-    /// Recorded subagent work, keyed by the parent tool-use id. Kept for the rest
-    /// of the turn so a panel opened on a finished subagent still has something
-    /// to show.
-    subagent_logs: HashMap<String, Vec<SubagentLogLine>>,
     command_selection: usize,
     spinner_frame: usize,
     turn_started_at: Option<Instant>,
@@ -4251,6 +4241,7 @@ impl AppState {
             turn_id: None,
             claude_usage_limit_reset: None,
             pending_interrupt: false,
+            early_steers: Vec::new(),
             turn_interrupted: false,
             resume_queue_after_interrupt: false,
             turn_progress_at: None,
@@ -4310,7 +4301,6 @@ impl AppState {
             codex_subagents: HashMap::new(),
             subagents_settled_at: None,
             idle_row_spinner: crate::devezcode::room_id().is_some(),
-            subagent_logs: HashMap::new(),
             command_selection: 0,
             spinner_frame: 0,
             compacting_started_at: None,
@@ -6344,6 +6334,7 @@ impl AppState {
         self.branch_cwd = None;
         self.turn_id = None;
         self.pending_interrupt = false;
+        self.early_steers.clear();
         self.busy = false;
         self.end_compaction();
         self.turn_started_at = None;
@@ -6669,6 +6660,9 @@ impl AppState {
     }
 
     fn begin_turn_prompt(&mut self, mut prompt: Block, started_at: Instant) {
+        // 웹 검색 줄은 검색이 끝나도 다음 출력까지 진행 영역에 남는다. 이 프롬프트보다
+        // 먼저 일어난 일이므로, 카드가 그 위에 놓이지 않게 먼저 확정한다.
+        self.settle_web_search_run();
         self.finish_active_turn_prompt(started_at);
         prompt.response_agent = Some(self.active_turn_agent);
         self.turn_prompt_started_at.insert(prompt.id(), started_at);
@@ -6778,10 +6772,76 @@ impl AppState {
         if self.pending_interrupt {
             let turn_id = self.turn_id.clone()?;
             self.pending_interrupt = false;
+            // Follow-ups typed after the Esc cannot join the turn it stops; they
+            // come back to the composer the way an Esc sends back its prompts.
+            if !self.early_steers.is_empty() {
+                self.discard_unanswered_turn_prompts();
+                self.return_early_steers();
+            }
             Some(turn_id)
         } else {
             None
         }
+    }
+
+    /// Whether Enter on the composer would steer the prompt in flight rather
+    /// than run a slash or shell command — the one send a session still being
+    /// built can take (see `defer_steer`).
+    pub fn enter_steers(&self) -> bool {
+        let text = self.editor.text();
+        self.busy
+            && !self.shell_mode
+            && !(text.starts_with('/')
+                && !text.contains('\n')
+                && self.slash_skill_prompt(&text).is_none())
+    }
+
+    /// Whether Esc now takes back the prompt in flight, as `handle_key` reads it —
+    /// rather than leaving a side thread, an empty shell-mode composer or an open
+    /// dialog first.
+    pub fn esc_takes_back_prompt(&self) -> bool {
+        self.side_parent.is_none()
+            && !self.has_pending_interaction()
+            && !(self.shell_mode && self.editor.is_empty() && self.composer_images.is_empty())
+    }
+
+    /// Holds a follow-up whose turn has no id yet. Its card is already on screen,
+    /// and its input — attachments, mentions, a quoted diff — is fixed now, so
+    /// whatever the composer takes on next stays with the next draft.
+    pub fn defer_steer(&mut self, text: String) {
+        let input = self.turn_input(text.clone());
+        self.early_steers.push((text, input));
+    }
+
+    /// The follow-ups held for the turn that now has an id.
+    pub fn take_early_steers(&mut self) -> Vec<(String, Vec<Value>)> {
+        if self.turn_id.is_none() {
+            return Vec::new();
+        }
+        std::mem::take(&mut self.early_steers)
+    }
+
+    /// Hands held follow-ups back to the composer when they can no longer reach
+    /// their turn.
+    fn return_early_steers(&mut self) {
+        let count = std::mem::take(&mut self.early_steers).len();
+        self.restore_last_unsent(count);
+    }
+
+    /// Hands the newest `count` unsent inputs back to the composer: follow-ups
+    /// `turn_input` recorded after the prompt that opened the turn, which stays.
+    pub fn restore_last_unsent(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let tail = self
+            .unsent_prompt
+            .split_off(self.unsent_prompt.len().saturating_sub(count));
+        let rest = std::mem::replace(&mut self.unsent_prompt, tail);
+        let provisional = std::mem::take(&mut self.unsent_provisional);
+        self.restore_unsent(false, false);
+        self.unsent_provisional = provisional;
+        self.unsent_prompt = rest;
     }
 
     /// 이번 턴에 보낸 입력을 모두 입력창에 되돌린다. 입력창이 비어 있지 않으면
@@ -6860,6 +6920,8 @@ impl AppState {
         }
         self.committed
             .push(Block::new(BlockKind::Error, "Request failed", message));
+        // Held follow-ups are already among the unsent inputs restored here.
+        self.early_steers.clear();
         if never_started {
             self.restore_unsent(queued, false);
         }
@@ -6965,6 +7027,8 @@ impl AppState {
         let discarded = !ids.is_empty();
         self.discarded_prompt_ids.extend(ids);
         if discarded {
+            // Held follow-ups are already among the unsent inputs restored here.
+            self.early_steers.clear();
             self.restore_unsent_prompt();
         }
     }
@@ -7290,10 +7354,10 @@ impl AppState {
         self.artifacts.clear();
         self.codex_subagents.clear();
         self.subagents_settled_at = None;
-        self.subagent_logs.clear();
         self.busy = false;
         self.turn_id = None;
         self.pending_interrupt = false;
+        self.early_steers.clear();
         self.turn_interrupted = false;
         self.resume_queue_after_interrupt = false;
         self.queued_input_pending = false;
@@ -7526,6 +7590,8 @@ impl AppState {
                     tool: running.tool.clone(),
                     elapsed: running.started_at.elapsed(),
                     depth: running.depth,
+                    // OpenCode는 행 하나만 멈추는 요청이 없다.
+                    stoppable: !crate::open_code::is_open_code_model(self.selected_model_name()),
                 })
                 .collect(),
             artifacts: self
@@ -7640,11 +7706,6 @@ impl AppState {
             }
         }
         self.subagents.clear();
-        let mut retained = HashSet::new();
-        if let Some(PendingInteraction::SubagentTranscript { id, .. }) = &self.pending {
-            retained.insert(id.clone());
-        }
-        self.subagent_logs.retain(|id, _| retained.contains(id));
         true
     }
 
@@ -9324,8 +9385,12 @@ impl AppState {
         self.names_this_thread(thread_id) || self.codex_subagents.contains_key(thread_id)
     }
 
+    /// 자식이 `/root`에게 말을 건 활동도 이 스레드를 가리킨다. 이 스레드를 하위
+    /// 에이전트로 기억하면 본 턴이 `/root` 행으로 떠서 그 x가 본 작업을 멈춘다.
     fn remember_codex_subagent(&mut self, id: &str) {
-        self.codex_subagents.entry(id.to_owned()).or_default();
+        if !self.names_this_thread(id) {
+            self.codex_subagents.entry(id.to_owned()).or_default();
+        }
     }
 
     fn update_codex_subagent_identity(
@@ -9335,7 +9400,10 @@ impl AppState {
         nickname: Option<&str>,
         role: Option<&str>,
     ) {
-        let metadata = self.codex_subagents.entry(id.to_owned()).or_default();
+        self.remember_codex_subagent(id);
+        let Some(metadata) = self.codex_subagents.get_mut(id) else {
+            return;
+        };
         if let Some(path) = agent_path.map(str::trim).filter(|path| !path.is_empty()) {
             metadata.agent_path = Some(path.to_owned());
         }
@@ -9423,27 +9491,10 @@ impl AppState {
         self.refresh_codex_subagent_row(id);
     }
 
-    fn record_subagent_line(&mut self, parent: &str, kind: &str, text: &str) {
-        let text = text.trim();
-        if text.is_empty() {
-            return;
-        }
-        if let Some(metadata) = self.codex_subagents.get_mut(parent) {
+    /// A child still reporting work is alive, so the quiet-row sweep waits for it.
+    fn note_subagent_activity(&mut self, id: &str) {
+        if let Some(metadata) = self.codex_subagents.get_mut(id) {
             metadata.probe_failures = 0;
-        }
-        let text = match kind {
-            "tool" => format!("⏺ {text}"),
-            "result" => format!("  ⎿ {text}"),
-            "error" => tr(format!("  ⎿ 오류: {text}"), format!("  ⎿ Error: {text}")),
-            _ => text.to_owned(),
-        };
-        let log = self.subagent_logs.entry(parent.to_owned()).or_default();
-        log.push(SubagentLogLine {
-            text,
-            muted: kind != "text",
-        });
-        if log.len() > SUBAGENT_LOG_LIMIT {
-            log.drain(..log.len() - SUBAGENT_LOG_LIMIT);
         }
         if self.subagents_settled_at.is_some() {
             self.subagents_settled_at = Some(Instant::now());
@@ -9500,8 +9551,12 @@ impl AppState {
             }
             "turn/started" => {
                 if let Some(id) = params.get("threadId").and_then(Value::as_str)
-                    && self.codex_subagents.contains_key(id)
+                    && let Some(metadata) = self.codex_subagents.get_mut(id)
                 {
+                    metadata.turn_id = params
+                        .pointer("/turn/id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
                     self.start_codex_subagent(id, true);
                 }
             }
@@ -9509,13 +9564,6 @@ impl AppState {
                 if let Some(id) = params.get("threadId").and_then(Value::as_str)
                     && self.codex_subagents.contains_key(id)
                 {
-                    if let Some(error) = params
-                        .pointer("/turn/error/message")
-                        .and_then(Value::as_str)
-                        .or_else(|| params.get("message").and_then(Value::as_str))
-                    {
-                        self.record_subagent_line(id, "error", error);
-                    }
                     self.finish_codex_subagent(id);
                 }
             }
@@ -9619,105 +9667,39 @@ impl AppState {
     }
 
     fn record_codex_subagent_item(&mut self, id: &str, method: &str, item: &Value) {
-        let completed = method == "item/completed";
-        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-        let activity = match item_type {
-            "agentMessage" | "plan" if completed => item
-                .get("text")
-                .and_then(Value::as_str)
-                .map(|text| ("text", compact_command(text, 320))),
-            "reasoning" if completed => item
-                .get("summary")
-                .and_then(Value::as_array)
-                .and_then(|summary| summary.last())
-                .and_then(Value::as_str)
-                .map(|text| ("result", compact_command(text, 240))),
-            "commandExecution" if !completed => {
-                let command = item
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or("command");
-                let label = format!("$ {}", compact_command(command, 200));
-                self.set_codex_subagent_tool(id, &label);
-                Some(("tool", label))
-            }
-            "commandExecution" => {
-                let status = item
-                    .get("exitCode")
-                    .and_then(Value::as_i64)
-                    .map(|exit| format!("exit {exit}"))
-                    .or_else(|| {
-                        item.get("status")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned)
-                    })
-                    .unwrap_or_else(|| "completed".to_owned());
-                Some((
-                    if status == "completed" || status == "exit 0" {
-                        "result"
-                    } else {
-                        "error"
-                    },
-                    status,
-                ))
-            }
-            "fileChange" if completed => {
-                let count = item
-                    .get("changes")
-                    .and_then(Value::as_array)
-                    .map(Vec::len)
-                    .unwrap_or_default();
-                Some(("tool", format!("Updated {count} file(s)")))
-            }
-            "mcpToolCall" if !completed => {
-                let label = format!(
+        if method == "item/started" {
+            let tool = match item.get("type").and_then(Value::as_str) {
+                Some("commandExecution") => {
+                    let command = item
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or("command");
+                    Some(format!("$ {}", compact_command(command, 200)))
+                }
+                Some("mcpToolCall") => Some(format!(
                     "MCP {}/{}",
                     item.get("server")
                         .and_then(Value::as_str)
                         .unwrap_or("server"),
                     item.get("tool").and_then(Value::as_str).unwrap_or("tool")
-                );
-                self.set_codex_subagent_tool(id, &label);
-                Some(("tool", label))
+                )),
+                Some("dynamicToolCall") => {
+                    let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
+                    Some(
+                        item.get("namespace")
+                            .and_then(Value::as_str)
+                            .filter(|namespace| !namespace.is_empty())
+                            .map(|namespace| format!("Tool {namespace}/{tool}"))
+                            .unwrap_or_else(|| format!("Tool {tool}")),
+                    )
+                }
+                _ => None,
+            };
+            if let Some(tool) = tool {
+                self.set_codex_subagent_tool(id, &tool);
             }
-            "dynamicToolCall" if !completed => {
-                let namespace = item
-                    .get("namespace")
-                    .and_then(Value::as_str)
-                    .filter(|namespace| !namespace.is_empty());
-                let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
-                let label = namespace
-                    .map(|namespace| format!("Tool {namespace}/{tool}"))
-                    .unwrap_or_else(|| format!("Tool {tool}"));
-                self.set_codex_subagent_tool(id, &label);
-                Some(("tool", label))
-            }
-            "webSearch" if completed => item.get("query").and_then(Value::as_str).map(|query| {
-                (
-                    "tool",
-                    format!("Web search: {}", compact_command(query, 200)),
-                )
-            }),
-            "collabAgentToolCall" if completed => item
-                .get("tool")
-                .and_then(Value::as_str)
-                .map(|tool| ("tool", format!("Agent {tool}"))),
-            "subAgentActivity" if completed => {
-                let action = match item.get("kind").and_then(Value::as_str) {
-                    Some("started") => "Started",
-                    Some("interacted") => "Contacted",
-                    Some("interrupted") => "Interrupted",
-                    _ => "Updated",
-                };
-                item.get("agentPath")
-                    .and_then(Value::as_str)
-                    .map(|path| ("tool", format!("{action} {path}")))
-            }
-            _ => None,
-        };
-        if let Some((kind, text)) = activity {
-            self.record_subagent_line(id, kind, &text);
         }
+        self.note_subagent_activity(id);
     }
 
     /// A parent turn keeps streaming behind a `/btw` fork. Its output stays out
@@ -9937,6 +9919,8 @@ impl AppState {
             }
             "turn/completed" => {
                 self.claude_usage_limit_reset = None;
+                // Follow-ups still held never had a turn id to steer.
+                self.return_early_steers();
                 let turn_error = params
                     .get("turn")
                     .and_then(|turn| turn.get("error"))
@@ -9957,19 +9941,9 @@ impl AppState {
                 self.end_compaction();
                 self.turn_id = None;
                 self.pending_interrupt = false;
-                let mut retained_logs = self
-                    .subagents
-                    .iter()
-                    .map(|running| running.id.clone())
-                    .collect::<HashSet<_>>();
-                if let Some(PendingInteraction::SubagentTranscript { id, .. }) = &self.pending {
-                    retained_logs.insert(id.clone());
-                }
-                self.subagent_logs
-                    .retain(|id, _| retained_logs.contains(id));
                 // 종료 알림을 놓친 하위 에이전트 행이 사용자가 지시할 때까지
-                // 남지 않게 유예를 건다. 살아 있는 백그라운드 에이전트는 로그
-                // 갱신이 유예를 계속 미뤄 준다.
+                // 남지 않게 유예를 건다. 살아 있는 백그라운드 에이전트는 활동과
+                // 목록 갱신이 유예를 계속 미뤄 준다.
                 self.subagents_settled_at = (!self.subagents.is_empty()).then(Instant::now);
                 if !self.turn_interrupted || self.last_completed_duration.is_none() {
                     self.last_completed_duration =
@@ -10222,15 +10196,6 @@ impl AppState {
                         name: name.to_owned(),
                         url: url.to_owned(),
                     });
-                }
-            }
-            "turn/subagent/line" => {
-                if let Some(parent) = params.get("parentToolUseId").and_then(Value::as_str)
-                    && let Some(line) = params.get("line")
-                    && let Some(text) = line.get("text").and_then(Value::as_str)
-                {
-                    let kind = line.get("kind").and_then(Value::as_str).unwrap_or("text");
-                    self.record_subagent_line(parent, kind, text);
                 }
             }
             "item/started" => {
@@ -12048,25 +12013,6 @@ impl AppState {
                 });
                 Action::None
             }
-            PendingInteraction::SubagentTranscript { id, offset } => match key.code {
-                KeyCode::Esc | KeyCode::Enter => Action::None,
-                KeyCode::Up | KeyCode::Char('k') if !ctrl && !alt => {
-                    self.pending = Some(PendingInteraction::SubagentTranscript {
-                        id,
-                        offset: offset.saturating_sub(1),
-                    });
-                    Action::None
-                }
-                KeyCode::Down | KeyCode::Char('j') if !ctrl && !alt => {
-                    let offset = (offset + 1).min(self.subagent_log_max_offset(&id));
-                    self.pending = Some(PendingInteraction::SubagentTranscript { id, offset });
-                    Action::None
-                }
-                _ => {
-                    self.pending = Some(PendingInteraction::SubagentTranscript { id, offset });
-                    Action::None
-                }
-            },
             PendingInteraction::StatusLinePicker { mut selected } => match key.code {
                 KeyCode::Esc => Action::None,
                 KeyCode::Enter => Action::None,
@@ -13180,45 +13126,6 @@ impl AppState {
                     "Bash(npm test)"
                 },
             }),
-            PendingInteraction::SubagentTranscript { id, offset } => {
-                let log = self.subagent_logs.get(id);
-                let running = self.subagents.iter().find(|running| &running.id == id);
-                let mut lines = log
-                    .into_iter()
-                    .flatten()
-                    .skip(*offset)
-                    .take(PICKER_ROWS)
-                    .map(|line| OverlayLine {
-                        text: line.text.clone(),
-                        selected: false,
-                        muted: line.muted,
-                    })
-                    .collect::<Vec<_>>();
-                if lines.is_empty() {
-                    lines.push(OverlayLine {
-                        text: tr("아직 기록된 활동이 없습니다.", "No activity recorded yet.").to_owned(),
-                        selected: false,
-                        muted: true,
-                    });
-                }
-                Some(OverlayView {
-                    closable: true,
-                    title: match running {
-                        Some(running) if running.description.is_empty() => running.name.clone(),
-                        Some(running) => format!("{} · {}", running.name, running.description),
-                        // The row is gone once the subagent finishes, but the
-                        // record it left behind stays readable.
-                        None => "Subagent · Finished".to_owned(),
-                    },
-                    lines,
-                    slider: None,
-                    hint: "↑↓ scroll  ·  Esc to return".to_owned(),
-                    style: OverlayStyle::KeyboardOnlyPanel,
-                    input: None,
-                    input_label: "",
-                    input_placeholder: "",
-                })
-            }
             PendingInteraction::VibeModePicker { selected, .. } => {
                 let vibe = VibeMode::PICKER_CHOICES[*selected];
                 Some(OverlayView {
@@ -15482,8 +15389,6 @@ impl AppState {
     /// The `✕` on a panel the user opened themselves: closes it, exactly as Esc
     /// does. Only the panels that paint the mark can be shut this way, so a prompt
     /// the server is waiting on stays put whatever is clicked.
-    /// Opens the transcript panel for the subagent shown on the clicked row. The
-    /// panel starts at the newest lines, which is where the work is.
     /// Puts the artifact row away and reports the URLs that went with it, so the
     /// caller can remember them: a resumed or forked session republishes its
     /// transcript's artifacts, and a dismissed row must not come back.
@@ -15498,20 +15403,12 @@ impl AppState {
         dismissed
     }
 
-    pub fn open_subagent(&mut self, index: usize) -> Action {
-        let Some(id) = self.subagents.get(index).map(|running| running.id.clone()) else {
-            return Action::None;
-        };
-        let offset = self.subagent_log_max_offset(&id);
-        self.pending = Some(PendingInteraction::SubagentTranscript { id, offset });
-        Action::Tick(true)
-    }
-
-    fn subagent_log_max_offset(&self, id: &str) -> usize {
-        self.subagent_logs
-            .get(id)
-            .map(|log| log.len().saturating_sub(PICKER_ROWS))
-            .unwrap_or(0)
+    pub fn stop_subagent(&self, id: String) -> Action {
+        let turn = self
+            .codex_subagents
+            .get(&id)
+            .and_then(|metadata| metadata.turn_id.clone());
+        Action::StopSubagent { id, turn }
     }
 
     pub fn close_overlay(&mut self) -> Action {
@@ -21076,6 +20973,182 @@ mod tests {
         assert!(state.editor.is_empty());
     }
 
+    /// A follow-up sent before its turn has an id keeps its card, steers that turn
+    /// once it has one, and otherwise comes back — with the prompt it followed on
+    /// a failed start or an Esc, alone when the turn ends or an earlier Esc stops it.
+    #[test]
+    fn a_follow_up_sent_before_its_turn_starts_steers_it_or_comes_back() {
+        fn submitted(state: &mut AppState) {
+            state.handle_paste("A");
+            let Action::Submit(text) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
+                panic!("제출돼야 한다");
+            };
+            // `start_turn` fixes the prompt's input before its session is built.
+            state.turn_input(text);
+        }
+        fn steered(state: &mut AppState) {
+            state.handle_paste("B");
+            assert!(state.enter_steers());
+            let Action::Steer(steer) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
+                panic!("후속 입력이어야 한다");
+            };
+            state.defer_steer(steer);
+        }
+
+        let mut state = test_state();
+        submitted(&mut state);
+        steered(&mut state);
+        assert_eq!(state.turn_prompts.len(), 2, "두 카드 모두 바로 보인다");
+        assert!(
+            state.take_early_steers().is_empty(),
+            "턴 ID 전에는 보내지 않는다"
+        );
+        state.set_turn_started("turn-1".to_owned());
+        let steers = state.take_early_steers();
+        assert_eq!(steers.len(), 1);
+        assert_eq!(steers[0].0, "B");
+        assert_eq!(steers[0].1[0]["text"], "B");
+        assert!(state.take_early_steers().is_empty());
+
+        let mut state = test_state();
+        submitted(&mut state);
+        steered(&mut state);
+        state.set_request_failed("start failed");
+        assert_eq!(state.editor.text(), "A\n\nB");
+        assert!(state.early_steers.is_empty());
+
+        let mut state = test_state();
+        submitted(&mut state);
+        steered(&mut state);
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(state.editor.text(), "A\n\nB");
+        assert!(state.early_steers.is_empty());
+
+        let mut state = test_state();
+        submitted(&mut state);
+        steered(&mut state);
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "threadId": "thread", "turn": { "id": "turn-1", "status": "completed" } }),
+        );
+        assert_eq!(state.editor.text(), "B", "답한 프롬프트는 돌아오지 않는다");
+        assert!(state.early_steers.is_empty());
+
+        // After an Esc the turn is stopped the moment it starts, so a follow-up
+        // typed after it comes back instead of steering that turn.
+        let mut state = test_state();
+        submitted(&mut state);
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        state.editor.clear();
+        steered(&mut state);
+        state.set_turn_started("turn-1".to_owned());
+        assert!(state.take_pending_interrupt().is_some());
+        assert_eq!(state.editor.text(), "B");
+        assert!(state.take_early_steers().is_empty());
+    }
+
+    /// Each input keeps its own attachments: a first prompt's leave the composer
+    /// before its session opens, and a held follow-up's when it is sent, so the
+    /// next draft starts clean and an empty Enter meanwhile sends nothing.
+    #[test]
+    fn inputs_sent_while_a_session_opens_keep_their_own_attachments() {
+        fn paths(input: &[Value]) -> Vec<&str> {
+            input
+                .iter()
+                .filter_map(|item| item.get("path").and_then(Value::as_str))
+                .collect()
+        }
+        let mut state = test_state();
+        state.attach_local_image(r"C:\a.png".to_owned());
+        state.handle_paste("A");
+        let Action::Submit(text) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
+            panic!("제출돼야 한다");
+        };
+        let first = state.turn_input(text);
+        assert_eq!(paths(&first), [r"C:\a.png"]);
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::None
+        ));
+
+        state.attach_local_image(r"C:\b.png".to_owned());
+        state.handle_paste("B");
+        let Action::Steer(steer) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
+            panic!("후속 입력이어야 한다");
+        };
+        state.defer_steer(steer);
+        state.attach_local_image(r"C:\c.png".to_owned());
+        state.set_turn_started("turn-1".to_owned());
+        let steers = state.take_early_steers();
+        assert_eq!(paths(&steers[0].1), [r"C:\b.png"]);
+        assert_eq!(state.composer_images, vec![r"C:\c.png".to_owned()]);
+    }
+
+    /// Follow-ups held for one turn go out together, so a refused steer hands
+    /// them all back while the prompt that opened the turn stays sent.
+    #[test]
+    fn a_refused_batch_of_held_follow_ups_comes_back_whole() {
+        let mut state = test_state();
+        state.handle_paste("A");
+        let Action::Submit(text) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
+            panic!("제출돼야 한다");
+        };
+        state.turn_input(text);
+        for follow_up in ["B", "C"] {
+            state.handle_paste(follow_up);
+            let Action::Steer(steer) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
+                panic!("후속 입력이어야 한다");
+            };
+            state.defer_steer(steer);
+        }
+        state.set_turn_started("turn-1".to_owned());
+        let count = state.take_early_steers().len();
+        state.restore_last_unsent(count);
+        assert_eq!(state.editor.text(), "B\n\nC");
+    }
+
+    /// Esc on an empty shell-mode composer leaves shell mode first, as
+    /// `handle_key` reads it; only otherwise does it take back the prompt.
+    #[test]
+    fn esc_leaves_an_empty_shell_composer_before_taking_back_a_prompt() {
+        let mut state = test_state();
+        state.handle_paste("A");
+        let Action::Submit(_) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
+            panic!("제출돼야 한다");
+        };
+        assert!(state.esc_takes_back_prompt());
+        state.handle_key(KeyEvent::from(KeyCode::Char('!')));
+        assert!(!state.esc_takes_back_prompt());
+        state.handle_paste("ls");
+        assert!(state.esc_takes_back_prompt());
+    }
+
+    /// Only a send steers before the session exists; a slash or shell command
+    /// waits for it.
+    #[test]
+    fn only_a_send_steers_while_a_prompt_is_in_flight() {
+        let mut state = test_state();
+        state.handle_paste("next");
+        assert!(
+            !state.enter_steers(),
+            "보낸 프롬프트가 없으면 steer가 아니다"
+        );
+        state.editor.clear();
+        state.handle_paste("A");
+        let Action::Submit(_) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
+            panic!("제출돼야 한다");
+        };
+        state.handle_paste("next");
+        assert!(state.enter_steers());
+        state.editor.clear();
+        state.handle_paste("/model");
+        assert!(!state.enter_steers());
+        state.editor.clear();
+        state.handle_key(KeyEvent::from(KeyCode::Char('!')));
+        state.handle_paste("cargo test");
+        assert!(!state.enter_steers());
+    }
+
     #[test]
     fn down_outside_history_leaves_shell_mode_alone() {
         let mut state = test_state();
@@ -21674,6 +21747,42 @@ mod tests {
                 "Web search · 1 search · tokio docs"
             ]
         );
+    }
+
+    /// 검색이 끝난 뒤에도 남아 있던 웹 검색 줄 아래로 steer 카드가 쌓여야 한다.
+    /// 카드가 먼저 기록에 올라가 진행 영역의 검색 줄 위에 놓이던 순서를 막는다.
+    #[test]
+    fn super_vibe_web_search_row_settles_above_a_steer_card() {
+        let mut state = test_state();
+        state.show_welcome = false;
+        state.apply_vibe_mode(VibeMode::SuperVibe);
+        assert!(matches!(
+            state.submit_text("첫 요청".to_owned(), "첫 요청".to_owned()),
+            Action::Submit(_)
+        ));
+        state.drain_committed();
+        state.set_turn_started("turn-1".to_owned());
+        state.complete_item(&json!({ "id": "s1", "type": "webSearch", "query": "rust async" }));
+        state.drain_committed();
+
+        assert!(matches!(
+            state.submit_text("끼어든 질문".to_owned(), "끼어든 질문".to_owned()),
+            Action::Steer(_)
+        ));
+        let order = state
+            .drain_committed()
+            .into_iter()
+            .filter(|block| block.title.starts_with("Web search") || block.body == "끼어든 질문")
+            .map(|block| {
+                if matches!(block.kind, BlockKind::User) {
+                    block.body
+                } else {
+                    block.title
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(order, ["Web search · 1 search · rust async", "끼어든 질문"]);
+        assert!(state.view().live_blocks.is_empty());
     }
 
     #[test]
@@ -22486,13 +22595,6 @@ mod tests {
                 "subagents": [{ "id": "toolu_1", "name": "Explore", "description": "", "tool": "Grep" }],
             }),
         );
-        state.handle_notification(
-            "turn/subagent/line",
-            &json!({
-                "parentToolUseId": "toolu_1",
-                "line": { "kind": "text", "text": "조사 중" },
-            }),
-        );
         state.handle_notification("turn/completed", &json!({}));
 
         // 유예가 지나기 전에는 백그라운드 에이전트로 보고 남겨 둔다.
@@ -22503,7 +22605,6 @@ mod tests {
         state.subagents_settled_at = Some(Instant::now() - SUBAGENT_LINGER_GRACE);
         assert!(state.sweep_settled_subagents());
         assert!(state.subagents.is_empty());
-        assert!(state.subagent_logs.is_empty());
         assert!(state.subagents_settled_at.is_none());
     }
 
@@ -22517,20 +22618,8 @@ mod tests {
             }),
         );
         state.handle_notification("turn/completed", &json!({}));
-        state.subagents_settled_at = Some(Instant::now() - SUBAGENT_LINGER_GRACE);
 
-        // 로그 한 줄이 오면 아직 살아 있는 것이므로 유예를 다시 센다.
-        state.handle_notification(
-            "turn/subagent/line",
-            &json!({
-                "parentToolUseId": "toolu_1",
-                "line": { "kind": "text", "text": "아직 작업 중" },
-            }),
-        );
-        assert!(!state.sweep_settled_subagents());
-        assert_eq!(state.subagents.len(), 1);
-
-        // 목록 갱신도 유예를 다시 센다.
+        // 목록 갱신이 오면 아직 살아 있는 것이므로 유예를 다시 센다.
         state.subagents_settled_at = Some(Instant::now() - SUBAGENT_LINGER_GRACE);
         state.handle_notification(
             "turn/subagents/updated",
@@ -22663,13 +22752,7 @@ mod tests {
                 }
             }),
         );
-        assert_eq!(
-            state.subagent_logs[child]
-                .iter()
-                .map(|line| line.text.clone())
-                .collect::<Vec<_>>(),
-            ["⏺ $ rg auth src", "인증 흐름을 찾았습니다."]
-        );
+        assert_eq!(state.view().subagents[0].tool, "$ rg auth src");
 
         state.handle_notification(
             "turn/completed",
@@ -22911,6 +22994,79 @@ mod tests {
         assert!(state.codex_subagents[child].terminal);
     }
 
+    #[test]
+    fn codex_child_activity_defers_the_linger_probe() {
+        let mut state = test_state();
+        let child = "00000000-0000-0000-0000-000000000109";
+        spawn_codex_subagent(&mut state, child);
+        state.handle_notification("turn/completed", &json!({ "threadId": "thread" }));
+        state.subagents_settled_at = Some(Instant::now() - SUBAGENT_LINGER_GRACE);
+
+        // 자식 스레드의 항목은 아직 일하고 있다는 신호이므로 유예를 다시 센다.
+        state.handle_notification(
+            "item/started",
+            &json!({
+                "threadId": child,
+                "item": { "id": "command-1", "type": "commandExecution", "command": "rg auth" }
+            }),
+        );
+
+        assert!(state.take_codex_subagent_probes().is_empty());
+        assert_eq!(state.view().subagents.len(), 1);
+    }
+
+    /// 자식이 `/root`에게 말을 걸면 그 활동 항목이 이 스레드를 가리킨다. 그것으로
+    /// 이 스레드가 하위 에이전트 행이 되면 행의 x가 본 작업을 멈춘다.
+    #[test]
+    fn codex_activity_naming_the_root_agent_never_lists_this_thread() {
+        let mut state = test_state();
+        let child = "00000000-0000-0000-0000-000000000110";
+        spawn_codex_subagent(&mut state, child);
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "threadId": child,
+                "item": {
+                    "id": "activity-root",
+                    "type": "subAgentActivity",
+                    "kind": "interacted",
+                    "agentThreadId": "thread",
+                    "agentPath": "/root"
+                }
+            }),
+        );
+        state.handle_notification(
+            "turn/started",
+            &json!({ "threadId": "thread", "turn": { "id": "parent-turn-2" } }),
+        );
+
+        let rows = state.view().subagents;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, child);
+    }
+
+    /// Codex는 자식 스레드의 턴을 중단해 하위 에이전트 하나만 멈춘다. 그 턴 id는
+    /// 자식의 `turn/started`에서 온다. Claude 행은 행 id만으로 작업을 찾는다.
+    #[test]
+    fn stopping_a_subagent_row_carries_the_codex_child_turn() {
+        let mut state = test_state();
+        let child = "00000000-0000-0000-0000-000000000111";
+        spawn_codex_subagent(&mut state, child);
+        state.handle_notification(
+            "turn/started",
+            &json!({ "threadId": child, "turn": { "id": "child-turn" } }),
+        );
+
+        assert!(matches!(
+            state.stop_subagent(child.to_owned()),
+            Action::StopSubagent { id, turn: Some(turn) } if id == child && turn == "child-turn"
+        ));
+        assert!(matches!(
+            state.stop_subagent("toolu_1".to_owned()),
+            Action::StopSubagent { turn: None, .. }
+        ));
+    }
+
     fn state_with_a_running_subagent() -> AppState {
         let mut state = test_state();
         state.handle_notification(
@@ -22925,97 +23081,6 @@ mod tests {
             }),
         );
         state
-    }
-
-    fn subagent_line_notification(kind: &str, text: &str) -> Value {
-        json!({
-            "parentToolUseId": "toolu_1",
-            "line": { "kind": kind, "text": text },
-        })
-    }
-
-    #[test]
-    fn subagent_lines_are_recorded_with_a_marker_for_each_kind() {
-        let mut state = state_with_a_running_subagent();
-
-        state.handle_notification(
-            "turn/subagent/line",
-            &subagent_line_notification("text", "auth 코드를 찾는 중"),
-        );
-        state.handle_notification(
-            "turn/subagent/line",
-            &subagent_line_notification("tool", "Grep(fn login)"),
-        );
-        state.handle_notification(
-            "turn/subagent/line",
-            &subagent_line_notification("result", "3 matches"),
-        );
-        state.handle_notification(
-            "turn/subagent/line",
-            &subagent_line_notification("text", "   "),
-        );
-
-        let log = &state.subagent_logs["toolu_1"];
-        assert_eq!(
-            log.iter()
-                .map(|line| line.text.as_str())
-                .collect::<Vec<_>>(),
-            ["auth 코드를 찾는 중", "⏺ Grep(fn login)", "  ⎿ 3 matches"],
-            "a blank line carries nothing and is left out"
-        );
-        assert_eq!(
-            log.iter().map(|line| line.muted).collect::<Vec<_>>(),
-            [false, true, true]
-        );
-    }
-
-    #[test]
-    fn clicking_a_subagent_row_opens_its_transcript_and_esc_returns_to_main() {
-        let mut state = state_with_a_running_subagent();
-        state.handle_notification(
-            "turn/subagent/line",
-            &subagent_line_notification("text", "찾는 중"),
-        );
-
-        state.open_subagent(0);
-        let overlay = state.overlay_view().expect("subagent panel");
-
-        assert_eq!(overlay.title, "Explore · Find auth code");
-        assert_eq!(
-            overlay
-                .lines
-                .iter()
-                .map(|line| line.text.as_str())
-                .collect::<Vec<_>>(),
-            ["찾는 중"]
-        );
-        assert!(overlay.closable);
-
-        state.close_overlay();
-
-        assert!(state.overlay_view().is_none());
-    }
-
-    #[test]
-    fn a_background_subagent_panel_survives_the_parent_turn() {
-        let mut state = state_with_a_running_subagent();
-        state.handle_notification(
-            "turn/subagent/line",
-            &subagent_line_notification("text", "찾는 중"),
-        );
-        state.open_subagent(0);
-
-        state.handle_notification("turn/completed", &json!({}));
-
-        assert!(state.overlay_view().is_some());
-        assert_eq!(state.subagent_logs["toolu_1"].len(), 1);
-
-        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
-
-        assert_eq!(
-            state.overlay_view().map(|overlay| overlay.title),
-            Some("Subagent · Finished".to_owned())
-        );
     }
 
     #[test]
@@ -23048,26 +23113,12 @@ mod tests {
     }
 
     #[test]
-    fn switching_sessions_clears_background_subagents_and_their_logs() {
+    fn switching_sessions_clears_background_subagents() {
         let mut state = state_with_a_running_subagent();
-        state.handle_notification(
-            "turn/subagent/line",
-            &subagent_line_notification("text", "찾는 중"),
-        );
 
         state.prepare_resume();
 
         assert!(state.subagents.is_empty());
-        assert!(state.subagent_logs.is_empty());
-    }
-
-    #[test]
-    fn clicking_a_row_that_is_already_gone_opens_nothing() {
-        let mut state = test_state();
-
-        state.open_subagent(0);
-
-        assert!(state.overlay_view().is_none());
     }
 
     #[test]
