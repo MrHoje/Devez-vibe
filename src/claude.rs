@@ -417,24 +417,23 @@ pub fn model_catalog() -> Value {
         ])
     };
     // Safeguard fallback only; `hidden` keeps it out of /model.
-    let mut previous_opus =
-        claude_model("claude:claude-opus-5", "Claude Opus 5", efforts(), false);
+    let mut previous_opus = claude_model("claude:claude-opus-5", "Opus 5", efforts(), false);
     previous_opus["hidden"] = json!(true);
-    let mut haiku = claude_model("claude:haiku", "Claude Haiku 5.5", efforts(), false);
+    let mut haiku = claude_model("claude:haiku", "Haiku 5.5", efforts(), false);
     haiku["supportsAutoMode"] = json!(true);
     let one_million_disabled = env::var("CLAUDE_CODE_DISABLE_1M_CONTEXT")
         .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true"));
     haiku["contextWindow"] = json!(if one_million_disabled { 200_000 } else { 1_000_000 });
     json!({
         "data": [
-            claude_model("claude:claude-fable-5-1", "Claude Fable 5.1", efforts(), false),
-            claude_model("claude:opus", "Claude Opus 5.5", efforts(), false),
+            claude_model("claude:claude-fable-5-1", "Fable 5.1", efforts(), false),
+            claude_model("claude:opus", "Opus 5.5", efforts(), false),
             previous_opus,
-            claude_model("claude:sonnet", "Claude Sonnet 5.5", efforts(), true),
+            claude_model("claude:sonnet", "Sonnet 5.5", efforts(), true),
             haiku,
             // Older versions follow every family's newest, like the bridge's order.
             // The `fable` alias now resolves to Fable 5.1, so Fable 5 needs its id.
-            claude_model("claude:claude-fable-5", "Claude Fable 5", efforts(), false)
+            claude_model("claude:claude-fable-5", "Fable 5", efforts(), false)
         ]
     })
 }
@@ -939,12 +938,12 @@ mod tests {
                 .filter_map(|model| model.get("displayName").and_then(Value::as_str))
                 .collect::<Vec<_>>(),
             [
-                "Claude Fable 5.1",
-                "Claude Opus 5.5",
-                "Claude Opus 5",
-                "Claude Sonnet 5.5",
-                "Claude Haiku 5.5",
-                "Claude Fable 5"
+                "Fable 5.1",
+                "Opus 5.5",
+                "Opus 5",
+                "Sonnet 5.5",
+                "Haiku 5.5",
+                "Fable 5"
             ]
         );
         assert_eq!(

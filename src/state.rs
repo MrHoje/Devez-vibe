@@ -1307,10 +1307,12 @@ pub enum Action {
     OpenUrl(String),
     OpenLinkDirectory(String),
     SetTheme(ThemeKind),
-    /// Write the picked model and effort into `~/.codex/config.toml`.
+    /// Write the picked model and effort into `~/.codex/config.toml`, and as
+    /// the provider default under `provider_key`.
     PersistModelDefault {
         model: String,
         effort: String,
+        provider_key: &'static str,
     },
     /// Save the model a provider switch lands on, as "<model> <effort>".
     PersistProviderModelDefault {
@@ -3982,6 +3984,10 @@ pub struct AppState {
     /// 턴이 끝났는데 하위 에이전트 행이 남아 있으면 그 시각. 유예가 지나도록
     /// 갱신이 없으면 종료 알림을 놓친 것으로 보고 행을 거둔다.
     subagents_settled_at: Option<Instant>,
+    /// Background rows appeared while Claude Code was running. The main agent's
+    /// runs on their results start only after the rows are gone, so the host
+    /// waits for Claude Code's own idle instead of the turn's end.
+    runtime_children: bool,
     /// Idle rows spin between full frames only where dvz draws the IME preedit
     /// itself (DevezCode). An external terminal paints its own preedit and loses
     /// it whenever the cursor hides, so there idle rows wait for the next second.
@@ -4309,6 +4315,7 @@ impl AppState {
             dismissed_artifacts: read_dismissed_artifacts(),
             codex_subagents: HashMap::new(),
             subagents_settled_at: None,
+            runtime_children: false,
             command_selection: 0,
             spinner_frame: 0,
             compacting_started_at: None,
@@ -5180,26 +5187,28 @@ impl AppState {
         self.busy || self.compacting()
     }
 
+    /// The host files a finished response the moment this turns false, so it
+    /// also covers the gap after a child's row is gone and before the main
+    /// agent's run on its result shows its first frame.
+    pub fn host_busy(&self) -> bool {
+        self.busy || self.host_children_busy() || self.runtime_children
+    }
+
     /// A background child can outlive the turn that started it. The host tab
     /// keeps spinning while those rows live so work in flight never looks done.
     pub fn host_children_busy(&self) -> bool {
         !self.subagents.is_empty()
     }
 
-    /// 대화를 떠나 살아 있는 작업이 화면에서 사라지지 않게 한다.
-    pub fn allow_thread_switch(&mut self) -> bool {
-        if !self.host_children_busy() {
-            return true;
-        }
-        self.push_notice(
-            BlockKind::Warning,
-            "Background work in progress",
-            tr(
-                "백그라운드 작업을 마치거나 중단한 뒤 대화를 전환하세요.",
-                "Finish or stop the background work before switching conversations.",
-            ),
-        );
-        false
+    /// 순정처럼 응답 중에 들어온 대화 전환 명령은 줄에 세웠다가 턴이 끝나면 실행한다.
+    /// 중단하면 줄이 곧바로 이어진다.
+    fn queue_command(&mut self, command: &str) -> Action {
+        self.queued_prompts.push_back(QueuedPrompt {
+            text: command.to_owned(),
+            display: command.to_owned(),
+            images: Vec::new(),
+        });
+        Action::None
     }
 
     pub fn host_loading(&self) -> bool {
@@ -5285,6 +5294,9 @@ impl AppState {
         model: &str,
         effort: Option<&str>,
     ) {
+        // The activity belonged to the session this one replaces, whose own
+        // end may never reach a screen that already moved on.
+        self.runtime_children &= self.thread_id == thread_id;
         self.thread_id = thread_id;
         self.resume_id = String::new();
         let cwd = plain_folder(cwd);
@@ -7432,6 +7444,7 @@ impl AppState {
         self.task_output = None;
         self.subagent_view_blocks.clear();
         self.subagents_settled_at = None;
+        self.runtime_children = false;
         self.busy = false;
         self.turn_id = None;
         self.pending_interrupt = false;
@@ -10037,6 +10050,9 @@ impl AppState {
             "claude/usageLimit/waiting" => {
                 self.claude_usage_limit_reset = params.get("resetsAt").and_then(Value::as_i64);
             }
+            "claude/session/state" => {
+                self.runtime_children &= params.get("active") == Some(&json!(true));
+            }
             "claude/ultracode/unavailable" => {
                 self.ultracode = false;
                 self.committed.push(Block::new(
@@ -10360,6 +10376,8 @@ impl AppState {
                     })
                     .collect();
                 self.linger_finished_subagents(before);
+                self.runtime_children |=
+                    params.get("runtimeActive") == Some(&json!(true)) && !self.subagents.is_empty();
                 // 갱신이 온 순간부터 유예를 다시 센다. 턴이 도는 중에는 유예를
                 // 걸지 않고, 빈 목록이면 지울 것도 없다.
                 self.subagents_settled_at =
@@ -10853,13 +10871,13 @@ impl AppState {
 
     pub(crate) fn run_slash_command(&mut self, command: &str) -> Action {
         let parts = command.split_whitespace().collect::<Vec<_>>();
-        if matches!(
-            parts.first().copied(),
-            Some("/new" | "/clear" | "/resume" | "/continue" | "/worktree")
-        )
-            && !self.allow_thread_switch()
+        if self.busy
+            && matches!(
+                parts.first().copied(),
+                Some("/new" | "/clear" | "/resume" | "/continue" | "/worktree")
+            )
         {
-            return Action::None;
+            return self.queue_command(command);
         }
         let using_claude = self.selected_model_name().starts_with("claude:");
         // OpenCode에는 아래 통합 기능이 없다. Claude나 Codex 런타임으로 잘못
@@ -11390,14 +11408,6 @@ impl AppState {
                 ));
                 Action::None
             }
-            "/resume" | "/continue" if self.busy => {
-                self.committed.push(Block::new(
-                    BlockKind::Warning,
-                    "Response in progress",
-                    tr("현재 응답을 중단한 뒤 세션을 전환하세요.", "Stop the current response before switching sessions."),
-                ));
-                Action::None
-            }
             "/resume" if parts.len() == 1 => Action::OpenResume,
             "/resume" => Action::ResumeThread(parts[1..].join(" ")),
             "/continue" => Action::OpenResume,
@@ -11490,13 +11500,13 @@ impl AppState {
                     .push(Block::new(BlockKind::Error, "Usage", "/side-panel"));
                 Action::None
             }
-            "/worktree" if self.busy || self.side_parent.is_some() => {
+            "/worktree" if self.side_parent.is_some() => {
                 self.push_notice(
                     BlockKind::Warning,
                     "Unavailable here",
                     tr(
-                        "응답을 중단하고 기본 대화에서 /worktree를 실행하세요.",
-                        "Stop the response and run /worktree from the main conversation.",
+                        "기본 대화에서 /worktree를 실행하세요.",
+                        "Run /worktree from the main conversation.",
                     ),
                 );
                 Action::None
@@ -11506,17 +11516,6 @@ impl AppState {
             }
             "/worktree" => {
                 self.push_notice(BlockKind::Error, "Usage", tr("/worktree [이름]", "/worktree [NAME]"));
-                Action::None
-            }
-            "/new" | "/clear" if self.busy => {
-                self.committed.push(Block::new(
-                    BlockKind::Warning,
-                    "Response in progress",
-                    tr(
-                        "현재 응답을 중단한 뒤 새 대화를 시작하세요.",
-                        "Stop the current response before starting a new conversation.",
-                    ),
-                ));
                 Action::None
             }
             "/agent" => {
@@ -14780,16 +14779,21 @@ impl AppState {
         let Some(model) = self.models.get(model_index) else {
             return Action::None;
         };
+        let key = ModelProvider::from_model(&model.model).default_model_key();
         if scope == ModelScope::ProviderDefault {
-            let key = ModelProvider::from_model(&model.model).default_model_key();
             let effort = effort.unwrap_or_else(|| model.default_effort.clone());
             let value = format!("{} {effort}", model.model);
             self.provider_default_models.insert(key, value.clone());
             return Action::PersistProviderModelDefault { key, value };
         }
+        // The overall default is also its provider's, so switching away and
+        // back lands on the model new sessions start with.
+        let effort = self.selected_effort.clone();
+        self.provider_default_models.insert(key, format!("{} {effort}", model.model));
         Action::PersistModelDefault {
             model: model.model.clone(),
-            effort: self.selected_effort.clone(),
+            effort,
+            provider_key: key,
         }
     }
 
@@ -23195,6 +23199,65 @@ mod tests {
         assert!(!state.host_children_busy());
     }
 
+    /// The order measured on the real bridge: the main turn ends, the child's
+    /// row goes, and only later does the run on its result open a turn. The
+    /// host files a finished response on every busy → idle, so the gap between
+    /// the row and that run's first frame must stay busy until Claude Code
+    /// itself reports the session idle.
+    #[test]
+    fn the_host_stays_busy_until_claude_code_reports_the_session_idle() {
+        let mut state = test_state();
+        let child = json!([{ "id": "toolu_1", "name": "probe", "backgroundTask": true }]);
+        let claude_rows = |rows: &Value| json!({ "subagents": rows, "runtimeActive": true });
+        // Only the last step, Claude Code's own idle, may let the tab stop.
+        let steps = [
+            ("turn/started", json!({ "turn": { "id": "main" } })),
+            ("claude/session/state", json!({ "active": true })),
+            ("turn/subagents/updated", claude_rows(&child)),
+            ("turn/completed", json!({ "turn": { "id": "main" } })),
+            ("turn/subagents/updated", claude_rows(&json!([]))),
+            ("turn/started", json!({ "turn": { "id": "follow-up" } })),
+            ("turn/completed", json!({ "turn": { "id": "follow-up" } })),
+            ("claude/session/state", json!({ "active": false })),
+        ];
+        let last = steps.len() - 1;
+        for (index, (method, params)) in steps.iter().enumerate() {
+            state.handle_notification(method, params);
+            assert_eq!(
+                state.host_busy(),
+                index < last,
+                "after {method} (step {index})"
+            );
+        }
+
+        // Rows from a runtime that does not report its state (OpenCode, an
+        // older bridge) and work without rows end with their turn as before,
+        // so a `/compact` turn is never reported as a response in between.
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": child }));
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
+        assert!(!state.host_busy());
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "plain" } }));
+        state.handle_notification("turn/completed", &json!({ "turn": { "id": "plain" } }));
+        assert!(!state.host_busy());
+
+        // A session the screen leaves cannot keep the tab spinning after it.
+        let finish_child = |state: &mut AppState| {
+            state.handle_notification("turn/subagents/updated", &claude_rows(&child));
+            state.handle_notification("turn/subagents/updated", &claude_rows(&json!([])));
+        };
+        finish_child(&mut state);
+        state.attach_thread("thread".to_owned(), "cwd".to_owned(), "gpt-5.6-sol", None);
+        assert!(
+            state.host_busy(),
+            "re-attaching the same session keeps its work"
+        );
+        state.attach_thread("other".to_owned(), "cwd".to_owned(), "gpt-5.6-sol", None);
+        assert!(!state.host_busy());
+        finish_child(&mut state);
+        state.prepare_resume();
+        assert!(!state.host_busy());
+    }
+
     #[test]
     fn a_terminal_subagent_snapshot_clears_the_row_during_the_parent_turn() {
         let mut state = test_state();
@@ -25256,14 +25319,13 @@ mod tests {
         state.submit_editor();
         assert!(state.view().welcome.is_none());
 
-        // 응답이 도는 동안에는 `/new`와 마찬가지로 새 대화를 열지 않는다.
+        // 응답이 도는 동안에는 순정처럼 줄에 세웠다가 턴이 끝나면 새 대화를 연다.
         assert!(matches!(state.run_slash_command("/clear"), Action::None));
+        assert_eq!(state.view().queued_prompts, ["/clear"]);
 
         state.busy = false;
-        assert!(matches!(
-            state.run_slash_command("/clear"),
-            Action::NewThread
-        ));
+        let queued = state.take_queued_prompt().expect("queued /clear");
+        assert!(matches!(state.start_queued_prompt(queued), Action::NewThread));
         state.prepare_new_thread();
 
         assert!(state.view().welcome.is_some());
@@ -27347,8 +27409,8 @@ mod tests {
 
         assert!(matches!(
             action,
-            Action::PersistModelDefault { ref model, ref effort }
-                if model == "gpt-5.6-sol" && effort == "xhigh"
+            Action::PersistModelDefault { ref model, ref effort, provider_key }
+                if model == "gpt-5.6-sol" && effort == "xhigh" && provider_key == "codex_default_model"
         ));
         assert!(state.overlay_view().is_none());
     }
@@ -27416,6 +27478,34 @@ mod tests {
 
         state.switch_provider(ModelProvider::Codex);
         assert_eq!(state.selected_model_name(), "gpt-5.6-sol");
+        state.switch_provider(ModelProvider::Claude);
+        assert_eq!(state.selected_model_name(), "claude:claude-opus-5-5");
+        assert_eq!(state.selected_effort, "max");
+    }
+
+    #[test]
+    fn the_overall_default_is_also_where_switching_back_lands() {
+        let mut state = AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![
+                test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
+                test_model("claude:claude-sonnet-5", "Sonnet 5", true),
+                test_model("claude:claude-opus-5-5", "Opus 5.5", false),
+            ],
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+        state.switch_provider(ModelProvider::Claude);
+
+        let action = state.apply_model_scope(2, 4, ModelScope::Default);
+        assert!(matches!(
+            action,
+            Action::PersistModelDefault { provider_key: "claude_default_model", .. }
+        ));
+
+        state.switch_provider(ModelProvider::Codex);
         state.switch_provider(ModelProvider::Claude);
         assert_eq!(state.selected_model_name(), "claude:claude-opus-5-5");
         assert_eq!(state.selected_effort, "max");
@@ -27972,19 +28062,25 @@ mod tests {
     }
 
     #[test]
-    fn thread_switches_leave_live_background_work_visible() {
-        for command in ["/new", "/clear", "/resume other", "/continue other", "/worktree"] {
-            let mut state = state_with_a_running_subagent();
-            let previous_thread = state.thread_id.clone();
-            assert!(matches!(state.run_command(command), Action::None), "{command}");
-            assert_eq!(state.thread_id, previous_thread);
-            assert!(state.host_children_busy());
-        }
-
+    fn thread_switches_never_wait_on_background_work_and_queue_behind_a_response() {
+        // 순정처럼 백그라운드 작업이 남아 있어도 곧바로 전환한다.
         let mut state = state_with_a_running_subagent();
-        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
-        assert!(!state.host_children_busy());
         assert!(matches!(state.run_command("/new"), Action::NewThread));
+        assert!(matches!(
+            state.run_command("/resume other"),
+            Action::ResumeThread(target) if target == "other"
+        ));
+        assert!(matches!(state.run_command("/worktree"), Action::Worktree(None)));
+
+        // 응답 중에는 줄에 세웠다가 턴이 끝나면 차례로 실행한다.
+        let mut state = busy_state_with_live_turn();
+        for command in ["/new", "/resume other", "/worktree"] {
+            assert!(matches!(state.run_command(command), Action::None), "{command}");
+        }
+        assert_eq!(state.view().queued_prompts, ["/new", "/resume other", "/worktree"]);
+        state.handle_notification("turn/completed", &json!({}));
+        let queued = state.take_queued_prompt().expect("queued /new");
+        assert!(matches!(state.start_queued_prompt(queued), Action::NewThread));
     }
 
     #[test]

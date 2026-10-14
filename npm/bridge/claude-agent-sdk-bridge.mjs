@@ -515,9 +515,16 @@ function adoptSessionId(session, incoming) {
   if (!real || real === session.id) return;
   const previous = session.id;
   sessions.delete(previous);
-  sessionAliases.set(previous, real);
   session.id = real;
   sessions.set(real, session);
+  // 호스트가 요청한 /clear는 같은 프로세스에 새 대화를 연다. 옛 대화는 기록대로
+  // 남으므로 옛 id를 새 대화로 잇지 않는다.
+  if (session.clearPending) {
+    session.clearPending = false;
+    session.clearWaiter?.(real);
+    return;
+  }
+  sessionAliases.set(previous, real);
   notify("claude/session/rebound", {
     threadId: visibleSession(previous),
     newThreadId: visibleSession(real),
@@ -757,7 +764,9 @@ function makeOptions(params, sessionId, resume) {
       preset: "claude_code",
       append: params.systemPrompt || "",
     },
-    env: sanitizedEnvironment(),
+    // The SDK reads the CLI's session state itself and drops it; this hands
+    // it on, so the host learns when the main session's work is really over.
+    env: { ...sanitizedEnvironment(), CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1" },
     stderr: (data) => process.stderr.write(data),
   };
   const model = stripClaudeModel(params.model);
@@ -861,6 +870,31 @@ async function startAgentQuery(prompt, options) {
     warm.close();
     throw error;
   }
+}
+
+// One Haiku reply. It reads no settings, hooks or project files, runs no tools,
+// keeps no transcript, and leaves the DevezCode room out so the host never
+// takes it for the room's session.
+async function haikuReply(prompt, params) {
+  await ensureClaudeExecutableChoice(params);
+  const env = sanitizedEnvironment();
+  delete env.DEVEZCODE_ROOM_ID;
+  const options = {
+    cwd: tmpdir(),
+    model: "haiku",
+    effort: "low",
+    maxTurns: 1,
+    persistSession: false,
+    settingSources: [],
+    tools: [],
+    env,
+  };
+  applyClaudeExecutable(options, params);
+  let reply = "";
+  for await (const message of await startAgentQuery(prompt, options)) {
+    if (message.type === "result") reply = message.result || "";
+  }
+  return reply;
 }
 
 function permissionSuggestionLabel(suggestions) {
@@ -1914,6 +1948,8 @@ async function createSession(params, resumeId) {
   const session = {
     id,
     cwd: params.cwd || process.cwd(),
+    // 진행 요약을 옮기는 단발 호출도 같은 CLI를 쓴다.
+    claudePath: params.claudePath || "",
     model: visibleModel(params.model),
     effort: params.effort || "",
     permissionMode: BOOTSTRAP_PERMISSION_MODE,
@@ -2030,10 +2066,11 @@ async function createSession(params, resumeId) {
   return { session, initialization, account, usage };
 }
 
+// 추가 입력·작업 통지의 후속 턴 예약은 살아 있는 작업의 증거가 아니다. 턴 중에
+// 흡수된 입력·통지는 CLI가 알려 주지 않아 예약이 끝없이 남으므로 전환을 막지 않는다.
 function sessionHasLiveWork(session) {
   return Boolean(session.initializing || session.promptStarting || session.queryRequests > 0 || session.turn
-    || session.pendingPrompts?.length || session.queue?.values?.length
-    || session.steerPending > 0 || session.automaticTurnsPending > 0 || session.usageLimitWait
+    || session.pendingPrompts?.length || session.queue?.values?.length || session.usageLimitWait
     || session.subagents?.size || session.hiddenSubagentTasks?.size || session.ambientSubagentTasks?.size
     || [...pendingHostRequests.values()].some((request) => request.session === session));
 }
@@ -2056,6 +2093,7 @@ function closeLiveSession(session) {
   clearUsageLimitWait(session);
   watchSubagent(session, null);
   clearSubagents(session);
+  noteRuntimeActive(session, false);
   for (const [id, request] of pendingHostRequests) {
     if (request.session !== session) continue;
     pendingHostRequests.delete(id);
@@ -3012,6 +3050,23 @@ function syncBackgroundSubagents(session, tasks) {
   if (changed || liveIds.size) emitSubagents(session);
 }
 
+// CLI는 진행 요약을 고정 영어 지시로 만들어 language 설정도 따르지 않는다. 한국어
+// 요청 세션이면 Haiku로 옮겨 보이고, 같은 문구는 한 번만 옮긴다. 실패하면 원문을 쓴다.
+const summaryTranslations = new Map();
+
+function translateSummary(session, summary) {
+  let translation = summaryTranslations.get(summary);
+  if (!translation) {
+    if (summaryTranslations.size >= 200) summaryTranslations.clear();
+    translation = haikuReply(
+      `다음 진행 상황 문구를 '~하는 중' 꼴의 한국어 한 줄로 옮긴다. 파일·함수 이름은 그대로 두고 결과만 쓴다.\n${summary}`,
+      session,
+    ).then((reply) => firstLine(reply, SUBAGENT_DESCRIPTION_LIMIT) || summary, () => summary);
+    summaryTranslations.set(summary, translation);
+  }
+  return translation;
+}
+
 function processSubagentSystemMessage(session, message) {
   if (String(message.subtype || "").startsWith("task_")) {
     const taskId = firstLine(message.task_id || "", 80);
@@ -3050,7 +3105,19 @@ function processSubagentSystemMessage(session, message) {
     const tool = firstLine(message.last_tool_name || "", 80);
     if (tool) running.tool = tool;
     const summary = firstLine(message.summary || "", SUBAGENT_DESCRIPTION_LIMIT);
-    if (summary) running.description = summary;
+    if (summary) {
+      running.latestSummary = summary;
+      if (session.lastKoreanRequest && !/[가-힣]/.test(summary)) {
+        // 옮기는 동안은 앞 설명을 두고, 그사이 새 요약이 왔거나 줄이 끝났으면 버린다.
+        translateSummary(session, summary).then((text) => {
+          if (running.latestSummary !== summary || session.subagents.get(running.id) !== running) return;
+          running.description = text;
+          emitSubagents(session);
+        });
+      } else {
+        running.description = summary;
+      }
+    }
     emitSubagents(session);
     return true;
   }
@@ -3163,6 +3230,16 @@ function clearSubagents(session) {
   if (changed) emitSubagents(session);
 }
 
+// The CLI says `idle` only after the main agent, the background agents it
+// waits on and the runs their results start have all ended. Between those
+// runs no turn is open and the subagent rows may be gone, so the host has to
+// hear this to keep the session busy instead of finishing it early.
+function noteRuntimeActive(session, active) {
+  if (Boolean(session.runtimeActive) === active) return;
+  session.runtimeActive = active;
+  notify("claude/session/state", { threadId: session.id, active });
+}
+
 function firstLine(value, limit) {
   return String(value ?? "").split("\n")[0].trim().slice(0, limit);
 }
@@ -3215,6 +3292,10 @@ function emitSubagents(session) {
   notify("turn/subagents/updated", {
     threadId: session.id,
     turnId: session.turn?.id,
+    // Rows that live while the CLI is still running keep the host busy until
+    // it reports idle; every pulse repeats this, so a host that switched
+    // conversations in between picks it up again.
+    runtimeActive: Boolean(session.runtimeActive),
     subagents: subagentRows(session).map(({ agent, depth }) => ({
       id: agent.id,
       // 스냅숏 자리표시자가 Agent 행에 접혀 사라져도 화면이 끝난 줄로 남기지 않게 한다.
@@ -3685,6 +3766,11 @@ function beginUntrackedTurn(session, message) {
 
 async function consumeMessage(session, message) {
   if (session.closed) return;
+  // 초기화 통지는 옛 id로 오고, 새 대화 id는 바로 뒤 메시지가 싣는다.
+  if (message.type === "conversation_reset") {
+    if (session.clearWaiter) session.clearPending = true;
+    return;
+  }
   adoptSessionId(session, message.session_id);
   beginUntrackedTurn(session, message);
   // A queued SDK response may beat the timer. It already resumes the work.
@@ -3722,6 +3808,8 @@ async function consumeMessage(session, message) {
   else if (message.type === "system" && message.subtype === "compact_boundary") {
     noteCompactBoundary(session, message.compact_metadata);
     notify("thread/compacted", { threadId: session.id });
+  } else if (message.type === "system" && message.subtype === "session_state_changed") {
+    noteRuntimeActive(session, message.state !== "idle");
   } else if (message.type === "system" && message.subtype === "permission_denied") {
     const reason = message.decision_reason || message.decision_reason_type;
     rememberPermissionDenial(session, {
@@ -4699,29 +4787,9 @@ async function dispatch(method, params = {}) {
     await renameSession(id, String(params.name ?? ""), { dir });
     return {};
   }
-  // One Haiku reply that dvz titles a new session with. It reads no settings,
-  // hooks or project files, runs no tools, keeps no transcript, and leaves the
-  // DevezCode room out so the host never takes it for the room's session.
+  // dvz titles a new session with one Haiku reply.
   if (method === "session/title") {
-    await ensureClaudeExecutableChoice(params);
-    const env = sanitizedEnvironment();
-    delete env.DEVEZCODE_ROOM_ID;
-    const options = {
-      cwd: tmpdir(),
-      model: "haiku",
-      effort: "low",
-      maxTurns: 1,
-      persistSession: false,
-      settingSources: [],
-      tools: [],
-      env,
-    };
-    applyClaudeExecutable(options, params);
-    let reply = "";
-    for await (const message of await startAgentQuery(String(params.prompt ?? ""), options)) {
-      if (message.type === "result") reply = message.result || "";
-    }
-    return { reply };
+    return { reply: await haikuReply(String(params.prompt ?? ""), params) };
   }
   if (method === "session/fork") {
     const source = liveSessionId(params.sessionId);
@@ -4758,6 +4826,42 @@ async function dispatch(method, params = {}) {
     if (session && sessionHasLiveWork(session)) return { released: false, busy: true };
     if (session) closeLiveSession(session);
     return { released: true, busy: false };
+  }
+  // 순정 /clear처럼 백그라운드 작업만 남은 세션은 같은 프로세스에서 새 대화로
+  // 넘긴다. 작업과 그 완료 통지는 새 대화가 이어받는다.
+  if (method === "session/clear") {
+    const session = lookupSession(params.sessionId);
+    if (!session || !sessionHasLiveWork(session)) {
+      if (session) closeLiveSession(session);
+      return { released: true, busy: false };
+    }
+    if (!session.queue || session.turn || session.initializing || session.promptStarting || session.clearWaiter
+      || session.pendingPrompts?.length || session.queue?.values?.length) {
+      return { released: false, busy: true };
+    }
+    let timer;
+    const id = await new Promise((resolve) => {
+      session.clearWaiter = resolve;
+      timer = setTimeout(() => resolve(null), 15000);
+      session.queue.push({
+        type: "user",
+        message: { role: "user", content: "/clear" },
+        parent_tool_use_id: null,
+        session_id: session.id,
+      });
+    });
+    clearTimeout(timer);
+    session.clearWaiter = null;
+    session.clearPending = false;
+    if (!id) return { released: false, busy: true };
+    emitSubagents(session);
+    return {
+      id: session.id,
+      thread: { id: session.id, turns: [] },
+      cwd: session.cwd,
+      model: session.model,
+      reasoningEffort: session.effort,
+    };
   }
   if (method === "account/usage") {
     const session = lookupSession(params.sessionId) || [...sessions.values()][0];
@@ -5206,11 +5310,21 @@ async function runSelfTest() {
       if (reply.released !== false || reply.busy !== true || lookupSession(releaseId) !== session
         || oldQuery.closeCalls || oldQueue.closed) throw new Error("Claude release terminated live work");
     };
-    for (const key of ["initializing", "promptStarting", "steerPending", "automaticTurnsPending", "usageLimitWait", "turn"]) {
+    for (const key of ["initializing", "promptStarting", "usageLimitWait", "turn"]) {
       session[key] = key === "turn" ? { id: "busy-turn" } : 1;
       await assertBusy();
       session[key] = null;
     }
+    // 턴 중에 흡수된 추가 입력·통지가 남긴 예약만으로는 전환을 막지 않는다.
+    beginTurn(session, "work");
+    await consumeMessage(session, { type: "system", subtype: "task_notification", task_id: "absorbed-task", status: "completed" });
+    session.steerPending = 1;
+    await consumeMessage(session, { type: "result", is_error: false, modelUsage: {}, permission_denials: [], duration_ms: 1, queued_turn_count: 0 });
+    if (session.turn || session.automaticTurnsPending !== 1 || sessionHasLiveWork(session)) {
+      throw new Error("Claude absorbed follow-up booking kept the session busy");
+    }
+    session.steerPending = 0;
+    session.automaticTurnsPending = 0;
     session.pendingPrompts.push({ input: [] });
     await assertBusy();
     session.pendingPrompts.length = 0;
@@ -5260,6 +5374,32 @@ async function runSelfTest() {
     const resumedConsumer = resumedSession.consumer;
     await dispatch("session/release", { sessionId: releaseId });
     await resumedConsumer;
+    // 백그라운드 작업만 남은 세션은 같은 프로세스에서 새 대화로 넘어가 작업을 이어받는다.
+    const { session: clearSession } = await createSession({ cwd: process.cwd() });
+    const clearPreviousId = clearSession.id;
+    const clearConsumer = clearSession.consumer;
+    clearSession.subagents.set("clear-child", { id: "clear-child", background: true, taskId: "clear-task" });
+    const clearing = dispatch("session/clear", { sessionId: clearPreviousId });
+    await new Promise((resolve) => setImmediate(resolve));
+    if (clearSession.queue.values.at(-1)?.message?.content !== "/clear") {
+      throw new Error("Claude clear did not send /clear to the live query");
+    }
+    clearSession.queue.values.length = 0;
+    clearSession.query.events.push({ type: "conversation_reset", session_id: clearPreviousId, new_conversation_id: randomUUID() });
+    clearSession.query.events.push({ type: "system", subtype: "init", session_id: "cleared-session" });
+    const cleared = await clearing;
+    const clearRows = releaseNotices.filter((notice) => notice.method === "turn/subagents/updated");
+    if (cleared.id !== "cleared-session" || lookupSession("cleared-session") !== clearSession
+      || lookupSession(clearPreviousId) || clearSession.query.closeCalls
+      || !clearRows.some((notice) => notice.params.threadId === "cleared-session"
+        && notice.params.subagents.some((row) => row.id === "clear-child"))) {
+      throw new Error("Claude in-process clear did not move the live work to a new conversation");
+    }
+    releaseNotices.splice(0, releaseNotices.length,
+      ...releaseNotices.filter((notice) => !clearRows.includes(notice)));
+    clearSession.subagents.clear();
+    await dispatch("session/release", { sessionId: "cleared-session" });
+    await clearConsumer;
     const { session: mainSession } = await createSession({ cwd: process.cwd() });
     const mainQuery = mainSession.query;
     const mainConsumer = mainSession.consumer;
@@ -6219,6 +6359,29 @@ async function runSelfTest() {
       process.stdout.write = steerWrite;
       sessions.delete(steerSession.id);
     }
+    // The CLI's own session state reaches the host once per change, and a
+    // session that closes never leaves the host spinning.
+    const stateNotices = [];
+    const stateWrite = process.stdout.write;
+    process.stdout.write = (chunk) => { stateNotices.push(JSON.parse(String(chunk))); return true; };
+    try {
+      const stateSession = { id: "runtime-state-self-test", subagents: new Map() };
+      for (const state of ["running", "running", "idle", "requires_action"]) {
+        await consumeMessage(stateSession, { type: "system", subtype: "session_state_changed", state });
+        emitSubagents(stateSession);
+      }
+      closeLiveSession(stateSession);
+    } finally {
+      process.stdout.write = stateWrite;
+    }
+    const noticed = (method, field) => stateNotices
+      .filter((notice) => notice.method === method)
+      .map((notice) => notice.params[field])
+      .join();
+    if (noticed("claude/session/state", "active") !== "true,false,true,false"
+      || noticed("turn/subagents/updated", "runtimeActive") !== "true,true,false,true") {
+      throw new Error(`Claude session state did not reach the host: ${JSON.stringify(stateNotices)}`);
+    }
     beginTurn(limitSession);
     for (let attempt = 0; attempt < 4; attempt++) {
       await rejectLimit();
@@ -6515,6 +6678,44 @@ async function runSelfTest() {
     if (structuredSession.subagents.size !== 0) {
       throw new Error("Claude background task snapshot did not remove a finished subagent");
     }
+
+    // 한국어 요청 세션은 영어 진행 요약을 옮긴 뒤에 보이고, 늦은 번역은 새 요약을 덮지 않는다.
+    const koreanSummarySession = {
+      id: "korean-summary-self-test",
+      turn: null,
+      lastKoreanRequest: true,
+      subagents: new Map(),
+      knownSubagents: new Map(),
+      hiddenSubagentTasks: new Set(),
+      ambientSubagentTasks: new Set(),
+      subagentPulse: null,
+    };
+    let finishOldTranslation;
+    summaryTranslations.set("Reading old notes", new Promise((resolve) => { finishOldTranslation = resolve; }));
+    summaryTranslations.set("Reading new notes", Promise.resolve("새 노트를 읽는 중"));
+    startSubagent(koreanSummarySession, { id: "toolu_korean", input: { description: "노트 확인", subagent_type: "Explore" } });
+    const koreanProgress = (summary) => processSubagentSystemMessage(koreanSummarySession, {
+      type: "system",
+      subtype: "task_progress",
+      tool_use_id: "toolu_korean",
+      subagent_type: "Explore",
+      summary,
+    });
+    const koreanRow = koreanSummarySession.subagents.get("toolu_korean");
+    koreanProgress("Reading old notes");
+    const whileTranslating = koreanRow.description;
+    koreanProgress("Reading new notes");
+    await new Promise((resolve) => setImmediate(resolve));
+    finishOldTranslation("옛 노트를 읽는 중");
+    await new Promise((resolve) => setImmediate(resolve));
+    const afterLateTranslation = koreanRow.description;
+    koreanProgress("노트를 고치는 중");
+    if (whileTranslating !== "노트 확인" || afterLateTranslation !== "새 노트를 읽는 중"
+      || koreanRow.description !== "노트를 고치는 중") {
+      throw new Error(`Claude Korean summary translation self-test failed: ${JSON.stringify([whileTranslating, afterLateTranslation, koreanRow.description])}`);
+    }
+    clearSubagents(koreanSummarySession);
+    summaryTranslations.clear();
 
     // parent_task_id puts what a subagent launched right under its row, one
     // level in; a parent that is gone leaves the child at the top level.

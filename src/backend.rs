@@ -1120,6 +1120,8 @@ impl BackendServer {
     }
 
     /// Releases only the live Claude query; all providers' transcripts and routes survive.
+    /// Like stock, leaving never waits on work: a busy query stays alive in the bridge
+    /// until a later session start finds it idle.
     pub async fn release_thread(&self, visible: &str) -> Result<()> {
         if visible.is_empty() {
             return Ok(());
@@ -1131,20 +1133,38 @@ impl BackendServer {
         else {
             return Ok(());
         };
-        let response = self
-            .claude
+        self.claude
             .request(
                 "session/release",
                 json!({ "sessionId": raw_thread_id(&backing) }),
             )
             .await?;
-        if response.get("busy").and_then(Value::as_bool) == Some(true) {
-            anyhow::bail!(tr(
-                "Claude가 작업 중이므로 대화를 전환할 수 없습니다. 작업을 중단한 뒤 다시 시도하세요.",
-                "Can't switch conversations while Claude is working. Stop the active turn and try again.",
-            ));
-        }
         Ok(())
+    }
+
+    /// Stock `/clear` keeps background work in the same process and hands it, and
+    /// its completion notices, to the new conversation. A Claude thread left with
+    /// only such work does the same and returns the new thread; anything else is
+    /// just released and the next prompt opens the session.
+    pub async fn clear_thread(&self, visible: &str) -> Result<Option<Value>> {
+        let route = self.route(&self.canonical_visible(visible));
+        let Some((backing, cwd)) = route
+            .filter(|route| route.active == RuntimeKind::Claude)
+            .and_then(|route| route.claude_id.map(|id| (id, route.cwd)))
+            .filter(|(id, _)| !raw_thread_id(id).is_empty())
+        else {
+            self.release_thread(visible).await?;
+            return Ok(None);
+        };
+        let mut response = self
+            .claude
+            .request("session/clear", json!({ "sessionId": raw_thread_id(&backing) }))
+            .await?;
+        if response.get("thread").is_none() {
+            return Ok(None);
+        }
+        self.register_claude_response(&mut response, cwd)?;
+        Ok(Some(response))
     }
 
     /// 첫 프롬프트 전에는 스레드 id가 비어 있다. 빈 id를 그대로 넘기면 app-server가
@@ -3149,7 +3169,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn integration_and_release_rpc_use_the_claude_backing_and_report_busy() {
+    async fn integration_release_and_clear_rpc_use_the_claude_backing() {
         let root = env::temp_dir().join(format!(
             "dvz-backend-rpc-{}-{}",
             process::id(),
@@ -3164,9 +3184,12 @@ import readline from 'node:readline';
 readline.createInterface({ input: process.stdin }).on('line', line => {
   const request = JSON.parse(line);
   if (request.method === 'shutdown') process.exit(0);
+  const busy = request.params.sessionId === 'busy-backing';
   const result = request.method === 'session/release'
-    ? { busy: request.params.sessionId === 'busy-backing' }
-    : { method: request.method, params: request.params };
+    ? { busy }
+    : request.method === 'session/clear'
+      ? (busy ? { id: 'cleared-backing', thread: { id: 'cleared-backing', turns: [] } } : { released: true })
+      : { method: request.method, params: request.params };
   console.log(JSON.stringify({ id: request.id, result }));
 });
 "#,
@@ -3203,16 +3226,23 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
             assert_eq!(response["params"]["enabled"], false);
         }
         server.release_thread("codex-backing").await.unwrap();
-        let error = server
-            .release_thread("busy-room")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("작업 중") || error.contains("while Claude is working"),
-            "{error}"
-        );
+        // 순정처럼 작업 중인 세션도 떠날 수 있다. 연결은 브리지에 남는다.
+        server.release_thread("busy-room").await.unwrap();
         assert_eq!(server.routes.lock().unwrap().len(), 2);
+        // Codex가 활성인 방은 Claude 쪽을 놓기만 하고 새 대화를 만들지 않는다.
+        assert!(server.clear_thread("visible-room").await.unwrap().is_none());
+        let cleared = server.clear_thread("busy-room").await.unwrap().expect("in-process clear");
+        let visible = cleared["thread"]["id"].as_str().unwrap();
+        assert_ne!(visible, "busy-room");
+        assert_eq!(
+            server.route(visible).and_then(|route| route.claude_id).as_deref(),
+            Some("cleared-backing")
+        );
+        assert_eq!(
+            server.route("busy-room").and_then(|route| route.claude_id).as_deref(),
+            Some("busy-backing"),
+            "옛 대화는 옛 기록을 가리킨다"
+        );
         server.shutdown().await;
         fs::remove_dir_all(root).unwrap();
     }

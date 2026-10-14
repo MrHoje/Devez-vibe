@@ -654,7 +654,18 @@ async fn open_pending_thread(
                 return Ok(false);
             }
         };
-    apply_claude_account_metadata(state, &response);
+    Ok(attach_started_thread(server, state, &response, &model).await)
+}
+
+/// Puts a session that just opened behind the screen. Returns false when the
+/// response names no thread, with the failure already on screen.
+async fn attach_started_thread(
+    server: &BackendServer,
+    state: &mut AppState,
+    response: &Value,
+    model: &str,
+) -> bool {
+    apply_claude_account_metadata(state, response);
     let thread_id = response
         .get("thread")
         .and_then(|thread| thread.get("id"))
@@ -667,14 +678,14 @@ async fn open_pending_thread(
     let actual_model = response
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or(&model)
+        .unwrap_or(model)
         .to_owned();
     let (Some(thread_id), Some(cwd)) = (thread_id, cwd) else {
         state.set_request_failed(tr(
             "thread/start 응답이 올바르지 않습니다.",
             "The thread/start response is invalid.",
         ));
-        return Ok(false);
+        return false;
     };
     let effort = response
         .get("reasoningEffort")
@@ -685,7 +696,7 @@ async fn open_pending_thread(
     state.note_untitled_thread();
     state.note_resume_id(&server.resume_id(&state.thread_id));
     apply_deferred_startup_actions(server, state).await;
-    Ok(true)
+    true
 }
 
 /// Runs the full UI while `thread/start` is still in flight: the screen is live,
@@ -3153,13 +3164,10 @@ async fn run_action(
         }
         Action::NewThread => return start_new_thread(server, state, renderer).await,
         Action::Worktree(name) => {
-            if !state.allow_thread_switch() {
-                return Ok(false);
-            }
             if let Err(error) =
                 await_integration_panel(state, renderer, server.release_thread(&state.thread_id)).await?
             {
-                state.push_notice(BlockKind::Warning, "Session still running", error.to_string());
+                state.push_notice(BlockKind::Warning, "Session release failed", error.to_string());
                 return Ok(false);
             }
             let cwd = PathBuf::from(&state.cwd);
@@ -4574,7 +4582,16 @@ async fn run_action(
             }
         }
         // The pick is already live for this session; this only makes it stick.
-        Action::PersistModelDefault { model, effort } => {
+        Action::PersistModelDefault {
+            model,
+            effort,
+            provider_key,
+        } => {
+            if let Err(error) =
+                state::write_vibe_config_value(provider_key, &format!("{model} {effort}"))
+            {
+                state.push_notice(BlockKind::Warning, "Failed to save default", error.to_string());
+            }
             let writes = [("model", model), ("model_reasoning_effort", effort)];
             for (key, value) in writes {
                 if let Err(error) = server
@@ -4732,32 +4749,36 @@ async fn await_integration_panel<T>(
 
 /// Clears the screen back to the welcome panel without opening a session. The next
 /// prompt opens one, so the new conversation is named after the runtime it actually
-/// runs on. Returns `true` when the user quits, which this path never does.
+/// runs on. A Claude session still running background work clears in place instead,
+/// as stock `/clear` does. Returns `true` when the user quits, which this path never does.
 async fn start_new_thread(
     server: &mut BackendServer,
     state: &mut AppState,
     renderer: &mut Renderer,
 ) -> Result<bool> {
-    if !state.allow_thread_switch() {
-        return Ok(false);
-    }
     if state.waiting_for_usage_limit() {
         server.request("turn/interrupt", json!({
             "threadId": state.thread_id, "turnId": state.turn_id
         })).await?;
     }
-    if let Err(error) =
-        await_integration_panel(state, renderer, server.release_thread(&state.thread_id)).await?
-    {
-        state.push_notice(BlockKind::Warning, "Session still running", error.to_string());
-        return Ok(false);
-    }
+    let cleared =
+        match await_integration_panel(state, renderer, server.clear_thread(&state.thread_id)).await? {
+            Ok(cleared) => cleared,
+            Err(error) => {
+                state.push_notice(BlockKind::Warning, "Session release failed", error.to_string());
+                return Ok(false);
+            }
+        };
     renderer.clear_screen()?;
     state.prepare_new_thread();
     state.begin_thread_switch();
-    // Nothing is started here: the next prompt builds the session, on whichever
-    // runtime is selected by then. Until it does, the screen is an empty new
-    // conversation with no session behind it.
+    // Otherwise nothing is started here: the next prompt builds the session, on
+    // whichever runtime is selected by then. Until it does, the screen is an empty
+    // new conversation with no session behind it.
+    if let Some(response) = cleared {
+        let model = state.selected_model_name().to_owned();
+        attach_started_thread(server, state, &response, &model).await;
+    }
     draw(state, renderer)?;
     let refresh_errors = refresh_new_thread_catalogs(server, state, renderer).await?;
     if !refresh_errors.is_empty() {
@@ -4875,9 +4896,6 @@ async fn resume_thread(
     renderer: &mut Renderer,
     target: &str,
 ) -> Result<bool> {
-    if !state.allow_thread_switch() {
-        return Ok(false);
-    }
     // Turning a name into an id is a quick lookup, and a miss has to leave the
     // current session untouched, so it runs before anything is torn down.
     let current_cwd = state.cwd.clone();
@@ -4927,9 +4945,6 @@ async fn resume_into_state(
     thread_id: &str,
     protect_side_exit_keys: bool,
 ) -> Result<Switched> {
-    if !protect_side_exit_keys && !state.allow_thread_switch() {
-        return Ok(Switched::Failed);
-    }
     if state.waiting_for_usage_limit() {
         server.request("turn/interrupt", json!({
             "threadId": state.thread_id, "turnId": state.turn_id
@@ -4939,7 +4954,7 @@ async fn resume_into_state(
         if let Err(error) =
             await_integration_panel(state, renderer, server.release_thread(&state.thread_id)).await?
         {
-            state.push_notice(BlockKind::Warning, "Session still running", error.to_string());
+            state.push_notice(BlockKind::Warning, "Session release failed", error.to_string());
             return Ok(Switched::Failed);
         }
     }
@@ -7213,10 +7228,11 @@ fn sync_host_state(state: &AppState) {
     // retry a failed host write while rendering uses its animation-only path.
     // The turn flag and compaction are handed over separately: the host spins its
     // tab for both, but only a finished turn is a finished response.
-    // Background children outlive the turn, so the tab stays busy until they end.
+    // Background children outlive the turn, so the tab stays busy until they end
+    // and the runs their results start are over too.
     devezcode::sync(
         state.host_session_id(),
-        state.busy || state.host_children_busy(),
+        state.host_busy(),
         state.compacting(),
         state.host_loading(),
         state.awaiting_input(),
