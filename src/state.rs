@@ -7909,7 +7909,10 @@ impl AppState {
         let inline_answer_active = self.buffers_pending_text_input();
         // Compaction animates the same row a turn does, so it keeps the frame
         // loop alive even on a runtime that reports no turn while it runs.
-        let animating = self.busy || self.compacting() || self.host_loading;
+        let animating = self.busy
+            || self.compacting()
+            || self.host_loading
+            || self.viewed_subagent_started_at().is_some();
         // A background Claude agent outlives its parent turn. Its elapsed label
         // changes once a second, so only that boundary asks for a full frame.
         // 목록에서 숨긴 백그라운드 명령은 작업 창이 열려 있을 때만 경과 초가 보이므로,
@@ -14497,6 +14500,17 @@ impl AppState {
             let dots = (self.host_loading_since.elapsed().as_millis() / 250 % 4) as usize;
             return Some(format!("{label}{}", ".".repeat(dots)));
         }
+        // 하위 에이전트를 보는 동안은 메인 턴 대신 그 에이전트의 실행 시간을 보인다.
+        if let Some(id) = self.viewing_subagent.as_deref() {
+            if let Some(started) = self.viewed_subagent_started_at() {
+                let elapsed = format_elapsed(started.elapsed().as_secs());
+                return Some(format!("Working.. ({elapsed})"));
+            }
+            if let Some((row, _)) = self.finished_subagents.iter().find(|(row, _)| row.id == id) {
+                let elapsed = format_elapsed(row.elapsed.as_secs());
+                return Some(format!("❖ Completed ({elapsed})"));
+            }
+        }
         if self.busy && !self.turn_interrupted {
             if let Some(reset) = self.claude_usage_limit_reset {
                 let remaining = reset.saturating_sub(chrono::Utc::now().timestamp()).max(0) as u64;
@@ -14577,8 +14591,21 @@ impl AppState {
 
     /// Activity text animation runs from the wall clock rather than counted ticks,
     /// so its pace stays stable even when frames are delayed.
+    /// 보고 있는 하위 에이전트가 아직 돌고 있으면 그 시작 시각.
+    fn viewed_subagent_started_at(&self) -> Option<Instant> {
+        let id = self.viewing_subagent.as_deref()?;
+        self.subagents
+            .iter()
+            .find(|running| running.id == id)
+            .map(|running| running.started_at)
+    }
+
     fn activity_phase(&self) -> f32 {
-        let Some(started) = self.compacting_started_at.or(self.turn_started_at) else {
+        let Some(started) = self
+            .viewed_subagent_started_at()
+            .or(self.compacting_started_at)
+            .or(self.turn_started_at)
+        else {
             return 0.0;
         };
         let position = started.elapsed().as_millis() % SHIMMER_PERIOD.as_millis();
@@ -24098,6 +24125,23 @@ mod tests {
         let view = state.view();
         let transcript = view.subagent_view.expect("the body shows the subagent");
         assert_eq!((transcript.name, transcript.description), ("Explore", "Find auth code"));
+    }
+
+    /// 보는 동안 진행 줄은 메인 턴이 아닌 고른 하위 에이전트의 실행 시간을 보인다.
+    #[test]
+    fn the_subagent_view_reports_the_agent_run_time() {
+        let mut state = state_with_a_running_subagent();
+        state.busy = true;
+        state.turn_started_at = Some(Instant::now() - Duration::from_secs(300));
+        state.subagents[0].started_at = Instant::now() - Duration::from_secs(21);
+        state.view_subagent(Some("toolu_1".to_owned()));
+        assert_eq!(state.activity().as_deref(), Some("Working.. (21s)"));
+
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
+        assert_eq!(state.activity().as_deref(), Some("❖ Completed (21s)"));
+
+        state.view_subagent(None);
+        assert_eq!(state.activity().as_deref(), Some("Working.. (5m 0s)"));
     }
 
     /// 끝나 잠시 남은 줄을 뺀, 지금 도는 하위 에이전트 줄.

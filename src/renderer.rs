@@ -222,6 +222,16 @@ fn set_chat_layout(enabled: bool) {
 fn set_chat_layout(enabled: bool) {
     CHAT_LAYOUT.with(|layout| layout.set(enabled));
 }
+
+thread_local! {
+    /// 마우스가 올라간 목록 줄. 선택 표시만 이 줄로 옮기고, 목록의 스크롤과
+    /// Enter가 고르는 항목은 실제 선택을 따른다. 프레임을 만드는 동안만 쓴다.
+    static POINTED_ROW: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+fn pointed_row() -> Option<usize> {
+    POINTED_ROW.with(std::cell::Cell::get)
+}
 /// Cells a chat bubble keeps between its edge and its text, per side.
 const CHAT_BUBBLE_PADDING: usize = 1;
 /// Extra cell that keeps the right edge visibly clear after terminal painting.
@@ -2259,6 +2269,17 @@ impl Renderer {
         changed
     }
 
+    /// 지금 뜬 목록에서 마우스가 올라간 줄. 오버레이와 컴포저 목록은 함께 뜨지
+    /// 않으므로, 앞서 클릭한 다른 목록의 줄 번호는 받지 않는다.
+    fn set_pointed_row(&self, overlay: bool) {
+        let row = match self.hovered_pick {
+            Some(Pick::Row(row)) if overlay => Some(row),
+            Some(Pick::Suggestion(index)) if !overlay => Some(index),
+            _ => None,
+        };
+        POINTED_ROW.with(|pointed| pointed.set(row));
+    }
+
     /// The columns a row lights up when the pointer is on it: the heading's own
     /// text, or the span the hovered piece of chrome was painted across.
     fn hover_columns(
@@ -2271,19 +2292,25 @@ impl Renderer {
             return Some(start..start + UnicodeWidthStr::width(line.text.as_str()));
         }
         let hovered_pick = hovered_pick?;
+        // 목록 줄은 배경 대신 선택 표시가 마우스를 따라간다(`POINTED_ROW`).
+        if matches!(hovered_pick, Pick::Row(_) | Pick::Suggestion(_)) {
+            return None;
+        }
         let columns = line.pick.as_ref()?.columns_of(hovered_pick)?;
         if matches!(hovered_pick, Pick::Effort(_)) {
+            // 단계 이름만 가리킨다. 고른 단계는 상자 안의 이름만이다.
             let mut start = UnicodeWidthStr::width(line.prefix.as_str())
                 + UnicodeWidthStr::width(line.text.as_str());
             for span in &line.tail {
                 let end = start + UnicodeWidthStr::width(span.text.as_str());
-                if span.bold
-                    && start >= columns.start
-                    && end <= columns.end
-                    && span.text.starts_with("│ ")
-                    && span.text.ends_with(" │")
-                {
-                    return Some(start + 2..end.saturating_sub(2));
+                if start >= columns.start && end <= columns.end {
+                    return Some(
+                        if span.text.starts_with("│ ") && span.text.ends_with(" │") {
+                            start + 2..end.saturating_sub(2)
+                        } else {
+                            start..end
+                        },
+                    );
                 }
                 start = end;
             }
@@ -2479,7 +2506,12 @@ impl Renderer {
         self.selection_anchor_screen_row = None;
         self.split_selection_focus = None;
         self.composer_select_all = false;
-        self.selection.clear()
+        // 키·클릭·스크롤이 오면 목록의 호버 표시를 거두어 실제 선택이 다시 보이게 한다.
+        let unpointed = matches!(self.hovered_pick, Some(Pick::Row(_) | Pick::Suggestion(_)));
+        if unpointed {
+            self.hovered_pick = None;
+        }
+        self.selection.clear() || unpointed
     }
 
     /// True while Ctrl+A's highlight stands, so an edit knows it covers the whole
@@ -3293,6 +3325,7 @@ impl Renderer {
         } else {
             view.subagents.as_slice()
         };
+        self.set_pointed_row(view.overlay.is_some());
         let mut frame = if let Some(overlay) = view.overlay {
             overlay_frame_with_expansion(
                 live_lines,
@@ -3532,6 +3565,10 @@ impl Renderer {
 
         let main_rows = height / 2;
         let btw_rows = height - main_rows;
+        self.set_pointed_row(match focus {
+            SplitFocus::Main => main_view.overlay.is_some(),
+            SplitFocus::Btw => btw_view.overlay.is_some(),
+        });
         let main = split_pane_frame_scrolled(
             &self.history,
             main_view,
@@ -4904,22 +4941,29 @@ fn paint_text_into_frame(
     background: Option<Rgb>,
     selected_columns: Option<&Range<usize>>,
     hovered_columns: Option<&Range<usize>>,
+    bold_hover: bool,
 ) {
     for unit in display_units(text) {
         let width = terminal_unit_width(unit);
         let end = column.saturating_add(width);
         let selected = range_overlaps(selected_columns, *column, end);
         let hovered = !selected && range_overlaps(hovered_columns, *column, end);
-        let style = cell_style(
+        let mut style = cell_style(
             tone,
             bold,
-            if hovered {
+            if hovered && !bold_hover {
                 Some(theme::palette().hover_bg)
             } else {
                 background
             },
             selected,
         );
+        if hovered && bold_hover {
+            style.bold = true;
+            if tone == Tone::Muted {
+                style.foreground = tone_rgb(Tone::Plain);
+            }
+        }
         frame.write(*column, row, unit, style);
         *column = end;
     }
@@ -4940,6 +4984,13 @@ fn paint_line_into_frame(
     } else {
         (line, hovered_columns)
     };
+    // 단계 선택 줄은 배경 대신 밝고 굵은 글자로 마우스가 올라간 단계를 가리킨다.
+    let bold_hover = line.pick.as_ref().is_some_and(|regions| {
+        regions
+            .0
+            .iter()
+            .any(|(_, _, pick)| matches!(pick, Pick::Effort(_)))
+    });
     let question_card = is_question_card_line(line);
     let background = if question_card { Some(theme::palette().user_prompt_bg) } else { row_background(line.tone) };
     let bubble_background = bubble_background(line);
@@ -5059,6 +5110,7 @@ fn paint_line_into_frame(
         prefix_background,
         selected_columns.as_ref(),
         text_hovered_columns,
+        bold_hover,
     );
     }
     // 기록 띠는 집기 영역 안에서만 칠한다. 질문 줄처럼 오른쪽 라벨만 집는
@@ -5083,6 +5135,7 @@ fn paint_line_into_frame(
         }),
         selected_columns.as_ref(),
         text_hovered_columns,
+        bold_hover,
     );
     for (index, span) in line.tail.iter().enumerate() {
         if span.tone == Tone::CopyJoin {
@@ -5107,6 +5160,7 @@ fn paint_line_into_frame(
             history_background.filter(|_| within_history(span_start)).or(span_background),
             selected_columns.as_ref(),
             text_hovered_columns,
+            bold_hover,
         );
     }
 }
@@ -7768,7 +7822,11 @@ fn normal_frame_with_expansion(
         );
     }
     // Separate the running-subagent rows from the status line with one blank row.
-    if status_line_painted && (!subagents.is_empty() || !artifacts.is_empty()) {
+    // 하위 에이전트를 보는 동안에는 상태 줄 대신 진행 줄과 띄운다.
+    if (status_line_painted || composer_hidden)
+        && lines.last() != Some(&PaintLine::blank())
+        && (!subagents.is_empty() || !artifacts.is_empty())
+    {
         lines.push(PaintLine::blank());
     }
     lines.extend(subagent_lines(subagents, width));
@@ -8254,27 +8312,28 @@ fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine
         .unwrap_or(COMMAND_COLUMN_WIDTH)
         .max(COMMAND_COLUMN_WIDTH)
         .min(inner_width.saturating_sub(13 + SUGGESTION_RIGHT_INSET));
+    let pointed = pointed_row();
     for (offset, suggestion) in visible.iter().enumerate() {
-        let marker = if suggestion.selected { "❯" } else { " " };
+        // A long list scrolls, so the row's place on screen is not its place in
+        // the list: a click has to name the entry, not the line it landed on.
+        let index = first_visible + offset;
+        let selected = pointed.map_or(suggestion.selected, |row| row == index);
         let line = match suggestion.category.as_deref() {
             Some(category) => named_suggestion_line(
                 suggestion,
                 &format!("[{category}] {}", suggestion.command),
-                marker,
+                selected,
                 completion_name_width,
                 panel_width,
             ),
             None => named_suggestion_line(
                 suggestion,
                 &suggestion.command,
-                marker,
+                selected,
                 command_name_width,
                 panel_width,
             ),
         };
-        // A long list scrolls, so the row's place on screen is not its place in
-        // the list: a click has to name the entry, not the line it landed on.
-        let index = first_visible + offset;
         lines.push(pick_panel_interior(
             line,
             panel_width,
@@ -8348,7 +8407,7 @@ fn picker_suggestion_row(
 fn named_suggestion_line(
     suggestion: &SuggestionView,
     label: &str,
-    marker: &str,
+    selected: bool,
     name_width: usize,
     panel_width: usize,
 ) -> PaintLine {
@@ -8364,11 +8423,7 @@ fn named_suggestion_line(
     let description = compact_right(&suggestion.description, description_width);
     let description_padding =
         description_width.saturating_sub(UnicodeWidthStr::width(description.as_str()));
-    let name_tone = if suggestion.selected {
-        Tone::Accent
-    } else {
-        Tone::Plain
-    };
+    let name_tone = if selected { Tone::Accent } else { Tone::Plain };
 
     PaintLine {
         prefix: "│".to_owned(),
@@ -8380,13 +8435,9 @@ fn named_suggestion_line(
         pick: None,
         tail: vec![
             PaintSpan {
-                text: marker.to_owned(),
-                tone: if suggestion.selected {
-                    Tone::Accent
-                } else {
-                    Tone::Muted
-                },
-                bold: suggestion.selected,
+                text: if selected { "❯" } else { " " }.to_owned(),
+                tone: if selected { Tone::Accent } else { Tone::Muted },
+                bold: selected,
             },
             PaintSpan {
                 text: "  ".to_owned(),
@@ -8396,7 +8447,7 @@ fn named_suggestion_line(
             PaintSpan {
                 text: format!("{name}{}  ", " ".repeat(name_padding)),
                 tone: name_tone,
-                bold: suggestion.selected,
+                bold: selected,
             },
             PaintSpan {
                 text: description,
@@ -8697,12 +8748,21 @@ fn overlay_frame(
 
 fn overlay_frame_with_expansion(
     live_lines: Vec<PaintLine>,
-    overlay: OverlayView<'_>,
+    mut overlay: OverlayView<'_>,
     welcome: Option<WelcomeView>,
     status: StatusArea,
     width: u16,
     composer_preedit: &str,
 ) -> Frame {
+    // 마우스가 올라간 줄로 선택 표시를 옮긴다. 답을 적고 있는 질문은 입력 줄을 지킨다.
+    if let Some(pointed) = pointed_row()
+        && pointed < overlay.lines.len()
+        && !(overlay.style == OverlayStyle::Question && overlay.input.is_some())
+    {
+        for (index, row) in overlay.lines.iter_mut().enumerate() {
+            row.selected = index == pointed;
+        }
+    }
     let mut lines = Vec::new();
     // A picker docks over the transcript rather than replacing the screen, so the
     // welcome card stays where it was instead of blinking out for as long as
@@ -8762,6 +8822,7 @@ fn overlay_frame_with_expansion(
                 lines.push(panel_padding_row(panel_width));
             }
 
+            let model_picker = title == "Model";
             // A row may carry a two-column body (name US description); the
             // name column is sized once so every description starts flush.
             let picker_name_width = overlay
@@ -8791,6 +8852,7 @@ fn overlay_frame_with_expansion(
                     continue;
                 }
                 for (part_index, part) in row.text.lines().enumerate() {
+                    let selected = row.selected && part_index == 0;
                     let prefix = if part_index == 0 {
                         if row.selected { "│ ❯  " } else { "│    " }
                     } else {
@@ -8810,8 +8872,16 @@ fn overlay_frame_with_expansion(
                     } else if part.starts_with(CHECKED_BOX) {
                         // 켜 둔 항목은 커서가 떠나도 색을 지킨다.
                         Tone::Accent
+                    } else if selected && !model_picker {
+                        Tone::Accent
                     } else {
+                        // `/model`은 고른 줄도 모델 계열 색 그대로 두고 `❯`만 옮긴다.
                         picker_model_tone(part)
+                    };
+                    let marker_tone = match (selected, model_picker) {
+                        (false, _) => Tone::Muted,
+                        (true, true) => Tone::Plain,
+                        (true, false) => Tone::Accent,
                     };
                     let wrapped = wrapped_line_with_continuation(
                         prefix,
@@ -8819,10 +8889,12 @@ fn overlay_frame_with_expansion(
                         Tone::Border,
                         part,
                         tone,
-                        row.selected && part_index == 0,
+                        selected && !model_picker,
                         (panel_width.saturating_sub(2)).min(u16::MAX as usize) as u16,
                     );
                     lines.extend(wrapped.into_iter().map(|line| {
+                        let mut line = split_panel_border(line, marker_tone);
+                        line.bold = selected;
                         let line = close_panel_row(line, panel_width);
                         // A muted row is the picker talking, not offering: a
                         // summary or a heading answers to no click, so it must
@@ -8946,10 +9018,13 @@ fn overlay_frame_with_expansion(
                     } else {
                         "│      "
                     };
+                    let selected = row.selected && part_index == 0;
                     // The line under a label is that label's detail, not a claim
                     // of its own: it reads as the quieter half of one row.
                     let tone = if row.muted || part_index > 0 {
                         Tone::Muted
+                    } else if selected {
+                        Tone::Accent
                     } else {
                         Tone::Plain
                     };
@@ -8960,10 +9035,13 @@ fn overlay_frame_with_expansion(
                         Tone::Border,
                         part,
                         tone,
-                        row.selected && part_index == 0,
+                        selected,
                         (panel_width.saturating_sub(1)).min(u16::MAX as usize) as u16,
                     );
                     lines.extend(wrapped.into_iter().map(|line| {
+                        let marker_tone = if selected { Tone::Accent } else { Tone::Muted };
+                        let mut line = split_panel_border(line, marker_tone);
+                        line.bold = selected;
                         let line = close_panel_row(line, panel_width);
                         // A muted row is the picker talking, not offering: a
                         // summary or a heading answers to no click, so it must
@@ -20832,6 +20910,44 @@ mod tests {
         );
     }
 
+    /// 하위 에이전트를 보는 동안 상태 줄이 숨어도 진행 줄과 하위 에이전트 줄 사이는 한 줄 띄운다.
+    #[test]
+    fn the_subagent_view_leaves_a_blank_row_below_the_activity() {
+        let editor = Editor::default();
+        let frame = normal_frame_with_expansion(
+            Vec::new(),
+            &editor,
+            &[],
+            "",
+            &[],
+            &[],
+            &[],
+            &[test_subagent("Explore", "Find auth code", "", 4)],
+            true,
+            &[],
+            "",
+            None,
+            &[],
+            Some("❖ Completed (21s)"),
+            None,
+            0.5,
+            0.5,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+        let activity = frame.activity_index.expect("activity row");
+        assert!(painted(&frame.lines[activity]).contains("Completed (21s)"));
+        assert!(frame.lines[activity + 1] == PaintLine::blank());
+        assert_eq!(painted(&frame.lines[activity + 2]), "  • main");
+    }
+
     /// Queued prompts and the diff citation dock above the row that carries the
     /// composer controls, so that row never leaves the composer.
     #[test]
@@ -25932,17 +26048,24 @@ mod tests {
         let body = frame
             .lines
             .iter()
-            .filter(|line| line.prefix.starts_with('│') && !line.text.trim().is_empty())
+            .filter(|line| painted(line).starts_with('│'))
             .collect::<Vec<_>>();
-        let indent = |line: &PaintLine| UnicodeWidthStr::width(line.prefix.as_str());
+        // 테두리와 선택 표시 뒤에서 글자가 시작하는 열.
+        let indent = |line: &PaintLine| {
+            let row = painted(line);
+            let start = row
+                .find(|ch: char| !matches!(ch, '│' | ' ' | '❯'))
+                .unwrap_or(row.len());
+            UnicodeWidthStr::width(&row[..start])
+        };
 
         let label = body
             .iter()
-            .find(|line| line.text.starts_with("화면에"))
+            .find(|line| painted(line).contains("화면에"))
             .expect("option label");
         let details = body
             .iter()
-            .filter(|line| line.text.starts_with("상세"))
+            .filter(|line| painted(line).contains("상세"))
             .collect::<Vec<_>>();
 
         assert!(details.len() > 1, "the detail should have folded");
@@ -25955,8 +26078,13 @@ mod tests {
             indent(label)
         );
         assert!(
-            details.iter().all(|line| line.tone == Tone::Muted),
+            details.iter().all(|line| line.tail[0].tone == Tone::Muted),
             "a detail row is not dimmed"
+        );
+        assert_eq!(
+            label.tail[0].tone,
+            Tone::Accent,
+            "the selected label wears the accent"
         );
         assert!(
             body.iter().all(|line| painted(line).ends_with('│')),
@@ -27464,11 +27592,14 @@ mod tests {
                 .all(|line| painted(line).ends_with('│')),
             "every picker body row must keep both side borders"
         );
+        // `/model`은 진한 `❯`만 고른 줄로 옮기고, 이름은 모델 색 그대로 둔다.
         let selected = panel
             .iter()
-            .find(|line| line.prefix.contains('❯'))
+            .find(|line| painted(line).contains('❯'))
             .expect("selected model row");
-        assert_eq!(selected.tone, Tone::ModelSol);
+        assert!(selected.tone == Tone::Plain && selected.bold);
+        assert_eq!(selected.tail[0].tone, Tone::ModelSol);
+        assert!(!selected.tail[0].bold);
     }
 
     #[test]
@@ -27518,7 +27649,7 @@ mod tests {
                 .iter()
                 .find(|line| painted(line).contains(text))
                 .expect("Claude model row");
-            assert_eq!(line.tone, tone);
+            assert_eq!(line.tail[0].tone, tone);
         }
     }
 
@@ -27713,6 +27844,136 @@ mod tests {
             Renderer::hover_columns(&steps, None, Some(&Pick::Effort(1))),
             Some(selected_start + 2..selected_start + 8)
         );
+    }
+
+    /// 단계에 마우스가 올라가면 배경 없이 그 이름만 밝고 굵은 글자로 가리킨다.
+    #[test]
+    fn hovering_an_effort_step_bolds_its_label_without_a_background() {
+        let slider = EffortSlider {
+            efforts: ["low", "medium", "high"].map(ToOwned::to_owned).to_vec(),
+            selected: 1,
+            detail: None,
+        };
+        let steps = effort_step_lines(&slider, 80).remove(1);
+        let painted_steps = painted(&steps);
+        let start = UnicodeWidthStr::width(&painted_steps[..painted_steps.find("high").unwrap()]);
+        let hovered = Renderer::hover_columns(&steps, None, Some(&Pick::Effort(2)));
+        assert_eq!(hovered, Some(start..start + 4));
+
+        // 마지막 열은 터미널 안전 칸이라 비워 두므로 한 칸 넓게 그린다.
+        let mut frame = CellFrame::new(painted_width(&steps) + 1, 1);
+        paint_line_into_frame(&mut frame, 0, &steps, None, hovered, None);
+        for column in start..start + 4 {
+            let style = frame.cells[column].style;
+            assert!(style.bold && !style.underlined);
+            assert_eq!(style.foreground, tone_rgb(Tone::Plain));
+            assert_ne!(style.background, Some(theme::palette().hover_bg));
+        }
+        assert!(!frame.cells[start - 1].style.bold);
+    }
+
+    /// 마우스가 올라간 줄로 선택 표시가 옮겨 가도, 목록 창은 실제 선택을 따라 그대로 있다.
+    #[test]
+    fn a_pointed_suggestion_takes_the_highlight_without_scrolling_the_list() {
+        let suggestions = (0..10)
+            .map(|index| SuggestionView {
+                command: format!("item-{index}"),
+                description: format!("description-{index}"),
+                selected: index == 0,
+                category: None,
+                panel_title: "Commands",
+                hint: None,
+            })
+            .collect::<Vec<_>>();
+        let names = |lines: &[PaintLine]| {
+            lines
+                .iter()
+                .map(painted)
+                .filter(|line| line.contains("item-"))
+                .map(|line| line.replace('❯', " "))
+                .collect::<Vec<_>>()
+        };
+        let before = suggestion_lines(&suggestions, 80);
+        POINTED_ROW.with(|row| row.set(Some(5)));
+        let pointed = suggestion_lines(&suggestions, 80);
+        POINTED_ROW.with(|row| row.set(None));
+        let row = |name: &str| {
+            pointed
+                .iter()
+                .find(|line| painted(line).contains(name))
+                .expect("suggestion row")
+        };
+
+        assert_eq!(names(&before), names(&pointed));
+        assert!(painted(row("item-5")).contains('❯'));
+        assert_eq!(row("item-5").tail[2].tone, Tone::Accent);
+        assert!(!painted(row("item-0")).contains('❯'));
+        assert_eq!(row("item-0").tail[2].tone, Tone::Plain);
+    }
+
+    /// 선택 창의 줄도 마우스가 올라간 줄이 주황 선택 표시를 받는다.
+    #[test]
+    fn a_pointed_picker_row_takes_the_accent_highlight() {
+        POINTED_ROW.with(|row| row.set(Some(2)));
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                closable: true,
+                title: "Provider".to_owned(),
+                lines: (0..3)
+                    .map(|index| OverlayLine {
+                        text: format!("{}. Runtime-{index} · Connected", index + 1),
+                        selected: index == 0,
+                        muted: false,
+                    })
+                    .collect(),
+                slider: None,
+                hint: "Enter Use".to_owned(),
+                style: OverlayStyle::Picker,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            },
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+        POINTED_ROW.with(|row| row.set(None));
+        let row = |name: &str| {
+            frame
+                .lines
+                .iter()
+                .find(|line| painted(line).contains(name))
+                .expect("provider row")
+        };
+
+        assert!(painted(row("Runtime-2")).contains('❯'));
+        assert_eq!(
+            (row("Runtime-2").tone, row("Runtime-2").tail[0].tone),
+            (Tone::Accent, Tone::Accent)
+        );
+        assert!(!painted(row("Runtime-0")).contains('❯'));
+        assert_eq!(row("Runtime-0").tail[0].tone, Tone::Plain);
+    }
+
+    /// 키를 누르면 목록의 호버 표시를 거두어 키보드 선택이 다시 보인다.
+    #[test]
+    fn a_key_or_click_returns_the_highlight_to_the_keyboard_selection() {
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.hovered_pick = Some(Pick::Suggestion(3));
+        assert!(renderer.clear_selection());
+        assert_eq!(renderer.hovered_pick, None);
+
+        renderer.hovered_pick = Some(Pick::Model);
+        assert!(!renderer.clear_selection());
+        assert_eq!(renderer.hovered_pick, Some(Pick::Model));
     }
 
     /// The top row of a picker, closable or not, at 80 columns.
@@ -27931,7 +28192,7 @@ mod tests {
 
     /// A selectable picker entry owns the whole row between its borders.
     #[test]
-    fn hovering_a_picker_row_lights_the_whole_row_inside_the_borders() {
+    fn a_picker_row_answers_across_the_whole_row_inside_the_borders() {
         let frame = overlay_frame(
             &[],
             OverlayView {
@@ -27967,18 +28228,18 @@ mod tests {
             .expect("the model row");
 
         assert_eq!(
-            Renderer::hover_columns(row, None, Some(&Pick::Row(0))),
+            row.pick.as_ref().and_then(|regions| regions.columns_of(&Pick::Row(0))),
             Some(1..painted_line_width(row) - 1)
         );
         assert_eq!(
-            Renderer::hover_columns(row, None, Some(&Pick::Row(1))),
+            row.pick.as_ref().and_then(|regions| regions.columns_of(&Pick::Row(1))),
             None
         );
     }
 
     /// Compact lists use the same full-row target as the taller pickers.
     #[test]
-    fn hovering_a_compact_row_lights_the_whole_row_inside_the_borders() {
+    fn a_compact_row_answers_across_the_whole_row_inside_the_borders() {
         let frame = overlay_frame(
             &[],
             OverlayView {
@@ -28014,13 +28275,13 @@ mod tests {
             .expect("the session row");
 
         assert_eq!(
-            Renderer::hover_columns(row, None, Some(&Pick::Row(0))),
+            row.pick.as_ref().and_then(|regions| regions.columns_of(&Pick::Row(0))),
             Some(1..painted_line_width(row) - 1)
         );
     }
 
     #[test]
-    fn panel_and_search_picker_rows_light_the_whole_row_inside_the_borders() {
+    fn panel_and_search_picker_rows_answer_across_the_whole_row_inside_the_borders() {
         for style in [
             OverlayStyle::Panel,
             OverlayStyle::SearchPicker {
@@ -28062,7 +28323,7 @@ mod tests {
                 .expect("the option row");
 
             assert_eq!(
-                Renderer::hover_columns(row, None, Some(&Pick::Row(0))),
+                row.pick.as_ref().and_then(|regions| regions.columns_of(&Pick::Row(0))),
                 Some(1..painted_line_width(row) - 1)
             );
         }

@@ -22,20 +22,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
-pub const RELEASE_NOTES: &[&str] = &[
-    "하위 에이전트를 띄울 때 하단 목록에 `Local agent` 줄이 겹치거나, 백그라운드 명령을 기다리는 하위 에이전트 줄이 사라지던 문제를 고쳤습니다.",
-    "하위 에이전트 줄의 설명이 순정 Claude Code처럼 약 30초마다 진행 요약으로 바뀝니다.",
-    "하위 에이전트 목록에서 마우스를 올린 줄은 `❯`와 굵은 글씨로 표시하고, `main` 줄은 줄 어디를 눌러도 열립니다.",
-    "화면 언어가 영어면 한국어 응답을 강제하지 않고 요청한 언어로 답하며, 한국어면 하위 에이전트 지시문도 한국어로 씁니다.",
-];
+pub const RELEASE_NOTES: &[&str] =
+    &["서브에이전트 표시방식 변경 및 에이전트 실행 종료 프로세스 안정화"];
 
 /// The same notes, line for line, for `/language english`.
-pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Fixed a duplicate `Local agent` row when launching subagents, and subagent rows vanishing while they wait on their own background commands.",
-    "Subagent row descriptions update to a progress summary about every 30 seconds, like stock Claude Code.",
-    "The hovered subagent row shows `❯` in bold, and clicking anywhere on the `main` row opens it.",
-    "With the English screen language, replies are no longer forced into Korean and follow the request's language; in Korean, subagent prompts are written in Korean too.",
-];
+pub const RELEASE_NOTES_EN: &[&str] =
+    &["Changed how subagents are displayed and stabilized the agent run shutdown process."];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");
 
