@@ -5326,17 +5326,7 @@ fn execute_local_action(
                 Ok(directory)
             });
             match result {
-                Ok(Some(directory)) => {
-                    let path = directory.display();
-                    state.push_notice(
-                        BlockKind::Warning,
-                        "Blocked executable link",
-                        tr(
-                            format!("실행 파일은 열지 않고 폴더를 열었습니다: {path}"),
-                            format!("Executable files aren't opened; opened the folder instead: {path}"),
-                        ),
-                    );
-                }
+                Ok(Some(_)) => {}
                 Ok(None) => state.push_notice(
                     BlockKind::Warning,
                     "Blocked executable link",

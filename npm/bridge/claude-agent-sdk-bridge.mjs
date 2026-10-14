@@ -3051,7 +3051,7 @@ function syncBackgroundSubagents(session, tasks) {
 }
 
 // CLI는 진행 요약을 고정 영어 지시로 만들어 language 설정도 따르지 않는다. 한국어
-// 요청 세션이면 Haiku로 옮겨 보이고, 같은 문구는 한 번만 옮긴다. 실패하면 원문을 쓴다.
+// 요청 세션이면 Haiku로 옮겨 보이고, 같은 문구는 한 번만 옮긴다. 옮기지 못하면 앞 설명을 둔다.
 const summaryTranslations = new Map();
 
 function translateSummary(session, summary) {
@@ -3059,12 +3059,20 @@ function translateSummary(session, summary) {
   if (!translation) {
     if (summaryTranslations.size >= 200) summaryTranslations.clear();
     translation = haikuReply(
-      `다음 진행 상황 문구를 '~하는 중' 꼴의 한국어 한 줄로 옮긴다. 파일·함수 이름은 그대로 두고 결과만 쓴다.\n${summary}`,
+      `아래 진행 상황 문구의 한국어 번역문만 한 줄로 쓴다. 원문을 되풀이하거나 화살표·따옴표·설명을 붙이지 않는다. 파일·함수 이름은 그대로 두고 '~하는 중' 꼴로 끝낸다.\n${summary}`,
       session,
-    ).then((reply) => firstLine(reply, SUBAGENT_DESCRIPTION_LIMIT) || summary, () => summary);
+    ).then(koreanSummary, () => "");
     summaryTranslations.set(summary, translation);
   }
   return translation;
+}
+
+// Haiku가 가끔 "원문 → 번역"으로 답한다. 한글이 든 줄의 한글 부분부터 쓰고, 한글이 없으면 버린다.
+function koreanSummary(reply) {
+  const line = String(reply).split("\n").find((text) => /[가-힣]/.test(text)) || "";
+  const parts = line.split(/\s*(?:→|->|=>)\s*/);
+  const text = parts.slice(parts.findIndex((part) => /[가-힣]/.test(part))).join(" → ");
+  return firstLine(text.replace(/^["'“]+|["'”]+$/g, ""), SUBAGENT_DESCRIPTION_LIMIT);
 }
 
 function processSubagentSystemMessage(session, message) {
@@ -3110,7 +3118,7 @@ function processSubagentSystemMessage(session, message) {
       if (session.lastKoreanRequest && !/[가-힣]/.test(summary)) {
         // 옮기는 동안은 앞 설명을 두고, 그사이 새 요약이 왔거나 줄이 끝났으면 버린다.
         translateSummary(session, summary).then((text) => {
-          if (running.latestSummary !== summary || session.subagents.get(running.id) !== running) return;
+          if (!text || running.latestSummary !== summary || session.subagents.get(running.id) !== running) return;
           running.description = text;
           emitSubagents(session);
         });
@@ -6713,6 +6721,19 @@ async function runSelfTest() {
     if (whileTranslating !== "노트 확인" || afterLateTranslation !== "새 노트를 읽는 중"
       || koreanRow.description !== "노트를 고치는 중") {
       throw new Error(`Claude Korean summary translation self-test failed: ${JSON.stringify([whileTranslating, afterLateTranslation, koreanRow.description])}`);
+    }
+    // 원문을 되풀이한 번역은 한국어 부분만, 한글이 없는 번역은 버리고 앞 설명을 둔다.
+    summaryTranslations.set("Reading empty", Promise.resolve(""));
+    koreanProgress("Reading empty");
+    await new Promise((resolve) => setImmediate(resolve));
+    const replies = [
+      ["Reading a.md and b.md → a.md와 b.md를 읽는 중", "a.md와 b.md를 읽는 중"],
+      ["Reading a.md\na.md를 읽는 중", "a.md를 읽는 중"],
+      ["\"a.md를 읽는 중\"", "a.md를 읽는 중"],
+      ["Reading a.md", ""],
+    ].filter(([reply, expected]) => koreanSummary(reply) !== expected);
+    if (koreanRow.description !== "노트를 고치는 중" || replies.length) {
+      throw new Error(`Claude Korean summary cleanup self-test failed: ${JSON.stringify([koreanRow.description, replies])}`);
     }
     clearSubagents(koreanSummarySession);
     summaryTranslations.clear();
