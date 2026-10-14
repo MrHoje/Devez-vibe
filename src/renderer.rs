@@ -7822,12 +7822,17 @@ fn normal_frame_with_expansion(
         );
     }
     // Separate the running-subagent rows from the status line with one blank row.
-    // 하위 에이전트를 보는 동안에는 상태 줄 대신 진행 줄과 띄운다.
-    if (status_line_painted || composer_hidden)
-        && lines.last() != Some(&PaintLine::blank())
-        && (!subagents.is_empty() || !artifacts.is_empty())
-    {
-        lines.push(PaintLine::blank());
+    // 하위 에이전트를 보는 동안에는 상태 줄 대신 진행 줄과 컴포저 가로줄 하나로 나눈다.
+    if !subagents.is_empty() || !artifacts.is_empty() {
+        if composer_hidden {
+            if lines.last() == Some(&PaintLine::blank()) {
+                lines.pop();
+            }
+            let rule_width = usize::from(width).saturating_sub(1).max(16);
+            lines.push(input_bottom_line(rule_width, None, composer_mode));
+        } else if status_line_painted && lines.last() != Some(&PaintLine::blank()) {
+            lines.push(PaintLine::blank());
+        }
     }
     lines.extend(subagent_lines(subagents, width));
     lines.extend(artifact_line(artifacts, width));
@@ -20910,9 +20915,9 @@ mod tests {
         );
     }
 
-    /// 하위 에이전트를 보는 동안 상태 줄이 숨어도 진행 줄과 하위 에이전트 줄 사이는 한 줄 띄운다.
+    /// 하위 에이전트를 보는 동안 상태 줄이 숨어도 진행 줄과 하위 에이전트 줄 사이에 가로줄 하나를 둔다.
     #[test]
-    fn the_subagent_view_leaves_a_blank_row_below_the_activity() {
+    fn the_subagent_view_rules_off_the_activity() {
         let editor = Editor::default();
         let frame = normal_frame_with_expansion(
             Vec::new(),
@@ -20944,7 +20949,7 @@ mod tests {
         );
         let activity = frame.activity_index.expect("activity row");
         assert!(painted(&frame.lines[activity]).contains("Completed (21s)"));
-        assert!(frame.lines[activity + 1] == PaintLine::blank());
+        assert_eq!(painted(&frame.lines[activity + 1]), "─".repeat(79));
         assert_eq!(painted(&frame.lines[activity + 2]), "  • main");
     }
 

@@ -701,13 +701,25 @@ impl BackendServer {
                     }
                     RuntimeKind::Codex => {
                         let backing = self.backing_id(visible, RuntimeKind::Codex)?;
-                        let response = self
-                            .codex()?
-                            .request(
-                                "thread/read",
-                                json!({ "threadId": backing, "includeTurns": true }),
-                            )
+                        let codex = self.codex()?;
+                        // includeTurns는 전체 기록 읽기라 Codex가 폐지 예정 알림을 보낸다.
+                        // 상태만 읽고, 멈춤 판정에 필요한 최근 턴은 페이지로 받는다.
+                        let mut response = codex
+                            .request("thread/read", json!({ "threadId": backing }))
                             .await?;
+                        if response
+                            .pointer("/thread/status/type")
+                            .and_then(Value::as_str)
+                            == Some("idle")
+                        {
+                            let page = codex
+                                .request(
+                                    "thread/turns/list",
+                                    json!({ "threadId": backing, "limit": 5 }),
+                                )
+                                .await?;
+                            response["thread"]["turns"] = page["data"].clone();
+                        }
                         Ok(codex_turn_status(
                             &response,
                             params.get("turnId").and_then(Value::as_str),

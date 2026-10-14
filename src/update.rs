@@ -23,11 +23,11 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] =
-    &["서브에이전트 표시방식 변경 및 에이전트 실행 종료 프로세스 안정화"];
+    &["Codex 작업이 한동안 조용할 때 대화창에 `Deprecation notice` 경고가 반복해서 뜨던 문제를 고쳤습니다."];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] =
-    &["Changed how subagents are displayed and stabilized the agent run shutdown process."];
+    &["Fixed a `Deprecation notice` warning that kept appearing during quiet Codex turns."];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");
 
