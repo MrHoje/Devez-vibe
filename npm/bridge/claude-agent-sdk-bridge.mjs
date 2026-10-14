@@ -4835,11 +4835,11 @@ async function dispatch(method, params = {}) {
     if (session) closeLiveSession(session);
     return { released: true, busy: false };
   }
-  // 순정 /clear처럼 백그라운드 작업만 남은 세션은 같은 프로세스에서 새 대화로
-  // 넘긴다. 작업과 그 완료 통지는 새 대화가 이어받는다.
+  // 순정 /clear처럼 살아 있는 세션은 같은 프로세스에서 새 대화로 넘겨 CLI와 MCP
+  // 연결을 다시 쓴다. 남은 백그라운드 작업과 그 완료 통지도 새 대화가 이어받는다.
   if (method === "session/clear") {
     const session = lookupSession(params.sessionId);
-    if (!session || !sessionHasLiveWork(session)) {
+    if (!session || (!session.queue && !sessionHasLiveWork(session))) {
       if (session) closeLiveSession(session);
       return { released: true, busy: false };
     }
@@ -4861,6 +4861,11 @@ async function dispatch(method, params = {}) {
     clearTimeout(timer);
     session.clearWaiter = null;
     session.clearPending = false;
+    // CLI가 /clear에 답하지 않아도 남은 작업이 없으면 연결을 닫고 새 대화를 연다.
+    if (!id && !sessionHasLiveWork(session)) {
+      closeLiveSession(session);
+      return { released: true, busy: false };
+    }
     if (!id) return { released: false, busy: true };
     emitSubagents(session);
     return {

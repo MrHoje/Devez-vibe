@@ -4772,14 +4772,21 @@ async fn start_new_thread(
     renderer.clear_screen()?;
     state.prepare_new_thread();
     state.begin_thread_switch();
+    // A live Claude session continues as a fresh conversation in the same CLI.
     // Otherwise nothing is started here: the next prompt builds the session, on
     // whichever runtime is selected by then. Until it does, the screen is an empty
     // new conversation with no session behind it.
+    let reused = cleared.is_some();
     if let Some(response) = cleared {
         let model = state.selected_model_name().to_owned();
         attach_started_thread(server, state, &response, &model).await;
     }
     draw(state, renderer)?;
+    // 순정 /clear처럼 같은 Claude CLI를 이어 쓰면 그 CLI가 불러 둔 Skills·Plugins도
+    // 그대로라 다시 조회하지 않는다.
+    if reused && claude::is_claude_model(state.selected_model_name()) {
+        return Ok(false);
+    }
     let refresh_errors = refresh_new_thread_catalogs(server, state, renderer).await?;
     if !refresh_errors.is_empty() {
         state.push_notice(
