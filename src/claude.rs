@@ -613,7 +613,9 @@ mod tests {
         assert!(bridge.contains("const PREFERRED_PERMISSION_MODE = \"auto\""));
         assert!(!bridge.contains("allowDangerouslySkipPermissions: true"));
         assert!(bridge.contains("withSessionQuery(session, (query) => query.setPermissionMode(PREFERRED_PERMISSION_MODE))"));
-        assert_eq!(bridge.matches("await applyPermissionMode(session);").count(), 1);
+        // Session start, and the way back from a model without auto mode.
+        assert_eq!(bridge.matches("await applyPermissionMode(session);").count(), 2);
+        assert!(bridge.contains("await followModelPermissionMode(session, params.model);"));
         assert!(!bridge.contains("claude/permissionMode/rejected"));
     }
 
@@ -1098,12 +1100,12 @@ mod tests {
             package
                 .pointer("/dependencies/@anthropic-ai~1claude-agent-sdk")
                 .and_then(Value::as_str),
-            Some("0.3.296")
+            Some("0.3.301")
         );
         assert_eq!(
             lock.pointer("/packages//dependencies/@anthropic-ai~1claude-agent-sdk")
                 .and_then(Value::as_str),
-            Some("0.3.296")
+            Some("0.3.301")
         );
         assert!(bridge.contains(
             "const CLAUDE_TASK_TOOLS = [\"TaskCreate\", \"TaskGet\", \"TaskUpdate\", \"TaskList\"]"

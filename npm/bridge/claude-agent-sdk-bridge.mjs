@@ -558,6 +558,19 @@ async function applyPermissionMode(session) {
   }
 }
 
+// Since CLI 2.1.299 a model without auto mode drops the session to default,
+// and it stays there after switching back, so restore auto where it exists.
+async function followModelPermissionMode(session, model) {
+  // The CLI omits supportsAutoMode on such a model rather than sending false.
+  const capabilities = modelCapabilities(session.models || [], model);
+  if (capabilities && !capabilities.supportsAutoMode) {
+    session.permissionMode = "default";
+    session.permissionModeVerified = false;
+    return;
+  }
+  await applyPermissionMode(session);
+}
+
 async function claudePermissionStatus(params) {
   const resolved = await resolveSettings({
     cwd: params.cwd || process.cwd(),
@@ -3965,6 +3978,7 @@ async function runPrompt(session, params) {
       const model = stripClaudeModel(params.model);
       await session.query.setModel(model);
       session.model = visibleModel(params.model);
+      await followModelPermissionMode(session, params.model);
     }
     session.steerPending = 0;
     // Steering carries no effort of its own, so a steer that lands here because the
@@ -4923,6 +4937,22 @@ async function runPermissionModeSelfTest() {
   if (!doubleRejection.includes("자동 승인 모드를 적용하지 못했습니다")
       || rejectedCalls.join(",") !== "auto" || rejected.permissionModeVerified) {
     throw new Error(`Claude permission double rejection self-test failed: ${doubleRejection}`);
+  }
+
+  const switchCalls = [];
+  const switching = fakeSession(async (mode) => switchCalls.push(mode));
+  switching.models = [
+    { value: "claude-haiku-4-5-20251001" },
+    { value: "sonnet", supportsAutoMode: true },
+  ];
+  await applyPermissionMode(switching);
+  await followModelPermissionMode(switching, "claude:claude-haiku-4-5-20251001");
+  const dropped = switching.permissionMode;
+  await followModelPermissionMode(switching, "claude:sonnet");
+  await followModelPermissionMode(switching, "claude:sonnet");
+  if (dropped !== "default" || switching.permissionMode !== PREFERRED_PERMISSION_MODE
+      || switchCalls.join(",") !== "auto,auto") {
+    throw new Error(`Claude model switch permission self-test failed: ${dropped} ${JSON.stringify(switchCalls)}`);
   }
 }
 
