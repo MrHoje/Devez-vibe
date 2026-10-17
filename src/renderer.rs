@@ -3295,12 +3295,11 @@ impl Renderer {
         });
         let frame_width = width;
         self.update_subagent_view(view.subagent_view.as_ref(), frame_width);
-        // Fullscreen assistant output shares the transcript surface with its
-        // completed form. Keeping active and completed text on one surface
-        // removes the live-frame -> history transfer that previously needed
-        // several timing and spacer corrections to conceal a row jump.
+        // Fullscreen live blocks share the transcript surface with their
+        // completed form, so a running tool scrolls with the conversation and
+        // nothing jumps when it commits.
         let (streamed_blocks, docked_blocks) = if self.mode == RenderMode::Fullscreen {
-            split_fullscreen_live_blocks(&view.live_blocks)
+            (view.live_blocks.clone(), Vec::new())
         } else {
             (Vec::new(), view.live_blocks.clone())
         };
@@ -5898,25 +5897,17 @@ fn split_pane_frame_scrolled(
         view.diff_display_mode,
         view.fold_progress_groups,
     );
-    // A streamed Assistant owns transcript rows in both fullscreen layouts.
-    // Keeping it in the split pane's dock would revive the old live-to-history
-    // transfer and move the answer when `/btw` closes or the item commits.
-    let (streamed_blocks, docked_blocks) = split_fullscreen_live_blocks(&view.live_blocks);
+    // Live blocks own transcript rows in both fullscreen layouts. Keeping them
+    // in the split pane's dock would move them when `/btw` closes or they commit.
     let (streamed_lines, _) = render_streamed_transcript_lines(
-        &streamed_blocks,
+        &view.live_blocks,
         content_width,
         expanded_tools,
         view.shell_display_mode,
         view.diff_display_mode,
     );
     transcript.extend(streamed_lines);
-    let live_lines = render_live_block_lines(
-        &docked_blocks,
-        content_width,
-        expanded_tools,
-        view.shell_display_mode,
-        view.diff_display_mode,
-    );
+    let live_lines = Vec::new();
     let status = if active {
         StatusArea {
             fallback: view.footer,
@@ -7509,14 +7500,6 @@ fn render_live_block_lines(
     lines
 }
 
-fn split_fullscreen_live_blocks<'a>(
-    live: &[LiveBlockView<'a>],
-) -> (Vec<LiveBlockView<'a>>, Vec<LiveBlockView<'a>>) {
-    live.iter()
-        .copied()
-        .partition(|live| matches!(live.block.kind, BlockKind::Assistant))
-}
-
 fn render_streamed_transcript_lines(
     live: &[LiveBlockView<'_>],
     width: u16,
@@ -7524,16 +7507,21 @@ fn render_streamed_transcript_lines(
     shell_display_mode: ShellDisplayMode,
     diff_display_mode: DiffDisplayMode,
 ) -> (Vec<PaintLine>, HashMap<u64, usize>) {
+    let blocks = live
+        .iter()
+        .map(|live| {
+            let mut block = live.block.clone();
+            if matches!(block.kind, BlockKind::Assistant) {
+                block.body = stable_streaming_markdown_body(&block.body);
+            }
+            block
+        })
+        .collect::<Vec<_>>();
     let mut output = Vec::new();
     let mut rows = HashMap::new();
-    for live in live {
-        let mut block = live.block.clone();
-        block.body = stable_streaming_markdown_body(&block.body);
-        if is_blank_bodied_assistant_block(&block) {
-            continue;
-        }
+    for block in visible_transcript_blocks(&blocks, shell_display_mode, diff_display_mode) {
         let mut lines = block_group_lines_at(
-            &block,
+            block,
             width,
             shell_display_mode,
             diff_display_mode,
@@ -7543,7 +7531,10 @@ fn render_streamed_transcript_lines(
         );
         // 활성 응답과 완료 기록이 같은 꼬리 행을 가져야 턴 종료 순간 답변이 한 행
         // 내려가지 않는다. 닫힌 문단과 블록 구분 줄이 겹치면 화면에는 하나만 둔다.
-        trim_trailing_visual_blank_rows(&mut lines, 1);
+        // 도구 카드는 완료 기록도 꼬리를 줄이지 않으므로 그대로 둔다.
+        if matches!(block.kind, BlockKind::Assistant) {
+            trim_trailing_visual_blank_rows(&mut lines, 1);
+        }
         rows.insert(block.id(), lines.len());
         output.extend(lines);
     }
@@ -22296,15 +22287,14 @@ mod tests {
                 revision: block.body.len() as u64,
             })
             .collect::<Vec<_>>();
-        let (streamed, docked) = split_fullscreen_live_blocks(&live_views);
         let (streamed_lines, streamed_rows) = render_streamed_transcript_lines(
-            &streamed,
+            &live_views,
             width,
             &renderer.expanded_tools,
             renderer.shell_display_mode,
             renderer.diff_display_mode,
         );
-        let live_lines = renderer.live_frame_lines(&docked, width, rows.max(3));
+        let live_lines = Vec::new();
         let editor = Editor::default();
         let status = StatusArea {
             fallback: HIDDEN_STATUS_LINE.to_owned(),
@@ -23194,6 +23184,50 @@ mod tests {
             before.iter().map(painted_line_text).collect::<Vec<_>>(),
             after.iter().map(painted_line_text).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn running_tool_scrolls_with_the_fullscreen_transcript() {
+        set_chat_layout(false);
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.shell_display_mode = ShellDisplayMode::Expand;
+        let history = (0..16)
+            .flat_map(|index| {
+                [
+                    Block::new(BlockKind::User, "Codex", format!("프롬프트 {index}")),
+                    Block::new(BlockKind::Assistant, "Codex", format!("기록 답변 {index}")),
+                ]
+            })
+            .collect::<Vec<_>>();
+        simulate_fullscreen_frame(&mut renderer, &history, &[], Some("Working"), None, 24, 80);
+        let tool = Block::new(BlockKind::Tool, "Shell · cargo test", "");
+        let shows_tool = |lines: &[PaintLine]| {
+            lines
+                .iter()
+                .any(|line| painted_line_text(line).contains("cargo test"))
+        };
+        let latest = simulate_fullscreen_frame(
+            &mut renderer,
+            &[],
+            std::slice::from_ref(&tool),
+            Some("Working"),
+            None,
+            24,
+            80,
+        );
+        assert!(shows_tool(&latest));
+
+        renderer.scroll_back = 10;
+        let scrolled = simulate_fullscreen_frame(
+            &mut renderer,
+            &[],
+            std::slice::from_ref(&tool),
+            Some("Working"),
+            None,
+            24,
+            80,
+        );
+        assert!(!shows_tool(&scrolled));
     }
 
     #[test]
