@@ -36,6 +36,7 @@ use crate::{
         PlanSummary,
         ProviderHandoffBlock, ProviderIntegrationView, StatusLineView,
         SteeredPromptView, SubagentTranscript, SubagentView, SuggestionView, VibeTone, View, WelcomeView,
+        WorkflowRun,
         format_clock_time, format_elapsed, visible_window,
     },
     rollout::{PlanSnapshot, Rollout, RolloutEvent, RolloutKind},
@@ -1669,6 +1670,8 @@ enum PendingInteraction {
         selected: usize,
         detail: Option<SubagentView>,
     },
+    /// Claude 워크플로 줄을 눌러 연 단계·에이전트 창. 워크플로가 끝나도 마지막 상태를 보이도록 떠 둔다.
+    WorkflowDetail(SubagentView),
     ModelPicker {
         model_index: usize,
         /// OpenCode exposes enough models to warrant live filtering. Other
@@ -3241,6 +3244,7 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
             | PendingInteraction::VibeModePicker { .. }
             | PendingInteraction::StatusLinePicker { .. }
             | PendingInteraction::BackgroundTasks { .. }
+            | PendingInteraction::WorkflowDetail(_)
             | PendingInteraction::SkillsPicker { .. }
             | PendingInteraction::SessionPicker(_)
             | PendingInteraction::HistoryPicker(_)
@@ -3704,6 +3708,8 @@ struct RunningSubagent {
     painted_elapsed_secs: u64,
     /// Levels below the subagent that launched it; the bridge orders the rows.
     depth: usize,
+    /// Claude 워크플로 행의 단계·에이전트 진행.
+    workflow: Option<WorkflowRun>,
 }
 
 /// A page this session published as a claude.ai Artifact, kept for the row
@@ -7711,8 +7717,12 @@ impl AppState {
                 .chain(
                     self.finished_subagents
                         .iter()
+                        // 순정 Claude Code처럼 끝난 줄은 보고 있을 때만 남긴다. 재실행 때
+                        // 경과를 이어 세도록 기록은 그대로 30초 둔다.
                         .filter(|(row, _)| {
                             !self.subagents.iter().any(|running| running.id == row.id)
+                                && (self.selected_provider() != ModelProvider::Claude
+                                    || self.viewing_subagent.as_deref() == Some(row.id.as_str()))
                         })
                         .map(|(row, _)| SubagentView {
                             selected: self.viewing_subagent.as_deref() == Some(row.id.as_str()),
@@ -7934,7 +7944,10 @@ impl AppState {
         // changes once a second, so only that boundary asks for a full frame.
         // 목록에서 숨긴 백그라운드 명령은 작업 창이 열려 있을 때만 경과 초가 보이므로,
         // 그 밖에는 쉬는 동안 화면 전체를 다시 그리지 않는다.
-        let tasks_open = matches!(self.pending, Some(PendingInteraction::BackgroundTasks { .. }));
+        let tasks_open = matches!(
+            self.pending,
+            Some(PendingInteraction::BackgroundTasks { .. } | PendingInteraction::WorkflowDetail(_))
+        );
         let mut subagent_elapsed_changed = false;
         for running in &mut self.subagents {
             let elapsed = running.started_at.elapsed().as_secs();
@@ -7951,6 +7964,18 @@ impl AppState {
         });
         if self.finished_subagents.len() != lingering {
             full_redraw = true;
+        }
+        // 워크플로 창은 끝난 뒤에도 마지막 진행을 보이도록 도는 동안 행을 따라간다.
+        let live_workflow = match &self.pending {
+            Some(PendingInteraction::WorkflowDetail(row)) => self
+                .subagents
+                .iter()
+                .find(|running| running.id == row.id)
+                .map(|running| self.subagent_row(running)),
+            _ => None,
+        };
+        if let (Some(live), Some(PendingInteraction::WorkflowDetail(row))) = (live_workflow, &mut self.pending) {
+            *row = live;
         }
         // 작업 창이 보는 명령은 끝나도 마지막 실행 시간을 보이도록 도는 동안 따라간다.
         if let Some(PendingInteraction::BackgroundTasks { detail: Some(row), .. }) = &mut self.pending
@@ -9052,7 +9077,11 @@ impl AppState {
         // 요청이 오면 닫고 그대로 처리한다.
         if matches!(
             self.pending,
-            Some(PendingInteraction::HistoryPicker(_) | PendingInteraction::BackgroundTasks { .. })
+            Some(
+                PendingInteraction::HistoryPicker(_)
+                    | PendingInteraction::BackgroundTasks { .. }
+                    | PendingInteraction::WorkflowDetail(_)
+            )
         ) {
             self.pending = None;
         }
@@ -9647,6 +9676,7 @@ impl AppState {
                 started_at: Instant::now(),
                 painted_elapsed_secs: 0,
                 depth: 0,
+                workflow: None,
             });
         }
         // A child can outlive its parent turn. Keep the existing missed-signal
@@ -10376,6 +10406,9 @@ impl AppState {
                                 .get("depth")
                                 .and_then(Value::as_u64)
                                 .map_or(0, |depth| depth as usize),
+                            workflow: entry
+                                .get("workflow")
+                                .and_then(|workflow| serde_json::from_value(workflow.clone()).ok()),
                         })
                     })
                     .collect();
@@ -12248,6 +12281,12 @@ impl AppState {
                     }
                 }
             }
+            PendingInteraction::WorkflowDetail(row) => {
+                if key.code != KeyCode::Esc {
+                    self.pending = Some(PendingInteraction::WorkflowDetail(row));
+                }
+                Action::None
+            }
             PendingInteraction::StatusLinePicker { mut selected } => match key.code {
                 KeyCode::Esc => Action::None,
                 KeyCode::Enter => Action::None,
@@ -13389,6 +13428,7 @@ impl AppState {
             PendingInteraction::BackgroundTasks { selected, detail } => {
                 Some(self.background_tasks_overlay(*selected, detail.as_ref()))
             }
+            PendingInteraction::WorkflowDetail(row) => Some(self.workflow_detail_overlay(row)),
             PendingInteraction::StatusLinePicker { selected } => Some(OverlayView {
                 closable: true,
                 title: "Status line".to_owned(),
@@ -15289,6 +15329,7 @@ impl AppState {
             viewable: !running.is_background_task
                 && !crate::open_code::is_open_code_model(self.selected_model_name()),
             finished: false,
+            workflow: running.workflow.clone(),
         }
     }
 
@@ -15332,6 +15373,89 @@ impl AppState {
             detail: None,
         });
         Action::Tick(true)
+    }
+
+    /// 워크플로 줄을 눌렀을 때 순정 /workflows 상세처럼 단계와 에이전트를 보인다.
+    pub fn open_workflow_detail(&mut self, id: &str) -> Action {
+        if self.pending.is_some() {
+            return Action::None;
+        }
+        let Some(row) = self
+            .subagents
+            .iter()
+            .find(|running| running.id == id && running.workflow.is_some())
+            .map(|running| self.subagent_row(running))
+        else {
+            return Action::None;
+        };
+        self.pending = Some(PendingInteraction::WorkflowDetail(row));
+        Action::Tick(true)
+    }
+
+    fn workflow_detail_overlay(&self, row: &SubagentView) -> OverlayView<'_> {
+        let run = row.workflow.clone().unwrap_or_default();
+        let line = |text: String, muted: bool| OverlayLine {
+            text,
+            selected: false,
+            muted,
+        };
+        let running = self.subagents.iter().any(|running| running.id == row.id);
+        let total = run.agents.len();
+        let mut lines = vec![line(
+            format!(
+                "Status: {} · {}/{total} agents · {}",
+                if running { "running" } else { "finished" },
+                run.done(),
+                crate::renderer::format_workflow_elapsed(row.elapsed)
+            ),
+            false,
+        )];
+        // 단계 순서대로 묶고, 단계 없이 돈 에이전트는 마지막에 둔다.
+        let mut groups: Vec<(Option<&str>, usize)> = run
+            .phases
+            .iter()
+            .map(|phase| (Some(phase.title.as_str()), phase.index))
+            .collect();
+        groups.push((None, usize::MAX));
+        for (title, index) in groups {
+            let agents: Vec<_> = run
+                .agents
+                .iter()
+                .filter(|agent| {
+                    agent.phase == index
+                        || (title.is_none() && !run.phases.iter().any(|phase| phase.index == agent.phase))
+                })
+                .collect();
+            if let Some(title) = title {
+                let done = agents.iter().filter(|agent| agent.state == "done").count();
+                lines.push(line(String::new(), false));
+                lines.push(line(format!("{index}. {title}  {done}/{}", agents.len()), false));
+            } else if !agents.is_empty() {
+                lines.push(line(String::new(), false));
+            }
+            for agent in agents {
+                lines.push(line(
+                    format!("  {} · {}", agent.label, agent.state),
+                    agent.state == "queued" || agent.state == "done",
+                ));
+            }
+        }
+        if total == 0 {
+            lines.push(line(String::new(), false));
+            lines.push(line(tr("아직 에이전트가 없습니다.", "No agents yet.").to_owned(), true));
+        }
+        let name = run.name.trim();
+        OverlayView {
+            closable: true,
+            title: if name.is_empty() { row.description.clone() } else { name.to_owned() },
+            lines,
+            slider: None,
+            hint: "Esc close".to_owned(),
+            style: OverlayStyle::Picker,
+            input: None,
+            input_label: "",
+            input_placeholder: "",
+        }
     }
 
     fn open_background_task_detail(&mut self, selected: usize) -> Action {
@@ -24113,6 +24237,7 @@ mod tests {
             started_at: Instant::now(),
             painted_elapsed_secs: 0,
             depth: 0,
+            workflow: None,
         };
         let (shell, monitor, other) = (task("Bash"), task("Monitor"), task("mcp_task"));
 
@@ -24171,6 +24296,89 @@ mod tests {
         state.finished_subagents[0].1 -= SUBAGENT_FINISHED_LINGER;
         state.render_tick();
         assert!(state.view().subagents.is_empty());
+    }
+
+    /// Claude는 순정처럼 끝난 줄을 idle로 남기지 않고 바로 감춘다. 보던 줄은 나올 때 감추고,
+    /// 같은 작업이 다시 돌면 경과를 이어 센다.
+    #[test]
+    fn claude_hides_a_finished_subagent_at_once_unless_it_is_viewed() {
+        let mut state = claude_test_state();
+        let running = json!({ "subagents": [{ "id": "toolu_1", "taskId": "a1", "name": "general-purpose" }] });
+        let none = json!({ "subagents": [] });
+        state.handle_notification("turn/subagents/updated", &running);
+        state.handle_notification("turn/subagents/updated", &none);
+        assert!(state.view().subagents.is_empty());
+
+        state.finished_subagents[0].0.elapsed = Duration::from_secs(190);
+        state.handle_notification("turn/subagents/updated", &running);
+        assert!(state.view().subagents[0].elapsed >= Duration::from_secs(190));
+
+        state.view_subagent(Some("toolu_1".to_owned()));
+        state.handle_notification("turn/subagents/updated", &none);
+        let rows = state.view().subagents;
+        assert!(rows.len() == 1 && rows[0].finished && rows[0].selected, "kept while it is viewed");
+        state.view_subagent(None);
+        assert!(state.view().subagents.is_empty());
+    }
+
+    /// 워크플로 줄을 누르면 단계별 에이전트 창이 열리고, 끝난 뒤에도 마지막 진행이 남는다.
+    #[test]
+    fn a_workflow_row_opens_its_phases_and_agents() {
+        let mut state = claude_test_state();
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({ "subagents": [{
+                "id": "task:wf",
+                "taskId": "wf",
+                "name": "Workflow",
+                "backgroundTask": true,
+                "description": "조사",
+                "workflow": {
+                    "name": "probe",
+                    "phases": [{ "index": 1, "title": "Find" }, { "index": 2, "title": "Verify" }],
+                    "agents": [
+                        { "label": "one", "phase": 1, "state": "done" },
+                        { "label": "two", "phase": 1, "state": "failed" },
+                        { "label": "three", "phase": 2, "state": "running" },
+                        { "label": "loose", "phase": 0, "state": "queued" },
+                    ],
+                },
+            }] }),
+        );
+        assert_eq!(state.view().subagents[0].workflow.as_ref().map(|run| run.done()), Some(1));
+        assert!(matches!(state.open_workflow_detail("task:wf"), Action::Tick(true)));
+        let texts = |state: &AppState| {
+            let overlay = state.view().overlay.expect("the workflow window is open");
+            (
+                overlay.title,
+                overlay.lines.into_iter().map(|line| line.text).collect::<Vec<_>>(),
+            )
+        };
+        let (title, lines) = texts(&state);
+        assert_eq!(title, "probe");
+        assert!(lines[0].starts_with("Status: running · 1/4 agents · "));
+        assert_eq!(
+            lines[1..],
+            [
+                "",
+                "1. Find  1/2",
+                "  one · done",
+                "  two · failed",
+                "",
+                "2. Verify  0/1",
+                "  three · running",
+                "",
+                "  loose · queued",
+            ]
+        );
+
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
+        state.render_tick();
+        let (_, lines) = texts(&state);
+        assert!(lines[0].starts_with("Status: finished · 1/4 agents · "));
+        assert!(state.view().subagents.is_empty(), "the finished row is gone");
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(state.view().overlay.is_none());
     }
 
     /// 보기 머리줄은 하단 줄과 같은 이름·설명을 쓴다.

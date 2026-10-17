@@ -546,6 +546,42 @@ pub struct SubagentView {
     pub viewable: bool,
     /// 끝났지만 순정처럼 잠시 남겨 둔 행. 점을 완료 색으로 칠한다.
     pub finished: bool,
+    /// Claude 워크플로 줄이면 그 단계와 에이전트. 줄 모양과 눌러 여는 상세 창이 달라진다.
+    pub workflow: Option<WorkflowRun>,
+}
+
+/// 브리지가 워크플로 task_progress의 workflow_progress에서 옮겨 준 실행 상태.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
+pub struct WorkflowRun {
+    /// 스크립트 meta.name. 비어 있으면 줄 설명(meta.description)을 이름으로 쓴다.
+    pub name: String,
+    pub phases: Vec<WorkflowPhase>,
+    pub agents: Vec<WorkflowAgent>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
+pub struct WorkflowPhase {
+    pub index: usize,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
+pub struct WorkflowAgent {
+    pub label: String,
+    /// 속한 단계의 `WorkflowPhase::index`. 0이면 단계 없이 돈 에이전트다.
+    pub phase: usize,
+    /// queued, running, done, failed 가운데 하나.
+    pub state: String,
+}
+
+impl WorkflowRun {
+    /// 순정처럼 끝난 에이전트만 완료로 세고, 전체는 지금까지 알려진 에이전트 수다.
+    pub fn done(&self) -> usize {
+        self.agents.iter().filter(|agent| agent.state == "done").count()
+    }
 }
 
 /// 본문 대신 그릴 하위 에이전트 기록과, 기록이 바뀔 때마다 오르는 판.
@@ -6316,6 +6352,8 @@ pub enum Pick {
     ViewSubagent(Option<String>),
     /// 상태 줄의 백그라운드 작업 수: 작업 창을 연다.
     BackgroundTasks,
+    /// Claude 워크플로 줄: 단계와 에이전트를 보이는 상세 창을 연다.
+    WorkflowDetail(String),
     McpSection(String),
     PluginSection(String),
     /// 패널 머리글의 [▶]: 패널을 12칸 좁힌다.
@@ -6820,21 +6858,117 @@ fn subagent_lines(subagents: &[SubagentView], width: u16) -> Vec<PaintLine> {
     // 상태 줄처럼 오른쪽 두 칸을 비운다. DevezCode 콘솔은 `·`·`…`를 두 칸으로 세어
     // 넘친 끝을 잘라 내므로, 가장 많이 센 행만큼 끝을 당겨 경과 시간을 한 열에 맞춘다.
     let edge = usize::from(width).saturating_sub(2);
+    let row = |subagent: &SubagentView, edge: usize| match &subagent.workflow {
+        Some(run) => workflow_line(subagent, run, edge),
+        None => subagent_line(subagent, edge),
+    };
     let extra = subagents
         .iter()
-        .map(|subagent| line_console_extra(&subagent_line(subagent, edge)))
+        .map(|subagent| line_console_extra(&row(subagent, edge)))
         .max()
         .unwrap_or(0);
-    // 앞 두 칸은 마우스가 올라간 줄의 `❯` 자리다. `main`도 줄 끝까지 누를 수 있다.
-    let mut main = subagent_main_line(subagents, "  ");
-    main.pick = Some(PickRegions::span(0, edge, Pick::ViewSubagent(None)));
-    let mut lines = vec![main];
+    let mut lines = Vec::new();
+    // 순정처럼 워크플로만 돌 때는 돌아갈 하위 대화가 없으므로 `main`을 세우지 않는다.
+    if subagents
+        .iter()
+        .any(|subagent| subagent.workflow.is_none() || subagent.selected)
+    {
+        // 앞 두 칸은 마우스가 올라간 줄의 `❯` 자리다. `main`도 줄 끝까지 누를 수 있다.
+        let mut main = subagent_main_line(subagents, "  ");
+        main.pick = Some(PickRegions::span(0, edge, Pick::ViewSubagent(None)));
+        lines.push(main);
+    }
     lines.extend(
         subagents
             .iter()
-            .map(|subagent| subagent_line(subagent, edge.saturating_sub(extra))),
+            .map(|subagent| row(subagent, edge.saturating_sub(extra))),
     );
     lines
+}
+
+/// 순정 진행 막대 폭. 자리가 모자라면 다음 폭으로 줄이고, 끝내 안 되면 막대를 뺀다.
+const WORKFLOW_BAR_WIDTHS: [usize; 4] = [20, 12, 8, 0];
+/// 순정처럼 이름을 이만큼은 지킨 채 막대부터 줄인다.
+const WORKFLOW_NAME_KEEP: usize = 20;
+
+/// 순정 워크플로 줄 `• 이름  ▰▰▱▱  완료/전체 · 경과`. 순정과 달리 토큰은 싣지 않는다.
+fn workflow_line(subagent: &SubagentView, run: &WorkflowRun, right_edge: usize) -> PaintLine {
+    let total = run.agents.len();
+    let done = run.done();
+    let mut segments = Vec::new();
+    if total > 0 {
+        segments.push(format!("{done}/{total}"));
+    }
+    segments.push(format_workflow_elapsed(subagent.elapsed));
+    let segments = segments.join(SUBAGENT_DESCRIPTION_SEPARATOR);
+    let segments_width = UnicodeWidthStr::width(segments.as_str());
+    let fixed = 2 + UnicodeWidthStr::width("• ") + SUBAGENT_ELAPSED_GAP + segments_width;
+    let name = match (run.name.trim(), subagent.description.trim()) {
+        ("", "") => "Dynamic workflow",
+        ("", description) => description,
+        (name, _) => name,
+    };
+    let kept = UnicodeWidthStr::width(name).min(WORKFLOW_NAME_KEEP);
+    let bar_room = |bar: usize| if bar > 0 { bar + SUBAGENT_ELAPSED_GAP } else { 0 };
+    let bar_width = WORKFLOW_BAR_WIDTHS
+        .into_iter()
+        .find(|bar| fixed + kept + bar_room(*bar) <= right_edge)
+        .unwrap_or(0);
+    let name = compact_right(name, right_edge.saturating_sub(fixed + bar_room(bar_width)));
+    let (glyph_tone, name_tone) = subagent_row_tones(subagent.selected, subagent.finished);
+    let gap = " ".repeat(SUBAGENT_ELAPSED_GAP);
+    let mut tail = vec![PaintSpan {
+        text: format!(" {name}"),
+        tone: name_tone,
+        bold: false,
+    }];
+    if bar_width > 0 {
+        // 순정 pill 막대처럼 채운 칸은 밝게, 남은 칸은 흐리게 그린다.
+        let filled = if total > 0 { done * bar_width / total } else { 0 };
+        tail.push(PaintSpan {
+            text: format!("{gap}{}", "▰".repeat(filled)),
+            tone: Tone::Plain,
+            bold: false,
+        });
+        tail.push(PaintSpan {
+            text: "▱".repeat(bar_width - filled),
+            tone: Tone::Muted,
+            bold: false,
+        });
+    }
+    tail.push(PaintSpan {
+        text: format!("{gap}{segments}"),
+        tone: Tone::Muted,
+        bold: false,
+    });
+    with_row_pick(
+        PaintLine {
+            prefix: "  ".to_owned(),
+            prefix_tone: Tone::Muted,
+            text: "•".to_owned(),
+            tone: glyph_tone,
+            bold: false,
+            tool_heading: None,
+            pick: None,
+            tail,
+        },
+        Pick::WorkflowDetail(subagent.id.clone()),
+    )
+}
+
+/// 순정 워크플로 줄의 경과 형식: `42s`, `3m16s`, `1h05m`, `2d03h`.
+pub(crate) fn format_workflow_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    let (minutes, hours) = (seconds / 60, seconds / 3600);
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if minutes < 60 {
+        format!("{minutes}m{:02}s", seconds % 60)
+    } else if hours < 24 {
+        format!("{hours}h{:02}m", minutes % 60)
+    } else {
+        format!("{}d{:02}h", hours / 24, hours % 24)
+    }
 }
 
 /// 본문에 띄운 줄만 테마색으로 칠하고, 끝난 줄은 점을 완료 색으로 칠한다.
@@ -6867,7 +7001,7 @@ fn is_subagent_row(line: &PaintLine) -> bool {
         regions
             .0
             .iter()
-            .any(|(_, _, pick)| matches!(pick, Pick::ViewSubagent(_)))
+            .any(|(_, _, pick)| matches!(pick, Pick::ViewSubagent(_) | Pick::WorkflowDetail(_)))
     })
 }
 
@@ -20407,6 +20541,7 @@ mod tests {
             selected: false,
             viewable: false,
             finished: false,
+            workflow: None,
         }
     }
 
@@ -20447,6 +20582,48 @@ mod tests {
         let panel = side_panel_subagent_lines(&[parent, child], 80, true);
         assert_eq!(painted(&panel[3]), "• Explore · 40s");
         assert_eq!(painted(&panel[4]), "  • Background task: Bash · npm run dev · 12s");
+    }
+
+    /// 워크플로 줄은 순정처럼 `이름  막대  완료/전체 · 경과`이고 토큰은 없다. 워크플로만
+    /// 돌면 `main`을 세우지 않고, 줄을 누르면 상세 창을 연다.
+    #[test]
+    fn a_workflow_row_reads_like_the_cli_footer_without_tokens() {
+        let mut row = test_subagent("Workflow", "환자 증상 사전 조사", "", 196);
+        row.is_background_task = true;
+        row.workflow = Some(WorkflowRun {
+            name: "probe".to_owned(),
+            phases: Vec::new(),
+            agents: ["done", "done", "done", "running", "queued", "running", "failed", "running"]
+                .into_iter()
+                .map(|state| WorkflowAgent {
+                    label: "agent".to_owned(),
+                    phase: 0,
+                    state: state.to_owned(),
+                })
+                .collect(),
+        });
+        let lines = subagent_lines(&[row.clone()], 80);
+        assert_eq!(lines.len(), 1, "no `main` while only a workflow runs");
+        assert_eq!(
+            painted(&lines[0]),
+            format!("  • probe  {}{}  3/8 · 3m16s", "▰".repeat(7), "▱".repeat(13))
+        );
+        assert_eq!(pick_on(&lines[0], "probe"), Some(Pick::WorkflowDetail(row.id.clone())));
+
+        // 좁으면 막대가 줄고, 이름이 없으면 설명이 이름이 된다.
+        row.workflow.as_mut().unwrap().name.clear();
+        let narrow = workflow_line(&row, row.workflow.as_ref().unwrap(), 50);
+        assert!(painted(&narrow).starts_with("  • 환자 증상 사전 조사  ▰"));
+        assert!(painted(&narrow).ends_with("  3/8 · 3m16s"));
+        assert!(painted_line_width(&narrow) <= 50);
+        let tiny = workflow_line(&row, row.workflow.as_ref().unwrap(), 24);
+        assert!(!painted(&tiny).contains('▱'));
+
+        let agent = test_subagent("Explore", "", "", 5);
+        assert_eq!(painted(&subagent_lines(&[agent, row], 80)[0]), "  • main");
+        assert_eq!(format_workflow_elapsed(Duration::from_secs(42)), "42s");
+        assert_eq!(format_workflow_elapsed(Duration::from_secs(3_900)), "1h05m");
+        assert_eq!(format_workflow_elapsed(Duration::from_secs(183_600)), "2d03h");
     }
 
     #[test]

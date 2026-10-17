@@ -3169,6 +3169,11 @@ function processSubagentSystemMessage(session, message) {
       }
       return true;
     }
+    // 워크플로 이름(meta.name)은 task_started에만 오고, 행을 만드는 스냅숏보다 먼저 올 수 있어 작업 id로 둔다.
+    const workflowName = firstLine(message.workflow_name || "", 80);
+    if (workflowName && message.task_id) {
+      (session.workflowNames ||= new Map()).set(firstLine(message.task_id, 80), workflowName);
+    }
     const running = upsertStructuredSubagent(session, message);
     if (!running) return false;
     emitSubagents(session);
@@ -3177,6 +3182,8 @@ function processSubagentSystemMessage(session, message) {
   if (message.subtype === "task_progress") {
     const running = upsertStructuredSubagent(session, message);
     if (!running) return false;
+    // 진행만 바뀐 묶음에는 workflow_progress가 빠지므로 앞서 받은 값을 둔다.
+    if (Array.isArray(message.workflow_progress)) running.workflow = workflowProgress(message.workflow_progress);
     const tool = firstLine(message.last_tool_name || "", 80);
     if (tool) running.tool = tool;
     const summary = firstLine(message.summary || "", SUBAGENT_DESCRIPTION_LIMIT);
@@ -3319,6 +3326,28 @@ function firstLine(value, limit) {
   return String(value ?? "").split("\n")[0].trim().slice(0, limit);
 }
 
+// 워크플로 task_progress는 공개 타입에 없는 workflow_progress에 단계(workflow_phase)와
+// 에이전트(workflow_agent)를 싣는다(CLI 2.1.302 실측). 순정 상세 창처럼 대기·실행·완료·실패로 나눈다.
+function workflowProgress(entries) {
+  const state = (entry) => {
+    if (entry.state === "done") return "done";
+    if (entry.state === "error") return "failed";
+    return entry.startedAt === undefined && entry.queuedAt !== undefined ? "queued" : "running";
+  };
+  return {
+    phases: entries
+      .filter((entry) => entry?.type === "workflow_phase")
+      .map((entry) => ({ index: Number(entry.index) || 0, title: firstLine(entry.title || "", 80) })),
+    agents: entries
+      .filter((entry) => entry?.type === "workflow_agent")
+      .map((entry) => ({
+        label: firstLine(entry.label || "", 80),
+        phase: Number(entry.phaseIndex) || 0,
+        state: state(entry),
+      })),
+  };
+}
+
 // SDK 0.3.292부터 하위 에이전트가 띄운 에이전트·명령에 parent_task_id가 붙는다.
 // 자식 행을 부모 행 바로 아래로 모아 깊이와 함께 보내면 호스트가 들여 그린다.
 // 부모가 이미 끝났거나 모르는 id면 최상위에 둔다.
@@ -3381,6 +3410,13 @@ function emitSubagents(session) {
       tool: agent.tool,
       elapsedMs: Date.now() - agent.startedAt,
       depth,
+      workflow: agent.backgroundTask === true && agent.name === "Workflow"
+        ? {
+          name: session.workflowNames?.get(agent.taskId) || "",
+          phases: agent.workflow?.phases || [],
+          agents: agent.workflow?.agents || [],
+        }
+        : undefined,
     })),
   });
 }
@@ -7282,6 +7318,41 @@ async function runSelfTest() {
         throw new Error(`Claude ${tool} row outlived its snapshot`);
       }
     }
+    // 워크플로 행은 스냅숏보다 먼저 온 task_started의 이름과 task_progress의 단계·에이전트를 싣고,
+    // workflow_progress가 빠진 진행 묶음에서는 앞 값을 유지한다.
+    for (const message of [
+      { subtype: "task_started", task_id: "wf-2", tool_use_id: "toolu_wf-2", task_type: "local_workflow", description: "조사", workflow_name: "probe" },
+      { subtype: "background_tasks_changed", tasks: [{ task_id: "wf-2", task_type: "local_workflow", description: "조사" }] },
+      {
+        subtype: "task_progress", task_id: "wf-2", tool_use_id: "toolu_wf-2", description: "A: one", summary: "조사",
+        workflow_progress: [
+          { type: "workflow_phase", index: 1, title: "A" },
+          { type: "workflow_agent", index: 1, label: "one", phaseIndex: 1, state: "done", startedAt: 1, queuedAt: 1 },
+          { type: "workflow_agent", index: 2, label: "two", phaseIndex: 1, state: "start", startedAt: 2, queuedAt: 1 },
+          { type: "workflow_agent", index: 3, label: "three", phaseIndex: 1, state: "start", queuedAt: 1 },
+          { type: "workflow_agent", index: 4, label: "four", phaseIndex: 1, state: "error", startedAt: 2, queuedAt: 1 },
+        ],
+      },
+      { subtype: "task_progress", task_id: "wf-2", tool_use_id: "toolu_wf-2", description: "A: two", summary: "조사" },
+    ]) processSubagentSystemMessage(commandSession, { type: "system", ...message });
+    const workflowRow = captured.join("").trim().split("\n").filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .filter((line) => line.method === "turn/subagents/updated" && line.params.threadId === "command-self-test")
+      .at(-1)?.params.subagents.find((row) => row.taskId === "wf-2");
+    const expectedWorkflow = {
+      name: "probe",
+      phases: [{ index: 1, title: "A" }],
+      agents: [
+        { label: "one", phase: 1, state: "done" },
+        { label: "two", phase: 1, state: "running" },
+        { label: "three", phase: 1, state: "queued" },
+        { label: "four", phase: 1, state: "failed" },
+      ],
+    };
+    if (JSON.stringify(workflowRow?.workflow) !== JSON.stringify(expectedWorkflow)) {
+      throw new Error(`Claude workflow progress row self-test failed: ${JSON.stringify(workflowRow)}`);
+    }
+    processSubagentSystemMessage(commandSession, { type: "system", subtype: "background_tasks_changed", tasks: [] });
     // 포그라운드로 끝난 작업은 여전히 그 도구 결과가 행을 거둔다.
     commandSession.tools.set("toolu_skill", { name: "Skill", input: {}, item: { id: "toolu_skill" } });
     processSubagentSystemMessage(commandSession, {

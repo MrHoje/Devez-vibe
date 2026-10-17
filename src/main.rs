@@ -2713,6 +2713,7 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
         }
         Pick::ViewSubagent(id) => state.view_subagent(id),
         Pick::BackgroundTasks => state.open_background_tasks(),
+        Pick::WorkflowDetail(id) => state.open_workflow_detail(&id),
         Pick::SubagentSection => {
             state.toggle_side_panel_subagents();
             Action::Tick(true)
