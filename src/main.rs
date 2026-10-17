@@ -7276,7 +7276,7 @@ async fn wait_for_paste_flush(deadline: Option<Instant>) {
 fn start_login_flow(state: &mut AppState, method: LoginMethod, response: &Value) {
     let login_id = response.get("loginId").and_then(Value::as_str);
     match method {
-        LoginMethod::Browser => {
+        LoginMethod::Browser | LoginMethod::Claude => {
             let auth_url = response.get("authUrl").and_then(Value::as_str);
             match (login_id, auth_url) {
                 (Some(login_id), Some(auth_url)) => {

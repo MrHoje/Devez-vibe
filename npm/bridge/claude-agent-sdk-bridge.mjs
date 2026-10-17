@@ -461,6 +461,60 @@ async function loadModelCatalog(params) {
   }
 }
 
+// In-flight `/login` flows. Each holds a throwaway CLI whose localhost listener
+// receives the browser callback, so it stays up until completion or cancel.
+const claudeLogins = new Map();
+
+async function startClaudeLogin(params) {
+  await ensureClaudeExecutableChoice(params);
+  const input = new AsyncQueue();
+  const options = {
+    cwd: params.cwd || process.cwd(),
+    persistSession: false,
+    settingSources: [],
+    tools: [],
+    env: sanitizedEnvironment(),
+    stderr: (data) => process.stderr.write(data),
+  };
+  applyClaudeExecutable(options, params);
+  const agentQuery = await startAgentQuery(input, options);
+  (async () => {
+    try { for await (const _message of agentQuery) { /* control requests only */ } }
+    catch { /* surfaced through the login requests */ }
+  })();
+  const close = () => {
+    input.close();
+    agentQuery.close();
+  };
+  let urls;
+  try {
+    urls = await agentQuery.claudeAuthenticate(true);
+  } catch (error) {
+    close();
+    throw error;
+  }
+  const loginId = `claude:${randomUUID()}`;
+  claudeLogins.set(loginId, close);
+  // The CLI saves the tokens itself; running sessions re-read the credentials
+  // file once its mtime changes, so no restart is needed.
+  agentQuery.claudeOAuthWaitForCompletion().then(
+    () => ({ success: true }),
+    (error) => ({ success: false, error: error instanceof Error ? error.message : String(error) }),
+  ).then((result) => {
+    if (!claudeLogins.delete(loginId)) return;
+    close();
+    notify("account/login/completed", { loginId, ...result });
+  });
+  return { type: "claudeai", loginId, authUrl: urls.automaticUrl };
+}
+
+function cancelClaudeLogin(params) {
+  const close = claudeLogins.get(params.loginId);
+  claudeLogins.delete(params.loginId);
+  close?.();
+  return {};
+}
+
 function stripClaudeModel(model) {
   if (!model || model === "claude:default") return undefined;
   return model.startsWith("claude:") ? model.slice("claude:".length) : model;
@@ -3819,7 +3873,9 @@ async function consumeMessage(session, message) {
         });
       }
     }
-    processAssistant(session, message);
+    // A failed sign-in's text would repeat as an answer what the turn error
+    // already shows with the /login guide.
+    if (message.error !== "authentication_failed") processAssistant(session, message);
   }
   else if (message.type === "user") processUser(session, message);
   else if (message.type === "result") await processResult(session, message);
@@ -4653,6 +4709,8 @@ async function dispatch(method, params = {}) {
   if (method === "account/read") {
     return await runClaudeJson(params, ["auth", "status", "--json"]) || {};
   }
+  if (method === "account/login/start") return startClaudeLogin(params);
+  if (method === "account/login/cancel") return cancelClaudeLogin(params);
   if (method === "plugin/reload") return {};
   if (method === "permissions/status") return claudePermissionStatus(params);
   if (method === "permissions/update") return updateClaudePermission(params);
@@ -6335,7 +6393,11 @@ async function runSelfTest() {
     process.stdout.write = (chunk) => { authNotices.push(JSON.parse(String(chunk))); return true; };
     try {
       beginTurn(limitSession);
-      await consumeMessage(limitSession, { type: "assistant", error: "authentication_failed", message: { content: [] } });
+      await consumeMessage(limitSession, {
+        type: "assistant",
+        error: "authentication_failed",
+        message: { content: [{ type: "text", text: "Not logged in · Please run /login" }] },
+      });
       await consumeMessage(limitSession, { ...failedResult, errors: ["API Error: 401 {\"type\":\"error\"}"] });
     } finally {
       process.stdout.write = authWrite;
@@ -6343,6 +6405,9 @@ async function runSelfTest() {
     const authTurn = authNotices.find((notice) => notice.method === "turn/completed")?.params?.turn;
     if (authTurn?.error?.codexErrorInfo !== "unauthorized" || !authTurn.error.message.includes("401")) {
       throw new Error(`Claude login failure lost its tag: ${JSON.stringify(authTurn)}`);
+    }
+    if (authNotices.some((notice) => notice.params?.item?.type === "agentMessage")) {
+      throw new Error("Claude login failure also showed as an answer");
     }
     // A steer answered in a run of its own stays in the turn it joined.
     const steerNotices = [];

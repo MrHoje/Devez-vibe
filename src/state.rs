@@ -1385,6 +1385,8 @@ pub struct PluginUninstallTarget {
 pub enum LoginMethod {
     Browser,
     DeviceCode,
+    /// Claude's browser sign-in, run by the Claude bridge instead of Codex.
+    Claude,
 }
 
 impl LoginMethod {
@@ -1395,6 +1397,7 @@ impl LoginMethod {
         match self {
             Self::Browser => "chatgpt",
             Self::DeviceCode => "chatgptDeviceCode",
+            Self::Claude => "claudeai",
         }
     }
 
@@ -1402,12 +1405,13 @@ impl LoginMethod {
         match self {
             Self::Browser => "Sign in with ChatGPT",
             Self::DeviceCode => "Sign in with a device code",
+            Self::Claude => "Sign in with Claude",
         }
     }
 
     fn detail(self) -> &'static str {
         match self {
-            Self::Browser => tr("브라우저를 엽니다", "Opens your browser"),
+            Self::Browser | Self::Claude => tr("브라우저를 엽니다", "Opens your browser"),
             Self::DeviceCode => tr("다른 기기에서 코드를 입력합니다", "Enter the code on another device"),
         }
     }
@@ -10944,8 +10948,8 @@ impl AppState {
                     Default::default()
                 } else if using_claude {
                     tr(
-                        "/login  Claude 로그인 방법\n/logout  Claude 로그아웃 방법\n",
-                        "/login  How to sign in to Claude\n/logout  How to sign out of Claude\n",
+                        "/login  Claude 로그인\n/logout  Claude 로그아웃 방법\n",
+                        "/login  Sign in to Claude\n/logout  How to sign out of Claude\n",
                     )
                 } else {
                     tr(
@@ -11295,17 +11299,7 @@ impl AppState {
                     .push(Block::new(BlockKind::Error, "Usage", "/connect"));
                 Action::None
             }
-            "/login" if using_claude => {
-                self.push_notice(
-                    BlockKind::System,
-                    "Claude login",
-                    tr(
-                        "터미널에서 `claude auth login`을 실행한 뒤 Devez Vibe를 다시 시작하세요.",
-                        "Run `claude auth login` in a terminal, then restart Devez Vibe.",
-                    ),
-                );
-                Action::None
-            }
+            "/login" if using_claude => Action::StartLogin(LoginMethod::Claude),
             "/login" => {
                 self.open_login_picker();
                 Action::None
@@ -16837,7 +16831,7 @@ fn codex_warning_block(method: &str, params: &Value) -> Block {
 fn provider_error_text(error: &Value, claude: bool) -> String {
     if error.get("codexErrorInfo").and_then(Value::as_str) == Some("unauthorized") {
         return if claude {
-            "Claude login expired. Run `claude auth login` in a terminal, then restart Devez Vibe."
+            "Claude login expired. Run /login to sign in again."
         } else {
             "Codex login expired. Run /login to sign in again."
         }
@@ -25609,19 +25603,16 @@ mod tests {
     }
 
     #[test]
-    fn claude_login_commands_use_claude_cli_instead_of_chatgpt_overlays() {
+    fn claude_login_commands_skip_chatgpt_overlays() {
         let mut state = test_state();
         state.models = vec![test_model("claude:sonnet", "Claude Sonnet", true)];
         state.selected_model = 0;
 
-        assert!(matches!(state.run_slash_command("/login"), Action::None));
+        assert!(matches!(
+            state.run_slash_command("/login"),
+            Action::StartLogin(LoginMethod::Claude)
+        ));
         assert!(state.overlay_view().is_none());
-        assert!(
-            state
-                .committed
-                .iter()
-                .any(|block| block.body.contains("claude auth login"))
-        );
 
         assert!(matches!(state.run_slash_command("/logout"), Action::None));
         assert!(state.overlay_view().is_none());
@@ -26582,7 +26573,7 @@ mod tests {
         assert_eq!(
             bodies,
             [
-                "Claude login expired. Run `claude auth login` in a terminal, then restart Devez Vibe.",
+                "Claude login expired. Run /login to sign in again.",
                 "Codex login expired. Run /login to sign in again.",
                 "stream error: Overloaded",
             ]

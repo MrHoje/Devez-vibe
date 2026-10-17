@@ -922,6 +922,15 @@ impl BackendServer {
             }
             "claude/permissions/status" => self.claude.request("permissions/status", params).await,
             "claude/account/read" => self.claude.request("account/read", params).await,
+            // Claude's `/login` runs on the Claude bridge, whose login ids carry `claude:`.
+            "account/login/start" if params["type"] == "claudeai" => {
+                self.claude.request(method, params).await
+            }
+            "account/login/cancel"
+                if params["loginId"].as_str().is_some_and(|id| id.starts_with("claude:")) =>
+            {
+                self.claude.request(method, params).await
+            }
             "claude/permissions/update" => self.claude.request("permissions/update", params).await,
             "claude/permissions/auto-mode" => {
                 self.claude.request("permissions/auto-mode", params).await

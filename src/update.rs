@@ -23,16 +23,14 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "순정 Claude Code처럼 응답 중에 입력한 `/new`·`/clear`·`/resume`·`/worktree`는 응답이 끝난 뒤 실행되고, 백그라운드 작업이 남아 있어도 대화 전환이 막히지 않습니다. Claude에서 `/new`를 하면 남은 작업과 완료 알림을 새 대화가 이어받습니다.",
-    "DevezCode에서 하위 에이전트가 끝날 때마다 완료 기록이 쌓이고 같은 줄이 두 번 남던 문제를 고쳐, 메인 작업이 모두 끝났을 때만 완료로 표시합니다.",
-    "한국어로 대화하는 Claude 세션에서는 하위 에이전트 줄의 30초 진행 요약도 한국어로 표시됩니다.",
+    "`/login`을 입력해 Claude에 로그인할 수 있습니다.",
+    "Claude Code 2.1.302를 적용해, 자동 승인 중 대화가 길어져도 도구를 모두 막지 않고 대화를 압축하도록 수정했습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "As in stock Claude Code, `/new`, `/clear`, `/resume`, and `/worktree` entered during a response now run after it ends, and leftover background work no longer blocks switching conversations. In Claude, `/new` hands the remaining work and its completion notices to the new conversation.",
-    "Fixed DevezCode piling up completion records and leaving a duplicate row each time a subagent finished; it now marks the response complete only after all of the main work ends.",
-    "In Claude sessions where you write in Korean, subagent rows now show their 30-second progress summaries in Korean too.",
+    "You can now sign in to Claude by entering `/login`.",
+    "Updated to Claude Code 2.1.302 so long conversations under auto-approval are compacted instead of blocking every tool.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");
