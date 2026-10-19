@@ -5536,6 +5536,7 @@ const CODEX_QUESTION_INSTRUCTIONS: &str = concat!(
     "Scope, planning, implementation, and review follow the current DevezVibe role and the user's instructions; actually make the permitted changes.\n",
     "Ask for choices and confirmations by calling the available request_user_input tool on its own. Do not use request_user_input_async. Do not number option labels.\n",
     "Put only a short item name in each option label. When an explanation is needed and the tool supports description, put it in description.\n",
+    "Keep each option description within two sentences. Drafts or lists the user must read go in the message body, not in request_user_input; keep only the short question in the tool.\n",
     "Do not merge explanations into the label with parentheses, dashes, or line breaks. With a tool that has no description, send only the item name. Do not invent explanations that are not needed.\n",
     "If the tool is missing or fails, ask in plain text, number the options once each from 1., and ask for the choice in the last sentence. Hold follow-up work and the final answer until the user answers. Do not turn free-form input into an option or a recommended value. Cancellation, an empty answer, an error, or a timeout is neither approval nor a choice; wait for a new instruction.\n",
 );
