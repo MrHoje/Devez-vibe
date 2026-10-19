@@ -433,14 +433,14 @@ impl SlashCommand {
         tr(self.korean, self.english)
     }
 
-    /// Whether the command reaches anything on `provider`. OpenCode has no
-    /// account, permission, MCP, plugin, skill, or session-name surface of its
-    /// own, and Claude has no fast service tier, so those commands stay out of the
-    /// suggestion list — and out of `/help` — while such a runtime is selected.
+    /// Whether the command reaches anything on `provider`. OpenCode manages
+    /// logout, MCP and plugins outside this UI, and Claude has no fast service tier,
+    /// so those commands stay out of suggestions and `/help` on that runtime.
     fn supports(&self, provider: ModelProvider) -> bool {
         match self.name {
-            "/login" | "/logout" | "/mcp" | "/plugins" | "/reload-plugins" | "/skills"
-            | "/rename" => provider != ModelProvider::OpenCode,
+            "/logout" | "/mcp" | "/plugins" | "/reload-plugins" => {
+                provider != ModelProvider::OpenCode
+            }
             "/fast" => provider != ModelProvider::Claude,
             _ => true,
         }
@@ -528,8 +528,8 @@ const SLASH_COMMANDS: [SlashCommand; 35] = [
     },
     SlashCommand {
         name: "/skills",
-        korean: "Codex Skill 목록 보기·켜기·끄기",
-        english: "List, enable, or disable Codex skills",
+        korean: "Skill 목록 보기·선택 또는 지원하는 provider의 켜기·끄기",
+        english: "List and select skills, or toggle them on supported providers",
         takes_argument: true,
     },
     SlashCommand {
@@ -1731,7 +1731,8 @@ enum PendingInteraction {
         selected: usize,
     },
     SkillsPicker {
-        provider: SkillProvider,
+        /// OpenCode skills can be selected, but have no enabled-state write API.
+        provider: Option<SkillProvider>,
         selected: usize,
         skills: Vec<SkillBinding>,
         errors: Vec<String>,
@@ -1970,7 +1971,7 @@ struct MentionBinding {
     description: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct SelectedCompletionBinding {
     sigil: char,
     trigger: String,
@@ -2241,6 +2242,21 @@ fn mcp_schema_is_message_only(schema: Option<&Value>) -> bool {
                     .is_some_and(Map::is_empty)
             })
     })
+}
+
+fn mcp_schema_has_pattern(schema: &Value) -> bool {
+    schema.get("pattern").is_some()
+        || schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_some_and(|properties| properties.values().any(mcp_schema_has_pattern))
+        || ["items", "oneOf", "anyOf", "allOf"]
+            .iter()
+            .filter_map(|key| schema.get(key))
+            .any(|nested| match nested {
+                Value::Array(values) => values.iter().any(mcp_schema_has_pattern),
+                _ => mcp_schema_has_pattern(nested),
+            })
 }
 
 fn mcp_persist_supported(meta: Option<&Map<String, Value>>, expected: &str) -> bool {
@@ -2964,9 +2980,13 @@ fn compact_skill_column(text: &str, max_width: usize) -> String {
     output
 }
 
-fn skill_picker_row(skill: &SkillBinding, name_width: usize) -> String {
+fn skill_picker_row(skill: &SkillBinding, name_width: usize, read_only: bool) -> String {
     let label = compact_skill_column(
-        &format!("[{}] {}", if skill.enabled { 'x' } else { ' ' }, skill.name),
+        &if read_only {
+            skill.name.clone()
+        } else {
+            format!("[{}] {}", if skill.enabled { 'x' } else { ' ' }, skill.name)
+        },
         name_width,
     );
     let padding = " ".repeat(name_width.saturating_sub(UnicodeWidthStr::width(label.as_str())));
@@ -2975,7 +2995,9 @@ fn skill_picker_row(skill: &SkillBinding, name_width: usize) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    if let Some(source) = skill.source.as_deref() {
+    if let Some(source) = skill.source.as_deref()
+        && !read_only
+    {
         if !description.is_empty() {
             description.push_str(" · ");
         }
@@ -3622,6 +3644,7 @@ pub struct QueuedPrompt {
     pub text: String,
     pub display: String,
     pub images: Vec<String>,
+    bindings: Vec<SelectedCompletionBinding>,
 }
 
 impl QueuedPrompt {
@@ -3637,6 +3660,7 @@ impl From<String> for QueuedPrompt {
             display: text.clone(),
             text,
             images: Vec::new(),
+            bindings: Vec::new(),
         }
     }
 }
@@ -3839,6 +3863,7 @@ pub struct AppState {
     queued_input_pending: bool,
     /// Images that came out of the queue with the prompt now starting.
     queued_images: Vec<String>,
+    queued_bindings: Vec<SelectedCompletionBinding>,
     /// (text, display) of the last prompt that started a turn. Kept so a
     /// safeguard-blocked turn can resend or restore it without the composer.
     blocked_prompt: Option<(String, String)>,
@@ -3876,6 +3901,7 @@ pub struct AppState {
     /// name it.
     untitled_thread: Option<String>,
     pub turn_id: Option<String>,
+    last_non_retry_error: Option<(String, String)>,
     claude_usage_limit_reset: Option<i64>,
     /// Set when the user interrupts after `turn/start` answers but before the
     /// app-server has announced that the turn is active.
@@ -3967,7 +3993,7 @@ pub struct AppState {
     cost_ledger: Option<CostLedger>,
     pending_turn_model: Option<String>,
     pending_turn_effort: Option<String>,
-    pending_provider_model: Option<String>,
+    pending_provider_model: Option<(ModelProvider, String)>,
     active_turn_model: Option<String>,
     active_turn_effort: Option<String>,
     cost_restore_due: bool,
@@ -4077,7 +4103,7 @@ pub struct AppState {
     /// 띄운 하위 에이전트의 기록을 전사 블록으로 바꾼 것. 바뀔 때마다 판이 오른다.
     subagent_view_blocks: Vec<Block>,
     subagent_view_revision: u64,
-    /// Codex 자식 스레드가 끝낸 항목. 그 하위 에이전트를 띄우면 이것으로 그린다.
+    /// Codex 자식 항목과 OpenCode 자식 기록. 하위 에이전트를 띄우면 이것으로 그린다.
     codex_subagent_items: HashMap<String, Vec<Value>>,
     /// 패널의 변경 섹션이 그리는 미커밋 diff. 파일 변경 블록과 같은 모양으로
     /// 만들어 두고 전사의 렌더를 그대로 쓴다.
@@ -4250,6 +4276,7 @@ impl AppState {
             pending_async_answer: None,
             queued_input_pending: false,
             queued_images: Vec::new(),
+            queued_bindings: Vec::new(),
             blocked_prompt: None,
             unsent_prompt: Vec::new(),
             unsent_provisional: false,
@@ -4263,6 +4290,7 @@ impl AppState {
             resume_id: String::new(),
             untitled_thread: None,
             turn_id: None,
+            last_non_retry_error: None,
             claude_usage_limit_reset: None,
             pending_interrupt: false,
             early_steers: Vec::new(),
@@ -4673,6 +4701,21 @@ impl AppState {
     }
 
     fn provider_model_index(&self, provider: ModelProvider, query: &str) -> Option<usize> {
+        if provider == ModelProvider::OpenCode {
+            return self
+                .provider_model_indices(provider)
+                .into_iter()
+                .find(|index| {
+                    let model = &self.models[*index];
+                    model.id.eq_ignore_ascii_case(query)
+                        || model.model.eq_ignore_ascii_case(query)
+                        || model
+                            .model
+                            .strip_prefix("opencode:")
+                            .is_some_and(|id| id.eq_ignore_ascii_case(query))
+                        || model.display_name.eq_ignore_ascii_case(query)
+                });
+        }
         let matches = self
             .provider_model_indices(provider)
             .into_iter()
@@ -4780,13 +4823,10 @@ impl AppState {
     /// Lands the session on the first opencode model after a provider connects,
     /// mirroring how the other runtimes switch on connect.
     pub fn activate_first_opencode_model(&mut self) {
-        if self.selected_provider() == ModelProvider::OpenCode {
-            return;
-        }
         if !self.opencode_loaded() {
             return;
         }
-        self.switch_provider(ModelProvider::OpenCode);
+        self.switch_to_open_code();
     }
 
     /// Whether the runtime on a `/provider` row may be dialled at all. Nothing is
@@ -5015,7 +5055,7 @@ impl AppState {
 
     pub fn switch_to_codex(&mut self) {
         self.switch_provider(ModelProvider::Codex);
-        if let Some(query) = self.pending_provider_model.take() {
+        if let Some((ModelProvider::Codex, query)) = self.pending_provider_model.take() {
             self.apply_provider_model(ModelProvider::Codex, &query);
         }
     }
@@ -5029,7 +5069,17 @@ impl AppState {
         // 제공자 선택 대기도 여기서 푼다.
         self.opencode_provider_connected = true;
         self.provider_choice_pending = false;
-        self.switch_provider(ModelProvider::OpenCode);
+        if let Some((ModelProvider::OpenCode, query)) = self.pending_provider_model.take() {
+            if self
+                .provider_model_index(ModelProvider::OpenCode, &query)
+                .is_some()
+            {
+                self.switch_provider(ModelProvider::OpenCode);
+            }
+            self.apply_provider_model(ModelProvider::OpenCode, &query);
+        } else {
+            self.switch_provider(ModelProvider::OpenCode);
+        }
     }
 
     pub fn fallback_from_codex(&mut self, message: impl Into<String>) -> bool {
@@ -5217,6 +5267,7 @@ impl AppState {
             text: command.to_owned(),
             display: command.to_owned(),
             images: Vec::new(),
+            bindings: Vec::new(),
         });
         Action::None
     }
@@ -5448,7 +5499,9 @@ impl AppState {
     }
 
     pub fn update_skills_for_provider(&mut self, provider: SkillProvider, response: &Value) {
-        if SkillProvider::from_model(self.selected_model_name()) == provider {
+        if self.selected_provider() != ModelProvider::OpenCode
+            && SkillProvider::from_model(self.selected_model_name()) == provider
+        {
             self.update_skills(response);
         }
     }
@@ -5475,7 +5528,9 @@ impl AppState {
                 skill.path == path
             }
         };
-        if SkillProvider::from_model(self.selected_model_name()) == provider {
+        if self.selected_provider() != ModelProvider::OpenCode
+            && SkillProvider::from_model(self.selected_model_name()) == provider
+        {
             for skill in &mut self.skills {
                 if matches(skill) {
                     skill.enabled = enabled;
@@ -5490,7 +5545,7 @@ impl AppState {
             notice,
             ..
         }) = self.pending.as_mut()
-            && *open_provider == provider
+            && *open_provider == Some(provider)
         {
             for skill in skills {
                 if matches(skill) {
@@ -5505,11 +5560,16 @@ impl AppState {
 
     pub fn open_skills_picker(
         &mut self,
-        provider: SkillProvider,
+        provider: impl Into<Option<SkillProvider>>,
         response: &Value,
         notice: Option<String>,
     ) {
-        self.update_skills_for_provider(provider, response);
+        let provider = provider.into();
+        if let Some(provider) = provider {
+            self.update_skills_for_provider(provider, response);
+        } else if self.selected_provider() == ModelProvider::OpenCode {
+            self.update_skills(response);
+        }
         let mut skills = parse_skill_bindings(response);
         skills.sort_by(|left, right| {
             left.name
@@ -5524,6 +5584,38 @@ impl AppState {
             errors: parse_skill_errors(response),
             notice,
         });
+    }
+
+    fn select_picker_skill(&mut self, skill: &SkillBinding) {
+        let before = self.composer_snapshot();
+        let old_text = self.editor.text();
+        let binding_count = self.selected_completion_bindings.len();
+        if self
+            .editor
+            .cursor()
+            .checked_sub(1)
+            .and_then(|index| self.editor.chars().get(index))
+            .is_some_and(|ch| !ch.is_whitespace())
+        {
+            self.editor.insert(' ');
+        }
+        let cursor = self.editor.cursor();
+        self.insert_completion(
+            &CompletionTarget {
+                sigil: '$',
+                range: cursor..cursor,
+                query: String::new(),
+            },
+            &CompletionCandidate::new(
+                CompletionKind::Skill,
+                &skill.name,
+                &skill.description,
+                format!("${}", skill.name),
+            )
+            .with_binding(&skill.name, &skill.path),
+        );
+        self.sync_selected_completion_bindings(&old_text, binding_count);
+        self.record_composer_edit(before);
     }
 
     pub fn update_plugins(&mut self, response: &Value) {
@@ -5641,7 +5733,11 @@ impl AppState {
         }
         let mut added_paths = Vec::new();
         let mut resolved_tokens = Vec::new();
-        let bindings = if queued { Vec::new() } else { std::mem::take(&mut self.selected_completion_bindings) };
+        let bindings = if queued {
+            std::mem::take(&mut self.queued_bindings)
+        } else {
+            std::mem::take(&mut self.selected_completion_bindings)
+        };
         for binding in bindings {
             if !binding.matches_text(&text_chars) || added_paths.contains(&binding.path) {
                 continue;
@@ -6679,6 +6775,7 @@ impl AppState {
     }
 
     fn reset_turn_item_tracking(&mut self) {
+        self.last_non_retry_error = None;
         self.unsent_prompt.clear();
         self.unsent_provisional = false;
         self.queued_input_pending = false;
@@ -6882,6 +6979,7 @@ impl AppState {
     pub fn enter_steers(&self) -> bool {
         let text = self.editor.text();
         self.busy
+            && self.selected_provider() != ModelProvider::OpenCode
             && !self.shell_mode
             && !(text.starts_with('/')
                 && !text.contains('\n')
@@ -7290,6 +7388,7 @@ impl AppState {
 
     pub fn provider_connection_failed(&mut self, message: impl Into<String>) {
         self.pending = None;
+        self.clear_pending_provider_model();
         self.push_notice(BlockKind::Error, "Provider connection failed", message.into());
     }
 
@@ -7769,6 +7868,8 @@ impl AppState {
                 "Run a shell command"
             } else if self.provider_switch_pending() {
                 "Enter: queue for switched provider · Alt+Enter: queue"
+            } else if self.busy && self.selected_provider() == ModelProvider::OpenCode {
+                "Enter: queue · Alt+Enter: queue"
             } else if self.busy {
                 "Enter: steer · Alt+Enter: queue"
             } else if self.stashed_prompt.is_some() {
@@ -9300,7 +9401,16 @@ impl AppState {
                     None => "form",
                     Some(value) => value.as_str().unwrap_or(""),
                 };
-                if !matches!(mode, "form" | "openai/form" | "openaiForm" | "url") {
+                let invalid_open_code_form = crate::open_code::is_open_code_request_id(&id)
+                    && (mode != "form"
+                        || !params.get("requestedSchema").is_some_and(|schema| {
+                            schema.get("type").and_then(Value::as_str) == Some("object")
+                                && schema.get("properties").is_some_and(Value::is_object)
+                                && !mcp_schema_has_pattern(schema)
+                        }));
+                if !matches!(mode, "form" | "openai/form" | "openaiForm" | "url")
+                    || invalid_open_code_form
+                {
                     let message = if mode == "openai/userVerification" {
                         tr(
                             "이 환경에서는 Codex 사용자 인증 요청을 처리할 수 없습니다. 인증이 필요한 작업을 계속하려면 사용자 인증을 지원하는 Codex 환경을 사용하세요.",
@@ -10156,6 +10266,20 @@ impl AppState {
                     .get("turn")
                     .and_then(|turn| turn.get("error"))
                     .filter(|error| !error.is_null());
+                let duplicate_error =
+                    self.last_non_retry_error
+                        .take()
+                        .is_some_and(|(turn_id, message)| {
+                            params
+                                .pointer("/turn/id")
+                                .and_then(Value::as_str)
+                                .or(self.turn_id.as_deref())
+                                == Some(turn_id.as_str())
+                                && turn_error
+                                    .and_then(|error| error.get("message"))
+                                    .and_then(Value::as_str)
+                                    == Some(message.as_str())
+                        });
                 let turn_status = params
                     .get("turn")
                     .and_then(|turn| turn.get("status"))
@@ -10186,7 +10310,7 @@ impl AppState {
                 if successful {
                     self.finish_active_turn_prompt(Instant::now());
                 }
-                if let Some(error) = turn_error {
+                if let Some(error) = turn_error.filter(|_| !duplicate_error) {
                     let message = error
                         .get("message")
                         .and_then(Value::as_str)
@@ -10343,7 +10467,32 @@ impl AppState {
                 self.commit_welcome_card();
             }
             "turn/subagent/history" => {
-                if self.viewing_subagent.is_some()
+                if crate::open_code::is_open_code_model(self.selected_model_name())
+                    && let (Some(id), Some(turns)) = (
+                        params.get("id").and_then(Value::as_str),
+                        params.get("turns").and_then(Value::as_array),
+                    )
+                {
+                    let items = turns
+                        .iter()
+                        .filter_map(|turn| turn.get("items").and_then(Value::as_array))
+                        .flatten()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !items.is_empty() {
+                        self.codex_subagent_items.insert(id.to_owned(), items);
+                        if let Some((row, _)) = self
+                            .finished_subagents
+                            .iter_mut()
+                            .find(|(row, _)| row.id == id)
+                        {
+                            row.viewable = !row.is_background_task;
+                        }
+                        if self.viewing_subagent.as_deref() == Some(id) {
+                            self.refresh_codex_subagent_view();
+                        }
+                    }
+                } else if self.viewing_subagent.is_some()
                     && params.get("id").and_then(Value::as_str) == self.viewing_subagent.as_deref()
                     && let Some(turns) = params.get("turns").and_then(Value::as_array)
                 {
@@ -10561,6 +10710,11 @@ impl AppState {
                     .unwrap_or(false);
                 if !retry {
                     self.resume_queue_after_interrupt = false;
+                    self.last_non_retry_error = params
+                        .get("turnId")
+                        .and_then(Value::as_str)
+                        .or(self.turn_id.as_deref())
+                        .map(|turn_id| (turn_id.to_owned(), message.to_owned()));
                 }
                 let provider = params
                     .get("provider")
@@ -10649,6 +10803,14 @@ impl AppState {
                     self.note_mcp_failure(name, Some(detail));
                 }
             }
+            "thread/compaction/failed" => {
+                self.end_compaction();
+                self.push_notice(
+                    BlockKind::Error,
+                    "Compaction failed",
+                    provider_error_text(&params["error"], false),
+                );
+            }
             "thread/compacted" => {
                 self.end_compaction();
                 let block = Block::new(
@@ -10713,8 +10875,14 @@ impl AppState {
     }
 
     pub fn start_queued_prompt(&mut self, prompt: QueuedPrompt) -> Action {
-        let QueuedPrompt { text, display, images } = prompt;
+        let QueuedPrompt {
+            text,
+            display,
+            images,
+            bindings,
+        } = prompt;
         self.queued_images = images;
+        self.queued_bindings = bindings;
         // 되돌아갈 수 있으니 이 프롬프트가 줄에서 왔다는 것을 먼저 세워 둔다.
         // 그래야 `requeue`가 컴포저 초안이 아니라 이 프롬프트의 첨부를 도로 담는다.
         self.queued_input_pending = true;
@@ -10724,6 +10892,7 @@ impl AppState {
             // 줄로 되돌아간 프롬프트는 이미지를 이미 도로 가져갔고, 슬래시 명령은
             // 애초에 첨부를 보내지 않는다.
             self.queued_images.clear();
+            self.queued_bindings.clear();
         }
         action
     }
@@ -10763,7 +10932,17 @@ impl AppState {
         } else {
             std::mem::take(&mut self.composer_images)
         };
-        let queued = QueuedPrompt { text, display, images };
+        let bindings = if self.queued_input_pending {
+            std::mem::take(&mut self.queued_bindings)
+        } else {
+            std::mem::take(&mut self.selected_completion_bindings)
+        };
+        let queued = QueuedPrompt {
+            text,
+            display,
+            images,
+            bindings,
+        };
         if self.is_handoff_prompt(&queued.text) {
             self.queued_prompts.push_front(queued);
         } else {
@@ -10792,7 +10971,13 @@ impl AppState {
         let images = std::mem::take(&mut self.composer_images);
         let display = submission_display(&self.editor.display_text(), images.len());
         let text = self.editor.take_for_submit().unwrap_or_default();
-        self.queued_prompts.push_back(QueuedPrompt { text, display, images });
+        let bindings = std::mem::take(&mut self.selected_completion_bindings);
+        self.queued_prompts.push_back(QueuedPrompt {
+            text,
+            display,
+            images,
+            bindings,
+        });
         Action::None
     }
 
@@ -10851,7 +11036,7 @@ impl AppState {
         }
         // A prompt sent mid-compaction would race the summary the runtime is
         // still writing, so it waits in the queue like one sent during a turn.
-        if self.compacting() {
+        if self.compacting() || (self.busy && self.selected_provider() == ModelProvider::OpenCode) {
             self.requeue(text, prompt.body);
             return Action::None;
         }
@@ -10935,30 +11120,16 @@ impl AppState {
                         "The OpenCode provider doesn't support plugin management.",
                     ),
                 )),
-                "/skills" => Some((
+                "/skills" if parts.len() > 1 => Some((
                     "Skills",
                     tr(
-                        "OpenCode provider는 스킬 관리를 지원하지 않습니다.",
-                        "The OpenCode provider doesn't support skill management.",
-                    ),
-                )),
-                "/login" => Some((
-                    "OpenCode login",
-                    tr(
-                        "터미널에서 `opencode auth login`을 실행한 뒤 /connect로 다시 연결하세요.",
-                        "Run `opencode auth login` in a terminal, then reconnect with /connect.",
+                        "OpenCode는 스킬 켜기·끄기를 지원하지 않습니다. /skills에서 목록을 보고 선택하세요.",
+                        "OpenCode doesn't support enabling or disabling skills. Use /skills to browse and select them.",
                     ),
                 )),
                 "/logout" => Some((
                     "OpenCode logout",
                     tr("터미널에서 `opencode auth logout`을 실행하세요.", "Run `opencode auth logout` in a terminal."),
-                )),
-                "/rename" => Some((
-                    "Rename",
-                    tr(
-                        "OpenCode provider는 세션 이름 변경을 지원하지 않습니다.",
-                        "The OpenCode provider doesn't support renaming sessions.",
-                    ),
                 )),
                 _ => None,
             };
@@ -10978,7 +11149,10 @@ impl AppState {
                 // cannot reach; `/help` lists the same set so the two agree.
                 let on_opencode = self.selected_provider() == ModelProvider::OpenCode;
                 let login_help = if on_opencode {
-                    Default::default()
+                    tr(
+                        "/login  OpenCode provider 연결·로그인\n",
+                        "/login  Connect or sign in to an OpenCode provider\n",
+                    )
                 } else if using_claude {
                     tr(
                         "/login  Claude 로그인\n/logout  Claude 로그아웃 방법\n",
@@ -10991,7 +11165,10 @@ impl AppState {
                     )
                 };
                 let integration_help = if on_opencode {
-                    Default::default()
+                    tr(
+                        "/skills  Skill 목록 보기·선택\n",
+                        "/skills  Browse and select skills\n",
+                    )
                 } else {
                     tr(
                         "/mcp [reconnect [NAME]|login NAME]  MCP 서버 탐색과 관리\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n",
@@ -11003,11 +11180,10 @@ impl AppState {
                 } else {
                     tr("/fast  Fast 서비스 티어 전환\n", "/fast  Toggle the Fast service tier\n")
                 };
-                let rename_help = if on_opencode {
-                    ""
-                } else {
-                    tr("/rename NAME  세션 이름 바꾸기\n", "/rename NAME  Rename the session\n")
-                };
+                let rename_help = tr(
+                    "/rename NAME  세션 이름 바꾸기\n",
+                    "/rename NAME  Rename the session\n",
+                );
                 let effort_help = if self
                     .selected_model()
                     .is_some_and(|model| !model.efforts.is_empty())
@@ -11020,8 +11196,8 @@ impl AppState {
                     BlockKind::System,
                     "Commands",
                     tr(
-                        format!("/provider [claude|codex|opencode]  provider 선택\n/provider [claude|codex] MODEL  provider와 모델 선택\nOpenCode는 /provider opencode로 전환한 뒤 /model로 모델 선택\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}/auto-knowledge [on|off]  지식 자동 기록 켜기·끄기\n{effort_help}/Response [All|Completed]  응답 압축 방식\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/vibemode  응답·Shell·Diff 표시 한 번에 설정\n/theme [minimal|soft|dark|gray|softpink|midnight]  화면 테마\n/language [korean|english]  화면 언어\n/agent [builder|planner|goal-runner|reviewer|researcher]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 열기·닫기\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/worktree [NAME]  git 작업 트리에서 대화 이어 가기\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n{rename_help}/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n/exit  /quit 별칭\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+Z / Ctrl+Y  입력 실행 취소·다시 실행\nCtrl+S  입력 초안 보관·되돌리기\nCtrl+R  프롬프트 이력 검색\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 열기·닫기(폭은 패널 머리글의 [◀][▶])\nShift+Tab  Claude 권한 모드 전환"),
-                        format!("/provider [claude|codex|opencode]  Select a provider\n/provider [claude|codex] MODEL  Select a provider and model\nFor OpenCode, switch with /provider opencode, then select a model with /model\n/model [MODEL] [EFFORT]  Select the current provider's model and effort\n{provider_help}{fast_help}/auto-knowledge [on|off]  Turn automatic knowledge recording on or off\n{effort_help}/Response [All|Completed]  Response compression\n/shell [hide|collapse|expand]  Shell display\n/diff [hide|collapse|expand]  Diff display\n/vibemode  Set response, shell, and diff display at once\n/theme [minimal|soft|dark|gray|softpink|midnight]  Screen theme\n/language [korean|english]  Screen language\n/agent [builder|planner|goal-runner|reviewer|researcher]  Choose the agent role\n/statusline  Status line items\n/side-panel  Open or close the right side panel\n{integration_help}/btw [MESSAGE]  Ephemeral side conversation\n/compact  Compact the context\n/copy  Copy the last response\n/worktree [NAME]  Continue the conversation in a git worktree\n/resume [SESSION]  Pick an earlier session\n/continue  Alias for /resume\n{rename_help}/new  New conversation\n/clear  Alias for /new\n{login_help}/status  Current settings\n/usage  Usage limits\n/quit  Quit\n/exit  Alias for /quit\n\n$  Search plugins, skills, and apps\n@  Search plugins, skills, files, and folders\nEsc or Ctrl+C  Stop the run\nCtrl+Enter / Shift+Enter  New line\nTab  Switch the agent role\nAlt+Enter  Queue a prompt while a response runs\nCtrl+Z / Ctrl+Y  Undo or redo input\nCtrl+S  Stash or restore the input draft\nCtrl+R  Search prompt history\nShift+Space or Alt+W  Collapse or expand task steps\nAlt+P  Open or close the right side panel (resize with [◀][▶] in the panel header)\nShift+Tab  Switch the Claude permission mode"),
+                        format!("/provider [claude|codex|opencode]  provider 선택\n/provider [claude|codex|opencode] MODEL  provider와 모델 선택\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}/auto-knowledge [on|off]  지식 자동 기록 켜기·끄기\n{effort_help}/Response [All|Completed]  응답 압축 방식\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/vibemode  응답·Shell·Diff 표시 한 번에 설정\n/theme [minimal|soft|dark|gray|softpink|midnight]  화면 테마\n/language [korean|english]  화면 언어\n/agent [builder|planner|goal-runner|reviewer|researcher]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 열기·닫기\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/worktree [NAME]  git 작업 트리에서 대화 이어 가기\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n{rename_help}/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n/exit  /quit 별칭\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+Z / Ctrl+Y  입력 실행 취소·다시 실행\nCtrl+S  입력 초안 보관·되돌리기\nCtrl+R  프롬프트 이력 검색\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 열기·닫기(폭은 패널 머리글의 [◀][▶])\nShift+Tab  Claude 권한 모드 전환"),
+                        format!("/provider [claude|codex|opencode]  Select a provider\n/provider [claude|codex|opencode] MODEL  Select a provider and model\n/model [MODEL] [EFFORT]  Select the current provider's model and effort\n{provider_help}{fast_help}/auto-knowledge [on|off]  Turn automatic knowledge recording on or off\n{effort_help}/Response [All|Completed]  Response compression\n/shell [hide|collapse|expand]  Shell display\n/diff [hide|collapse|expand]  Diff display\n/vibemode  Set response, shell, and diff display at once\n/theme [minimal|soft|dark|gray|softpink|midnight]  Screen theme\n/language [korean|english]  Screen language\n/agent [builder|planner|goal-runner|reviewer|researcher]  Choose the agent role\n/statusline  Status line items\n/side-panel  Open or close the right side panel\n{integration_help}/btw [MESSAGE]  Ephemeral side conversation\n/compact  Compact the context\n/copy  Copy the last response\n/worktree [NAME]  Continue the conversation in a git worktree\n/resume [SESSION]  Pick an earlier session\n/continue  Alias for /resume\n{rename_help}/new  New conversation\n/clear  Alias for /new\n{login_help}/status  Current settings\n/usage  Usage limits\n/quit  Quit\n/exit  Alias for /quit\n\n$  Search plugins, skills, and apps\n@  Search plugins, skills, files, and folders\nEsc or Ctrl+C  Stop the run\nCtrl+Enter / Shift+Enter  New line\nTab  Switch the agent role\nAlt+Enter  Queue a prompt while a response runs\nCtrl+Z / Ctrl+Y  Undo or redo input\nCtrl+S  Stash or restore the input draft\nCtrl+R  Search prompt history\nShift+Space or Alt+W  Collapse or expand task steps\nAlt+P  Open or close the right side panel (resize with [◀][▶] in the panel header)\nShift+Tab  Switch the Claude permission mode"),
                     ),
                 ));
                 Action::None
@@ -11039,8 +11215,8 @@ impl AppState {
                         BlockKind::Error,
                         "Usage",
                         tr(
-                            "/provider [claude|codex|opencode]\n/provider [claude|codex] MODEL\nOpenCode: /provider opencode로 전환한 뒤 /model",
-                            "/provider [claude|codex|opencode]\n/provider [claude|codex] MODEL\nOpenCode: /provider opencode, then /model.",
+                            "/provider [claude|codex|opencode]\n/provider [claude|codex|opencode] MODEL",
+                            "/provider [claude|codex|opencode]\n/provider [claude|codex|opencode] MODEL",
                         ),
                     ));
                     Action::None
@@ -11071,16 +11247,34 @@ impl AppState {
                         Action::None
                     }
                     "codex" => {
-                        self.pending_provider_model = Some(query.to_owned());
+                        self.pending_provider_model =
+                            Some((ModelProvider::Codex, query.to_owned()));
                         self.apply_runtime_choice(1)
+                    }
+                    "opencode" if crate::open_code::PROVIDER_ENABLED => {
+                        if self.opencode_loaded() {
+                            let Some(index) =
+                                self.provider_model_index(ModelProvider::OpenCode, query)
+                            else {
+                                self.apply_provider_model(ModelProvider::OpenCode, query);
+                                return Action::None;
+                            };
+                            let action = self.apply_runtime_choice(2);
+                            self.apply_model(index, None);
+                            action
+                        } else {
+                            self.pending_provider_model =
+                                Some((ModelProvider::OpenCode, query.to_owned()));
+                            self.apply_runtime_choice(2)
+                        }
                     }
                     _ => {
                         self.committed.push(Block::new(
                             BlockKind::Error,
                             "Usage",
                             tr(
-                                "/provider [claude|codex|opencode]\n/provider [claude|codex] MODEL\nOpenCode: /provider opencode로 전환한 뒤 /model",
-                                "/provider [claude|codex|opencode]\n/provider [claude|codex] MODEL\nOpenCode: /provider opencode, then /model.",
+                                "/provider [claude|codex|opencode]\n/provider [claude|codex|opencode] MODEL",
+                                "/provider [claude|codex|opencode]\n/provider [claude|codex|opencode] MODEL",
                             ),
                         ));
                         Action::None
@@ -11092,8 +11286,8 @@ impl AppState {
                     BlockKind::Error,
                     "Usage",
                     tr(
-                        "/provider [claude|codex|opencode]\n/provider [claude|codex] MODEL\nOpenCode: /provider opencode로 전환한 뒤 /model",
-                        "/provider [claude|codex|opencode]\n/provider [claude|codex] MODEL\nOpenCode: /provider opencode, then /model.",
+                        "/provider [claude|codex|opencode]\n/provider [claude|codex|opencode] MODEL",
+                        "/provider [claude|codex|opencode]\n/provider [claude|codex|opencode] MODEL",
                     ),
                 ));
                 Action::None
@@ -11331,6 +11525,9 @@ impl AppState {
                 self.committed
                     .push(Block::new(BlockKind::Error, "Usage", "/connect"));
                 Action::None
+            }
+            "/login" if self.selected_provider() == ModelProvider::OpenCode => {
+                Action::ConnectProvider
             }
             "/login" if using_claude => Action::StartLogin(LoginMethod::Claude),
             "/login" => {
@@ -12319,10 +12516,12 @@ impl AppState {
                 match key.code {
                     KeyCode::Esc => return Action::None,
                     KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                        return Action::OpenSkills {
-                            provider: provider.other(),
-                            notice: None,
-                        };
+                        if let Some(provider) = provider {
+                            return Action::OpenSkills {
+                                provider: provider.other(),
+                                notice: None,
+                            };
+                        }
                     }
                     KeyCode::Up | KeyCode::Char('k') if !ctrl && !alt => {
                         selected = selected.saturating_sub(1);
@@ -12338,6 +12537,10 @@ impl AppState {
                     }
                     KeyCode::Char(' ') | KeyCode::Enter => {
                         if let Some(skill) = skills.get(selected).cloned() {
+                            let Some(managed_provider) = provider else {
+                                self.select_picker_skill(&skill);
+                                return Action::None;
+                            };
                             let enabled = !skill.enabled;
                             self.pending = Some(PendingInteraction::SkillsPicker {
                                 provider,
@@ -12347,14 +12550,14 @@ impl AppState {
                                 notice,
                             });
                             self.apply_skill_enabled(
-                                provider,
+                                managed_provider,
                                 &skill.path,
                                 skill.source.as_deref(),
                                 enabled,
                                 Some(format!("{} · Saving", skill.name)),
                             );
                             return Action::SetSkillEnabled {
-                                provider,
+                                provider: managed_provider,
                                 name: skill.name,
                                 path: skill.path,
                                 source: skill.source,
@@ -12498,7 +12701,10 @@ impl AppState {
                     self.pending = Some(PendingInteraction::ProviderPicker(picker));
                     Action::None
                 }
-                ProviderPickerResult::Cancel => Action::None,
+                ProviderPickerResult::Cancel => {
+                    self.clear_pending_provider_model();
+                    Action::None
+                }
                 ProviderPickerResult::Submit(request) => Action::SubmitProviderAuth(request),
             },
             PendingInteraction::ProviderOAuthCode {
@@ -12546,7 +12752,10 @@ impl AppState {
                         }
                     }
                 }
-                KeyCode::Esc => Action::None,
+                KeyCode::Esc => {
+                    self.clear_pending_provider_model();
+                    Action::None
+                }
                 KeyCode::Backspace if ctrl => {
                     editor.delete_word_left();
                     self.pending = Some(PendingInteraction::ProviderOAuthCode {
@@ -13468,7 +13677,7 @@ impl AppState {
                     .iter()
                     .enumerate()
                     .map(|(offset, skill)| OverlayLine {
-                        text: skill_picker_row(skill, SKILL_NAME_MAX_COLUMNS),
+                        text: skill_picker_row(skill, SKILL_NAME_MAX_COLUMNS, provider.is_none()),
                         selected: window.start + offset == *selected,
                         muted: false,
                     })
@@ -13488,14 +13697,16 @@ impl AppState {
                     selected: false,
                     muted: true,
                 });
-                let hint = if let Some(notice) = notice.as_deref() {
+                let hint = if provider.is_none() {
+                    "OpenCode · Read only  ·  Move ↑↓  ·  Select Space/Enter  ·  Close Esc".to_owned()
+                } else if let Some(notice) = notice.as_deref() {
                     format!("Status · {notice}  ·  Move ↑↓  ·  Toggle Space/Enter  ·  Close Esc")
                 } else if !errors.is_empty() {
                     format!("{} errors  ·  Move ↑↓  ·  Toggle Space/Enter  ·  Close Esc", errors.len())
                 } else {
                     format!(
                         "Provider {} ←→  ·  Move ↑↓  ·  Toggle Space/Enter  ·  Close Esc",
-                        if *provider == SkillProvider::Claude {
+                        if *provider == Some(SkillProvider::Claude) {
                             "Claude"
                         } else {
                             "Codex"
@@ -15296,6 +15507,13 @@ impl AppState {
 
     /// 하위 에이전트 줄이나 `main` 줄을 눌렀을 때 그쪽을 본문에 띄운다.
     pub fn view_subagent(&mut self, id: Option<String>) -> Action {
+        if crate::open_code::is_open_code_model(self.selected_model_name())
+            && id
+                .as_ref()
+                .is_some_and(|id| self.codex_subagent_items.get(id).is_none_or(Vec::is_empty))
+        {
+            return Action::None;
+        }
         if self.viewing_subagent == id {
             return Action::None;
         }
@@ -15325,9 +15543,12 @@ impl AppState {
             elapsed: running.started_at.elapsed(),
             depth: running.depth,
             selected: self.viewing_subagent.as_deref() == Some(running.id.as_str()),
-            // OpenCode 하위 에이전트는 띄울 기록을 받지 못한다.
             viewable: !running.is_background_task
-                && !crate::open_code::is_open_code_model(self.selected_model_name()),
+                && (!crate::open_code::is_open_code_model(self.selected_model_name())
+                    || self
+                        .codex_subagent_items
+                        .get(&running.id)
+                        .is_some_and(|items| !items.is_empty())),
             finished: false,
             workflow: running.workflow.clone(),
         }
@@ -15866,6 +16087,10 @@ impl AppState {
                     .cloned();
                 match skill {
                     Some(skill) => {
+                        let Some(managed_provider) = provider else {
+                            self.select_picker_skill(&skill);
+                            return Action::None;
+                        };
                         let enabled = !skill.enabled;
                         self.pending = Some(PendingInteraction::SkillsPicker {
                             provider,
@@ -15875,14 +16100,14 @@ impl AppState {
                             notice,
                         });
                         self.apply_skill_enabled(
-                            provider,
+                            managed_provider,
                             &skill.path,
                             skill.source.as_deref(),
                             enabled,
                             Some(format!("{} · Saving", skill.name)),
                         );
                         Action::SetSkillEnabled {
-                            provider,
+                            provider: managed_provider,
                             name: skill.name,
                             path: skill.path,
                             source: skill.source,
@@ -16196,7 +16421,10 @@ impl AppState {
                         self.pending = Some(PendingInteraction::ProviderPicker(picker));
                         Action::None
                     }
-                    ProviderPickerResult::Cancel => Action::None,
+                    ProviderPickerResult::Cancel => {
+                        self.clear_pending_provider_model();
+                        Action::None
+                    }
                     ProviderPickerResult::Submit(request) => Action::SubmitProviderAuth(request),
                 }
             }
@@ -21703,6 +21931,79 @@ mod tests {
     }
 
     #[test]
+    fn opencode_followups_wait_for_the_running_turn_and_keep_images() {
+        let mut state = opencode_picker_state();
+        state.editor.set_text("첫 요청");
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::Submit(_)
+        ));
+        state.set_turn_started("turn-1".to_owned());
+        state.attach_local_image(r"C:\followup.png".to_owned());
+        state.editor.set_text("추가 요청");
+        assert!(!state.enter_steers());
+        assert_eq!(
+            state.view().composer_placeholder,
+            "Enter: queue · Alt+Enter: queue"
+        );
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(state.take_queued_prompt().is_none());
+        state.handle_notification("turn/completed", &json!({ "threadId": state.thread_id }));
+        let queued = state
+            .take_queued_prompt()
+            .expect("기존 턴이 끝나면 추가 입력을 꺼낸다");
+        assert_eq!(queued.text, "추가 요청");
+        assert_eq!(queued.images, [r"C:\followup.png"]);
+        assert!(
+            matches!(state.start_queued_prompt(queued), Action::Submit(text) if text == "추가 요청")
+        );
+        assert_eq!(
+            state.turn_input("추가 요청".to_owned())[1]["path"],
+            r"C:\followup.png"
+        );
+    }
+
+    #[test]
+    fn queued_opencode_skill_selection_keeps_its_path_separate_from_the_draft() {
+        let response = json!({"data": [{"skills": [
+            {"name": "review", "path": "C:/project/SKILL.md", "description": "Project review"},
+            {"name": "review", "path": "C:/user/SKILL.md", "description": "User review"}
+        ]}]});
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::ALT] {
+            let mut state = opencode_picker_state();
+            state.editor.set_text("첫 요청");
+            state.handle_key(KeyEvent::from(KeyCode::Enter));
+            state.turn_input("첫 요청".to_owned());
+            state.set_turn_started("turn-1".to_owned());
+            state.open_skills_picker(None, &response, None);
+            state.handle_key(KeyEvent::from(KeyCode::Down));
+            state.handle_key(KeyEvent::from(KeyCode::Enter));
+            let text = state.editor.text();
+            state.handle_key(KeyEvent::new(KeyCode::Enter, modifiers));
+            assert!(state.selected_completion_bindings.is_empty());
+            state.editor.set_text("별도 초안");
+            state.open_skills_picker(None, &response, None);
+            state.handle_key(KeyEvent::from(KeyCode::Enter));
+            state.handle_notification("turn/completed", &json!({ "threadId": state.thread_id }));
+            let queued = state.take_queued_prompt().unwrap();
+            assert!(matches!(
+                state.start_queued_prompt(queued),
+                Action::Submit(_)
+            ));
+            let input = state.turn_input(text);
+            assert_eq!(input[1]["path"], "C:/user/SKILL.md");
+            assert_eq!(
+                state.selected_completion_bindings[0].path,
+                "C:/project/SKILL.md"
+            );
+            assert_eq!(state.editor.text(), "별도 초안 $review ");
+        }
+    }
+
+    #[test]
     fn a_steer_refused_before_turn_started_does_not_bring_back_the_running_prompt() {
         let mut state = test_state();
         state.handle_paste("A");
@@ -23994,6 +24295,60 @@ mod tests {
         let view = state.view();
         let blocks = view.subagent_view.expect("the child is in the body").blocks;
         assert!(blocks.iter().any(|block| block.body.contains("child says hi")));
+    }
+
+    #[test]
+    fn an_opencode_subagent_is_viewable_only_after_its_history_arrives() {
+        let mut state = opencode_picker_state();
+        state.handle_notification("turn/subagents/updated", &json!({
+            "subagents": [{ "id": "call_1", "name": "explore", "description": "조사", "tool": "Task" }]
+        }));
+        assert!(!state.view().subagents[0].viewable);
+        state.view_subagent(Some("call_1".to_owned()));
+        assert!(state.view().subagent_view.is_none());
+        state.handle_notification(
+            "turn/subagent/history",
+            &json!({
+                "id": "call_1", "turns": [{ "items": [] }]
+            }),
+        );
+        assert!(!state.view().subagents[0].viewable);
+        state.handle_notification("turn/subagent/history", &json!({
+            "id": "call_1", "turns": [{ "items": [
+                { "type": "agentMessage", "id": "m1", "text": "자식 조사 결과" },
+                { "type": "commandExecution", "id": "t1", "command": "cargo check", "aggregatedOutput": "검사 통과", "status": "completed" }
+            ] }]
+        }));
+        assert!(state.view().subagents[0].viewable);
+        state.view_subagent(Some("call_1".to_owned()));
+        let view = state.view();
+        let blocks = view.subagent_view.as_ref().unwrap().blocks;
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.body.contains("자식 조사 결과"))
+        );
+        assert!(blocks.iter().any(|block| {
+            block.body.contains("검사 통과")
+                || block
+                    .children()
+                    .iter()
+                    .any(|child| child.body.contains("검사 통과"))
+        }));
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
+        assert!(state.view().subagents[0].viewable);
+        state.view_subagent(None);
+        state.view_subagent(Some("call_1".to_owned()));
+        assert!(
+            state
+                .view()
+                .subagent_view
+                .as_ref()
+                .unwrap()
+                .blocks
+                .iter()
+                .any(|block| block.body.contains("자식 조사 결과"))
+        );
     }
 
     /// 순정처럼 백그라운드 명령은 상태 줄의 작업 수로 세고, 그 수를 누르면 명령 목록이,
@@ -26330,6 +26685,108 @@ mod tests {
     }
 
     #[test]
+    fn opencode_ui_skills_picker_selects_the_exact_skill_without_writing() {
+        let response = json!({"data": [{"skills": [
+            {"name": "review", "path": "C:/skills/project/SKILL.md", "description": "Project review"},
+            {"name": "review", "path": "C:/skills/user/SKILL.md", "description": "User review"}
+        ]}]});
+        let mut state = opencode_picker_state();
+        state.editor.set_text("check");
+        state.open_skills_picker(None, &response, None);
+        let overlay = state.overlay_view().unwrap();
+        assert!(overlay.hint.contains("Read only"));
+        assert!(!overlay.hint.contains("Toggle"));
+        assert!(!overlay.lines[0].text.starts_with("[x]"));
+        for key in [KeyCode::Left, KeyCode::Right, KeyCode::Tab] {
+            assert!(matches!(
+                state.handle_key(KeyEvent::from(key)),
+                Action::None
+            ));
+            assert!(matches!(
+                state.pending,
+                Some(PendingInteraction::SkillsPicker { provider: None, .. })
+            ));
+        }
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(state.pending.is_none());
+        assert_eq!(state.editor.text(), "check $review ");
+        let input = state.turn_input(state.editor.text());
+        assert_eq!(input[1]["path"], "C:/skills/user/SKILL.md");
+
+        state.editor.set_text("");
+        state.open_skills_picker(None, &response, None);
+        assert!(matches!(state.click_overlay_row(0), Action::None));
+        assert!(state.pending.is_none());
+        assert_eq!(state.editor.text(), "$review ");
+        assert_eq!(
+            state.turn_input(state.editor.text())[1]["path"],
+            "C:/skills/project/SKILL.md"
+        );
+    }
+
+    #[test]
+    fn opencode_ui_skill_toggles_and_late_claude_refreshes_do_not_cross_providers() {
+        let response = json!({"data": [{"skills": [
+            {"name": "review", "path": "C:/skills/review/SKILL.md", "enabled": true}
+        ]}]});
+        let mut state = opencode_picker_state();
+        state.update_skills(&response);
+        for command in ["/skills enable review", "/skills disable review"] {
+            assert!(matches!(state.run_slash_command(command), Action::None));
+            assert!(
+                state
+                    .committed
+                    .last()
+                    .unwrap()
+                    .body
+                    .contains("켜기·끄기를 지원하지 않습니다")
+            );
+        }
+        assert!(!state.apply_skill_enabled(
+            SkillProvider::Claude,
+            "C:/skills/review/SKILL.md",
+            None,
+            false,
+            None
+        ));
+        state.update_skills_for_provider(SkillProvider::Claude, &json!({"data": []}));
+        assert_eq!(state.skills.len(), 1);
+        assert!(state.skills[0].enabled);
+    }
+
+    #[test]
+    fn opencode_ui_commands_expose_login_skills_and_rename() {
+        let mut state = opencode_picker_state();
+        assert!(matches!(
+            state.run_slash_command("/login"),
+            Action::ConnectProvider
+        ));
+        assert!(matches!(
+            state.run_slash_command("/skills"),
+            Action::ShowSkills
+        ));
+        assert!(
+            matches!(state.run_slash_command("/rename 새 이름"), Action::RenameThread(name) if name == "새 이름")
+        );
+        state.run_slash_command("/help");
+        let help = &state.committed.last().unwrap().body;
+        for command in [
+            "/login",
+            "/skills",
+            "/rename NAME",
+            "/provider [claude|codex|opencode] MODEL",
+        ] {
+            assert!(help.contains(command), "{command}");
+        }
+        assert!(!help.contains("/skills [enable|disable"));
+        assert!(!help.contains("/plugins "));
+    }
+
+    #[test]
     fn modified_enter_keys_insert_newlines_without_submitting() {
         for modifiers in [KeyModifiers::CONTROL, KeyModifiers::SHIFT] {
             let mut state = test_state();
@@ -26788,6 +27245,253 @@ mod tests {
         );
     }
 
+    #[test]
+    fn provider_turn_errors_deduplicate_the_same_turn_and_message() {
+        for claude in [false, true] {
+            for (explicit_turn_id, explicit_completion_id) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let mut state = if claude {
+                    claude_test_state()
+                } else {
+                    test_state()
+                };
+                state.set_turn_started("turn".to_owned());
+                state.resume_queue_after_interrupt = true;
+                let mut notification = json!({
+                    "provider": if claude { "Claude" } else { "Codex" },
+                    "willRetry": false,
+                    "error": { "message": "Overloaded" }
+                });
+                if explicit_turn_id {
+                    notification["turnId"] = json!("turn");
+                }
+                state.handle_notification("error", &notification);
+                let mut displayed = state.drain_committed();
+                let mut completion = json!({ "turn": {
+                    "status": "failed", "error": { "message": "Overloaded" }
+                } });
+                if explicit_completion_id {
+                    completion["turn"]["id"] = json!("turn");
+                }
+                state.handle_notification("turn/completed", &completion);
+                displayed.extend(state.drain_committed());
+
+                let errors = displayed
+                    .iter()
+                    .filter(|block| matches!(block.kind, BlockKind::Error))
+                    .map(|block| block.body.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    errors,
+                    ["Overloaded"],
+                    "claude={claude}, explicit_turn_id={explicit_turn_id}, explicit_completion_id={explicit_completion_id}"
+                );
+                assert!(!state.busy);
+                assert!(state.turn_id.is_none());
+                assert!(!state.resume_queue_after_interrupt);
+            }
+        }
+    }
+
+    #[test]
+    fn provider_turn_errors_keep_distinct_failures_and_retry_warnings() {
+        for claude in [false, true] {
+            for (error_turn, final_message, retry, expected_errors) in [
+                ("other-turn", "Overloaded", false, 2),
+                ("turn", "Different failure", false, 2),
+                ("turn", "Overloaded", true, 1),
+            ] {
+                let mut state = if claude {
+                    claude_test_state()
+                } else {
+                    test_state()
+                };
+                state.set_turn_started("turn".to_owned());
+                state.handle_notification(
+                    "error",
+                    &json!({
+                        "provider": if claude { "Claude" } else { "Codex" },
+                        "turnId": error_turn, "willRetry": retry,
+                        "error": { "message": "Overloaded" }
+                    }),
+                );
+                state.handle_notification(
+                    "turn/completed",
+                    &json!({ "turn": {
+                    "id": "turn", "status": "failed", "error": { "message": final_message }
+                } }),
+                );
+
+                assert_eq!(
+                    state
+                        .committed
+                        .iter()
+                        .filter(|block| matches!(block.kind, BlockKind::Error))
+                        .count(),
+                    expected_errors
+                );
+                assert_eq!(
+                    state
+                        .committed
+                        .iter()
+                        .filter(|block| block.title == "Retrying")
+                        .count(),
+                    usize::from(retry)
+                );
+                assert_eq!(
+                    state.committed.last().unwrap().title,
+                    "Response generation failed"
+                );
+                assert_eq!(state.committed.last().unwrap().body, final_message);
+            }
+        }
+    }
+
+    #[test]
+    fn provider_turn_errors_keep_completion_only_and_later_turn_failures() {
+        for claude in [false, true] {
+            let mut state = if claude {
+                claude_test_state()
+            } else {
+                test_state()
+            };
+            state.set_turn_started("first".to_owned());
+            state.handle_notification(
+                "error",
+                &json!({
+                    "provider": if claude { "Claude" } else { "Codex" },
+                    "willRetry": false, "error": { "message": "Overloaded" }
+                }),
+            );
+            state.handle_notification(
+                "turn/completed",
+                &json!({ "turn": {
+                "id": "first", "status": "completed"
+            } }),
+            );
+            state.set_turn_started("second".to_owned());
+            state.handle_notification(
+                "turn/completed",
+                &json!({ "turn": {
+                "id": "second", "status": "failed", "error": { "message": "Overloaded" }
+            } }),
+            );
+
+            assert_eq!(
+                state
+                    .committed
+                    .iter()
+                    .filter(|block| matches!(block.kind, BlockKind::Error))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                state.committed.last().unwrap().title,
+                "Response generation failed"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_turn_errors_without_a_known_turn_are_not_deduplicated() {
+        for claude in [false, true] {
+            let mut state = if claude {
+                claude_test_state()
+            } else {
+                test_state()
+            };
+            state.handle_notification(
+                "error",
+                &json!({
+                    "provider": if claude { "Claude" } else { "Codex" },
+                    "willRetry": false, "error": { "message": "Overloaded" }
+                }),
+            );
+            state.handle_notification(
+                "turn/completed",
+                &json!({ "turn": {
+                "status": "failed", "error": { "message": "Overloaded" }
+            } }),
+            );
+
+            assert_eq!(
+                state
+                    .committed
+                    .iter()
+                    .filter(|block| matches!(block.kind, BlockKind::Error))
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn provider_turn_errors_ignore_foreign_events_and_reset_between_threads() {
+        for claude in [false, true] {
+            let mut state = if claude { claude_test_state() } else { test_state() };
+            let error = json!({ "message": "Overloaded" });
+            state.set_turn_started("turn".to_owned());
+            state.handle_notification("error", &json!({
+                "threadId": "thread", "provider": if claude { "Claude" } else { "Codex" },
+                "willRetry": false, "error": error
+            }));
+            state.handle_notification("error", &json!({
+                "threadId": "other-thread", "turnId": "turn", "willRetry": false,
+                "error": { "message": "Other failure" }
+            }));
+            for (thread, turn) in [("other-thread", "turn"), ("thread", "other-turn")] {
+                state.handle_notification("turn/completed", &json!({
+                    "threadId": thread, "turn": { "id": turn, "status": "failed", "error": error }
+                }));
+                assert!(state.busy);
+                assert_eq!(state.turn_id.as_deref(), Some("turn"));
+            }
+            state.handle_notification("turn/started", &json!({ "turn": { "id": "turn" } }));
+            state.handle_notification("turn/completed", &json!({ "turn": {
+                "id": "turn", "status": "failed", "error": error
+            } }));
+            assert_eq!(state.committed.iter()
+                .filter(|block| matches!(block.kind, BlockKind::Error)).count(), 1);
+
+            // 새 대화에서는 같은 턴 ID와 문구도 별도의 오류다.
+            state.set_turn_started("turn".to_owned());
+            state.handle_notification("error", &json!({
+                "willRetry": false, "error": error
+            }));
+            let model = state.selected_model_name().to_owned();
+            state.set_thread("other-thread".to_owned(), state.cwd.clone(), &model, Some("high"));
+            state.set_turn_started("turn".to_owned());
+            state.handle_notification("turn/completed", &json!({ "turn": {
+                "id": "turn", "status": "failed", "error": error
+            } }));
+            assert_eq!(state.committed.iter()
+                .filter(|block| matches!(block.kind, BlockKind::Error)).count(), 3);
+        }
+    }
+
+    #[test]
+    fn claude_turn_error_dedup_preserves_the_safeguard_choice() {
+        let mut state = claude_test_state();
+        let _ = state.submit_text("차단될 프롬프트".to_owned(), "차단될 프롬프트".to_owned());
+        state.set_turn_started("turn".to_owned());
+        let message = "…safeguards flagged this message…";
+        state.handle_notification("error", &json!({
+            "provider": "Claude", "willRetry": false, "error": { "message": message }
+        }));
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        assert!(matches!(state.pending, Some(PendingInteraction::SafeguardBlock { selected: 1, .. })));
+
+        state.handle_notification("turn/completed", &json!({ "turn": {
+            "id": "turn", "status": "failed", "error": { "message": message }
+        } }));
+
+        assert!(matches!(state.pending, Some(PendingInteraction::SafeguardBlock { selected: 1, .. })));
+        assert_eq!(state.committed.iter()
+            .filter(|block| matches!(block.kind, BlockKind::Error)).count(), 1);
+        assert!(!state.busy);
+    }
+
     fn safeguard_turn_completed(message: &str) -> Value {
         json!({ "turn": { "status": "failed", "error": { "message": message } } })
     }
@@ -27030,15 +27734,18 @@ mod tests {
         let effort = state.selected_effort.clone();
         for command in [
             "/provider invalid",
-            "/provider opencode missing-model",
+            "/provider opencode extra argument",
             "/provider codex extra argument",
         ] {
             state.run_slash_command(command);
             let error = state.committed.last().unwrap();
             assert!(matches!(error.kind, BlockKind::Error));
             assert_eq!(error.title, "Usage");
-            assert!(error.body.contains("/provider [claude|codex] MODEL"));
-            assert!(error.body.contains("OpenCode: /provider opencode로 전환한 뒤 /model"));
+            assert!(
+                error
+                    .body
+                    .contains("/provider [claude|codex|opencode] MODEL")
+            );
             assert!(!error.body.contains("[claude|codex|opencode] [MODEL]"));
             assert_eq!(state.selected_model_name(), model);
         }
@@ -27105,17 +27812,15 @@ mod tests {
         assert!(names(&mut claude, "/plugins").contains(&"/plugins"));
 
         let mut opencode = opencode_picker_state();
-        for command in [
-            "/mcp",
-            "/plugins",
-            "/reload-plugins",
-            "/skills",
-            "/login",
-            "/logout",
-        ] {
+        for command in ["/mcp", "/plugins", "/reload-plugins", "/logout"] {
             assert!(names(&mut opencode, command).is_empty(), "{command}");
         }
-        assert!(names(&mut opencode, "/model").contains(&"/model"));
+        for command in ["/model", "/skills", "/login", "/rename"] {
+            assert!(
+                names(&mut opencode, command).contains(&command),
+                "{command}"
+            );
+        }
     }
 
     #[test]
@@ -28174,6 +28879,38 @@ mod tests {
         state.handle_notification("thread/compacted", &json!({}));
 
         assert!(!state.compacting());
+    }
+
+    #[test]
+    fn failed_compaction_releases_the_queue_without_claiming_success() {
+        let mut state = test_state();
+        state.begin_compaction();
+        state.editor.set_text("압축 뒤에 실행해");
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::None
+        ));
+        state.handle_notification(
+            "thread/compaction/failed",
+            &json!({
+                "error": { "message": "provider failed" }
+            }),
+        );
+        assert!(!state.compacting());
+        assert!(state.take_queued_prompt().is_some());
+        assert!(
+            state
+                .committed
+                .iter()
+                .any(|block| block.title == "Compaction failed"
+                    && block.body.contains("provider failed"))
+        );
+        assert!(
+            !state
+                .committed
+                .iter()
+                .any(|block| block.title == "Context compacted")
+        );
     }
 
     #[test]
@@ -31339,6 +32076,137 @@ mod tests {
     }
 
     #[test]
+    fn malformed_open_code_forms_decline_without_opening_an_approval() {
+        let id = json!({ "backend": "opencode", "kind": "elicitation", "id": 7 });
+        for schema in [
+            Value::Null,
+            json!({ "type": "object" }),
+            json!({ "type": "string", "properties": {} }),
+            json!({ "type": "object", "properties": { "nested": { "type": "object" } } }),
+            json!({ "type": "object", "properties": { "name": { "type": "string", "pattern": "^[A-Z]+$" } } }),
+            json!({ "type": "object", "properties": { "names": { "type": "array", "items": {
+                "anyOf": [{ "const": "Valid", "pattern": "^[A-Z]+$" }]
+            } } } }),
+            json!({ "type": "object", "properties": { "nested": { "type": "object", "properties": {
+                "name": { "type": "string", "pattern": "^[A-Z]+$" }
+            } } } }),
+        ] {
+            let mut state = test_state();
+            let action = state.begin_server_request(
+                id.clone(),
+                "mcpServer/elicitation/request",
+                &json!({ "mode": "form", "serverName": "OpenCode", "requestedSchema": schema }),
+            );
+            assert!(
+                matches!(action, Action::RpcResponse { ref result, .. }
+                if result["action"] == "decline"),
+                "잘못된 폼 {schema}"
+            );
+            assert!(state.pending.is_none());
+        }
+    }
+
+    #[test]
+    fn open_code_forms_enforce_existing_text_length_constraints() {
+        let id = json!({ "backend": "opencode", "kind": "elicitation", "id": 7 });
+        let mut state = test_state();
+        assert!(matches!(
+            state.begin_server_request(
+                id.clone(),
+                "mcpServer/elicitation/request",
+                &json!({
+                    "mode": "form", "serverName": "OpenCode", "requestedSchema": {
+                        "type": "object", "properties": {
+                            "pattern": { "type": "string", "minLength": 2, "maxLength": 3 }
+                        }, "required": ["pattern"]
+                    }
+                })
+            ),
+            Action::None
+        ));
+        state.handle_key(KeyEvent::from(KeyCode::Char('가')));
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::None
+        ));
+        for ch in "나다라".chars() {
+            state.handle_key(KeyEvent::from(KeyCode::Char(ch)));
+        }
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(state.awaiting_input());
+        state.handle_key(KeyEvent::from(KeyCode::Backspace));
+        assert!(
+            matches!(state.handle_key(KeyEvent::from(KeyCode::Enter)), Action::RpcResponse { id: returned_id, result }
+            if returned_id == id && result["content"] == json!({ "pattern": "가나다" }))
+        );
+    }
+
+    #[test]
+    fn open_code_forms_keep_pending_answers_and_cancel_the_new_request() {
+        let mut state = test_state();
+        let params = json!({ "mode": "form", "serverName": "OpenCode", "requestedSchema": {
+            "type": "object", "properties": { "answer": { "type": "string" } }, "required": ["answer"]
+        } });
+        let first = json!({ "backend": "opencode", "kind": "elicitation", "id": 1 });
+        let second = json!({ "backend": "opencode", "kind": "elicitation", "id": 2 });
+        assert!(matches!(
+            state.begin_server_request(first.clone(), "mcpServer/elicitation/request", &params),
+            Action::None
+        ));
+        assert!(
+            matches!(state.begin_server_request(second.clone(), "mcpServer/elicitation/request", &params),
+            Action::RpcResponse { id, result } if id == second && result["action"] == "cancel")
+        );
+        assert!(
+            matches!(state.pending, Some(PendingInteraction::McpForm(ref form)) if form.id == first)
+        );
+    }
+
+    #[test]
+    fn open_code_forms_preserve_multiple_and_custom_answers() {
+        let id = json!({ "backend": "opencode", "kind": "elicitation", "id": 7 });
+        let mut state = test_state();
+        assert!(matches!(state.begin_server_request(id.clone(), "mcpServer/elicitation/request", &json!({
+            "mode": "form", "serverName": "OpenCode", "requestedSchema": {
+                "type": "object", "properties": {
+                    "q0": { "type": "string", "oneOf": [{ "const": "Bun", "title": "Bun" }] },
+                    "q0_custom": { "type": "string" },
+                    "q1": { "type": "array", "items": { "anyOf": [{ "const": "Fast", "title": "Fast" }] } },
+                    "q1_custom": { "type": "string" }
+                }, "required": []
+            }
+        })), Action::None));
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::None
+        ));
+        for ch in "Node".chars() {
+            state.handle_key(KeyEvent::from(KeyCode::Char(ch)));
+        }
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::None
+        ));
+        state.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::None
+        ));
+        for ch in "Small".chars() {
+            state.handle_key(KeyEvent::from(KeyCode::Char(ch)));
+        }
+        assert!(
+            matches!(state.handle_key(KeyEvent::from(KeyCode::Enter)), Action::RpcResponse { id: returned_id, result }
+            if returned_id == id && result["action"] == "accept" && result["content"] == json!({
+                "q0_custom": "Node", "q1": ["Fast"], "q1_custom": "Small"
+            }))
+        );
+    }
+
+    #[test]
     fn unsupported_mcp_forms_decline_instead_of_breaking_the_turn() {
         let mut state = test_state();
         let action = state.begin_server_request(
@@ -34028,6 +34896,74 @@ mod tests {
         state.clear_pending_provider_model();
         state.switch_to_codex();
         assert_eq!(state.selected_model_name(), "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn opencode_ui_provider_model_selection_uses_catalog_identity() {
+        let mut state = opencode_picker_state();
+        for query in ["opencode-go/gpt-5.6-luna", "opencode:opencode/muse-spark"] {
+            assert!(matches!(
+                state.run_slash_command(&format!("/provider opencode {query}")),
+                Action::None
+            ));
+            assert_eq!(
+                state
+                    .selected_model_name()
+                    .strip_prefix("opencode:")
+                    .unwrap(),
+                query.trim_start_matches("opencode:")
+            );
+        }
+        let selected = state.selected_model_name().to_owned();
+        for query in ["luna", "missing-model", "gpt-5.6-luna"] {
+            state.run_slash_command(&format!("/provider opencode {query}"));
+            assert_eq!(state.selected_model_name(), selected);
+            assert_eq!(state.committed.last().unwrap().title, "Model not found");
+        }
+    }
+
+    #[test]
+    fn opencode_ui_provider_model_selection_survives_connection_and_clears_on_cancel() {
+        let mut state = test_state();
+        state.thread_id.clear();
+        let command = "/provider opencode opencode-go/gpt-5.6-luna";
+        assert!(matches!(
+            state.run_slash_command(command),
+            Action::ActivateOpenCode
+        ));
+        assert!(state.selected_provider() == ModelProvider::Codex);
+        state.open_provider_picker(&json!({"all": [], "connected": []}));
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(state.pending_provider_model.is_none());
+
+        assert!(matches!(
+            state.run_slash_command(command),
+            Action::ActivateOpenCode
+        ));
+        state.replace_models(opencode_picker_state().models);
+        state.switch_to_open_code();
+        assert_eq!(
+            state.selected_model_name(),
+            "opencode:opencode-go/gpt-5.6-luna"
+        );
+        assert!(state.pending_provider_model.is_none());
+    }
+
+    #[test]
+    fn opencode_ui_unknown_deferred_model_preserves_the_previous_provider() {
+        let mut state = test_state();
+        state.thread_id.clear();
+        assert!(matches!(
+            state.run_slash_command("/provider opencode missing-model"),
+            Action::ActivateOpenCode
+        ));
+        let mut models = state.models.clone();
+        models.extend(opencode_picker_state().models);
+        state.replace_models(models);
+        state.switch_to_open_code();
+        assert!(state.selected_provider() == ModelProvider::Codex);
+        assert_eq!(state.committed.last().unwrap().title, "Model not found");
+        assert!(state.pending_provider_model.is_none());
     }
 
     #[test]

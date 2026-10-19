@@ -880,20 +880,23 @@ impl BackendServer {
             // session list — and DevezCode — read it. A conversation that switched
             // providers lists whichever half ran last, so every half is named.
             "thread/name/set" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.trim().is_empty())
+                    .context(tr("세션 이름을 입력하세요.", "Enter a session name."))?;
                 let visible = self.canonical_visible(thread_id(&params)?);
                 let active = self.route_kind(&visible);
-                if active == RuntimeKind::OpenCode {
-                    return Err(anyhow::anyhow!(tr(
-                        "OpenCode provider는 세션 이름 변경을 지원하지 않습니다.",
-                        "The OpenCode provider doesn't support renaming sessions.",
-                    )));
-                }
                 let cwd = self
                     .route(&visible)
                     .map(|route| route.cwd)
                     .unwrap_or_else(|| self.cwd.clone());
                 let mut renamed = Ok(json!({}));
-                for kind in [RuntimeKind::Claude, RuntimeKind::Codex] {
+                for kind in [
+                    RuntimeKind::Claude,
+                    RuntimeKind::Codex,
+                    RuntimeKind::OpenCode,
+                ] {
                     let Ok(backing) = self.backing_id(&visible, kind) else {
                         continue;
                     };
@@ -904,6 +907,16 @@ impl BackendServer {
                                 json!({ "sessionId": backing, "name": params["name"], "cwd": cwd }),
                             )
                             .await
+                    } else if kind == RuntimeKind::OpenCode {
+                        match self.open_code() {
+                            Ok(open_code) => {
+                                open_code
+                                    .provider_api()
+                                    .rename_session(&backing, name)
+                                    .await
+                            }
+                            Err(error) => Err(error),
+                        }
                     } else {
                         match self.codex() {
                             Ok(codex) => {
@@ -3065,6 +3078,142 @@ mod question_runtime_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rename_rejects_empty_names_before_contacting_a_provider() {
+        let server = backend_with_routes(HashMap::new());
+        for name in [Value::Null, json!(""), json!("  "), json!(42)] {
+            let error = server
+                .request(
+                    "thread/name/set",
+                    json!({ "threadId": "ses_test", "name": name }),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("세션 이름"));
+        }
+        server.shutdown().await;
+    }
+
+    // DVZ_TEST_OPENCODE와 DVZ_TEST_OPENCODE_CWD, XDG_*를 임시 환경으로 지정해 실행한다.
+    #[tokio::test]
+    #[ignore = "격리된 OpenCode 설치본이 필요한 통합 검사"]
+    async fn installed_open_code_rename_and_compaction() {
+        let command = PathBuf::from(env::var_os("DVZ_TEST_OPENCODE").expect("DVZ_TEST_OPENCODE"));
+        let cwd =
+            PathBuf::from(env::var_os("DVZ_TEST_OPENCODE_CWD").expect("DVZ_TEST_OPENCODE_CWD"));
+        let mut server = backend_with_routes(HashMap::new());
+        server.cwd = cwd.clone();
+        server.open_code = Some(OpenCodeServer::spawn(&command, &cwd).await.unwrap());
+        server.open_code().unwrap().initialize().await.unwrap();
+        for (directory, name, other) in [
+            ("workspace-a", "only-a", "only-b"),
+            ("workspace-b", "only-b", "only-a"),
+        ] {
+            let workspace = cwd.join(directory);
+            let skill = workspace
+                .join(".opencode/skills")
+                .join(name)
+                .join("SKILL.md");
+            fs::create_dir_all(skill.parent().unwrap()).unwrap();
+            fs::write(
+                &skill,
+                "---\nname: Project skill\ndescription: project skill\n---\nProject instructions.\n",
+            )
+            .unwrap();
+            // 설치본은 새 작업 폴더의 스킬을 비동기로 발견한다.
+            let skills = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let skills = server
+                        .open_code()
+                        .unwrap()
+                        .provider_api()
+                        .skills(&workspace)
+                        .await
+                        .unwrap();
+                    if skills["data"][0]["skills"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|skill| skill["name"] == name)
+                    {
+                        break skills;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let skills = skills["data"][0]["skills"].as_array().unwrap();
+            assert!(
+                skills.iter().any(|skill| skill["name"] == name),
+                "현재 작업 폴더의 스킬을 조회해야 한다"
+            );
+            assert!(
+                !skills.iter().any(|skill| skill["name"] == other),
+                "다른 작업 폴더의 스킬이 섞이면 안 된다"
+            );
+        }
+        let catalog = server
+            .open_code()
+            .unwrap()
+            .model_catalog(&cwd)
+            .await
+            .unwrap();
+        let model = catalog["data"][0]["model"].as_str().expect("모델 카탈로그");
+        let response = server
+            .request("thread/start", json!({ "cwd": cwd, "model": model }))
+            .await
+            .unwrap();
+        let id = response["id"].as_str().unwrap();
+        server
+            .request(
+                "thread/name/set",
+                json!({ "threadId": id, "name": "통합 검사 이름" }),
+            )
+            .await
+            .unwrap();
+        let listed = server
+            .open_code()
+            .unwrap()
+            .list_sessions(Some(&cwd))
+            .await
+            .unwrap();
+        assert!(
+            listed["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|session| session["id"] == id && session["name"] == "통합 검사 이름")
+        );
+        let compact = server
+            .request("thread/compact/start", json!({ "threadId": id }))
+            .await
+            .unwrap();
+        assert!(compact["turn"]["id"].is_string());
+        let mut boundary = None;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(ServerEvent::Notification { method, params }) =
+                    server.open_code.as_mut().unwrap().next_event().await
+                {
+                    if method == "thread/compacted" || method == "thread/compaction/failed" {
+                        assert_eq!(params["threadId"], id);
+                        boundary = Some(method);
+                    } else if method == "turn/completed" {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            boundary.is_some(),
+            "압축의 실제 성공·실패 알림을 전달해야 한다"
+        );
+        server.shutdown().await;
+    }
 
     fn backend_with_routes(routes: HashMap<String, Route>) -> BackendServer {
         let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

@@ -23,14 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "`/login`을 입력해 Claude에 로그인할 수 있습니다.",
-    "Claude Code 2.1.302를 적용해, 자동 승인 중 대화가 길어져도 도구를 모두 막지 않고 대화를 압축하도록 수정했습니다.",
+    "오류가 발생한 Claude·Codex 턴에서 같은 메시지가 두 번 표시되던 문제를 수정했습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "You can now sign in to Claude by entering `/login`.",
-    "Updated to Claude Code 2.1.302 so long conversations under auto-approval are compacted instead of blocking every tool.",
+    "Fixed the same error message appearing twice in a failed Claude or Codex turn.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

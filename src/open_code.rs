@@ -8,7 +8,7 @@ use std::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -36,13 +36,15 @@ fn explicit_skill_instruction(input: &[Value]) -> Option<String> {
         .collect::<Vec<_>>();
     (!names.is_empty()).then(|| {
         format!(
-            "<devez-vibe-explicit-skills>\nThe user explicitly selected these OpenCode skills. Before handling the request, call the native skill tool once for each exact name: {}.\n</devez-vibe-explicit-skills>",
+            "<devez-vibe-explicit-skills>\nThe user explicitly selected these OpenCode skills. Before handling the request, call the native skill tool once for each exact identifier (use the tool's id or name parameter): {}.\n</devez-vibe-explicit-skills>",
             names.join(", ")
         )
     })
 }
 
 type PendingResponse = oneshot::Sender<Result<Value, String>>;
+type Outbound = Arc<StdMutex<Option<mpsc::UnboundedSender<Value>>>>;
+type InboundMap = Arc<StdMutex<HashMap<String, InboundRequest>>>;
 type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
 type DetachedMap = Arc<Mutex<HashMap<u64, DetachedTurn>>>;
 type ToolMap = Arc<Mutex<HashMap<String, Value>>>;
@@ -51,6 +53,11 @@ type ActiveMap = Arc<Mutex<ActiveTurns>>;
 type LoadingMap = Arc<Mutex<HashMap<String, LoadedHistory>>>;
 type HistoryMap = Arc<Mutex<HashMap<String, Value>>>;
 type Notification = (String, Value);
+
+struct InboundRequest {
+    id: Value,
+    session_id: String,
+}
 
 /// 백엔드가 죽지 않고 응답만 멈추면 요청이 영원히 매달려 스피너만 남는다.
 /// 세션 시작이나 큰 전사 복원도 이보다 오래 걸리지는 않으므로, 넘기면
@@ -82,6 +89,9 @@ struct ActiveTurns {
 }
 
 const COMPLETED_TURN_LIMIT: usize = 128;
+// 부모 결과보다 먼저 끝난 자식만 잠깐 보관한다.
+const COMPLETED_CHILD_LIMIT: usize = 32;
+const COMPLETED_CHILD_BYTES: usize = 4 * 1024 * 1024;
 
 /// session/load가 응답 전에 재생해 주는 과거 대화 조각. 재개 화면 복원에 쓴다.
 struct HistoryChunk {
@@ -109,6 +119,11 @@ struct SessionStreams {
     message: Option<StreamItem>,
     /// 지금 돌고 있는 하위 에이전트(task 도구) 목록.
     subagents: Vec<Value>,
+    /// 자식 알림에는 부모 호출 ID가 없어 도구 결과의 sessionID로 연결한다.
+    child_tool_ids: HashMap<String, String>,
+    child_items: Vec<Value>,
+    child_root: Option<String>,
+    child_completed_at: Option<Instant>,
 }
 
 struct StreamItem {
@@ -118,6 +133,80 @@ struct StreamItem {
 }
 
 impl SessionStreams {
+    fn record_child_update(
+        &mut self,
+        session_id: &str,
+        update: &Value,
+        tools: &mut HashMap<String, Value>,
+    ) {
+        let notifications = match update.get("sessionUpdate").and_then(Value::as_str) {
+            Some("agent_message_chunk") => content_text(update.get("content"))
+                .filter(|text| !text.is_empty())
+                .map(|text| {
+                    self.message_chunk(
+                        session_id,
+                        update.get("messageId").and_then(Value::as_str),
+                        text,
+                    )
+                })
+                .unwrap_or_default(),
+            Some("agent_thought_chunk") => self.close_all(session_id),
+            Some("tool_call" | "tool_call_update") => {
+                let notifications = self.close_all(session_id);
+                self.record_child_boundary(notifications);
+                if let Some(id) = update.get("toolCallId").and_then(Value::as_str) {
+                    let merged = merge_tool_update(tools.remove(id), update);
+                    let completed = matches!(
+                        merged.get("status").and_then(Value::as_str),
+                        Some("completed" | "failed")
+                    );
+                    let item = tool_item(&merged, completed);
+                    if let Some(existing) = self
+                        .child_items
+                        .iter_mut()
+                        .find(|existing| existing.get("id") == item.get("id"))
+                    {
+                        *existing = item;
+                    } else {
+                        self.child_items.push(item);
+                    }
+                    if !completed {
+                        tools.insert(id.to_owned(), merged);
+                    }
+                }
+                Vec::new()
+            }
+            _ => Vec::new(),
+        };
+        self.record_child_boundary(notifications);
+    }
+
+    fn record_child_boundary(&mut self, notifications: Vec<Notification>) {
+        for (method, params) in notifications {
+            if method == "item/completed"
+                && let Some(item) = params.get("item")
+            {
+                self.child_items.push(item.clone());
+            }
+        }
+        if self.child_items.len() > 400 {
+            self.child_items.drain(..self.child_items.len() - 400);
+        }
+    }
+
+    fn child_history(&self, session_id: &str, tool_id: &str) -> Option<Notification> {
+        let mut items = self.child_items.clone();
+        if let Some(message) = &self.message {
+            items.push(json!({ "id": message.id, "type": "agentMessage", "text": message.text, "provider": "OpenCode" }));
+        }
+        (!items.is_empty()).then(|| {
+            (
+                "turn/subagent/history".to_owned(),
+                json!({ "threadId": session_id, "id": tool_id, "turns": [{ "items": items }] }),
+            )
+        })
+    }
+
     fn message_chunk(
         &mut self,
         session_id: &str,
@@ -407,7 +496,8 @@ fn background_subagent_task_id(update: &Value) -> Option<&str> {
 
 #[derive(Clone)]
 pub struct OpenCodeClient {
-    outbound: Arc<StdMutex<Option<mpsc::UnboundedSender<Value>>>>,
+    outbound: Outbound,
+    inbound: InboundMap,
     pending: PendingMap,
     detached: DetachedMap,
     active_turns: ActiveMap,
@@ -547,16 +637,29 @@ impl OpenCodeClient {
     }
 
     pub fn respond(&self, id: Value, result: Value) -> Result<()> {
+        let result = if id.get("kind").and_then(Value::as_str) == Some("elicitation") {
+            result
+        } else {
+            permission_result(&result)
+        };
         let id = open_code_request_id(&id)?;
+        self.inbound
+            .lock()
+            .expect("inbound mutex")
+            .remove(&id.to_string());
         self.send(json!({
             "jsonrpc": "2.0",
             "id": id,
-            "result": permission_result(&result)
+            "result": result
         }))
     }
 
     pub fn respond_error(&self, id: Value, code: i64, message: &str) -> Result<()> {
         let id = open_code_request_id(&id)?;
+        self.inbound
+            .lock()
+            .expect("inbound mutex")
+            .remove(&id.to_string());
         self.send(json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -565,6 +668,7 @@ impl OpenCodeClient {
     }
 
     fn close(&self) {
+        cancel_inbound_requests(&self.inbound, &self.outbound, &self.events, None);
         self.outbound.lock().expect("outbound mutex").take();
     }
 
@@ -727,17 +831,41 @@ impl ProviderAuthServer {
         self.get(&["provider"]).await
     }
 
-    pub async fn skills(&self) -> Result<Value> {
+    pub async fn skills(&self, cwd: &Path) -> Result<Value> {
+        let directory = cwd.to_string_lossy();
         if self.is_v2() {
-            let skills = self.v2_list(&["api", "skill"], &[]).await?;
+            let skills = self
+                .v2_list(&["api", "skill"], &[("location[directory]", &directory)])
+                .await?;
             return Ok(normalize_skill_catalog(Value::Array(skills)));
         }
         self.wait_until_ready().await?;
-        Ok(normalize_skill_catalog(self.get(&["skill"]).await?))
+        Ok(normalize_skill_catalog(
+            self.send_json(
+                self.client
+                    .get(self.url(&["skill"])?)
+                    .query(&[("directory", &directory)])
+                    .timeout(Duration::from_secs(30)),
+            )
+            .await?,
+        ))
     }
 
     async fn session_status(&self) -> Result<Value> {
         self.get(&["session", "status"]).await
+    }
+
+    pub async fn rename_session(&self, session_id: &str, name: &str) -> Result<Value> {
+        self.wait_until_ready().await?;
+        let request = if self.is_v2() {
+            self.v2_request(reqwest::Method::PATCH, &["api", "session", session_id])?
+        } else {
+            self.client
+                .patch(self.url(&["session", session_id])?)
+                .timeout(Duration::from_secs(30))
+        };
+        self.send_json(request.json(&json!({ "title": name })))
+            .await
     }
 
     pub async fn set_api_key(
@@ -1182,7 +1310,8 @@ fn normalize_skill_catalog(response: Value) -> Value {
         .unwrap_or_default()
         .iter()
         .filter_map(|skill| {
-            let name = skill.get("name").and_then(Value::as_str)?;
+            let name = skill.get("id").and_then(Value::as_str)
+                .or_else(|| skill.get("name").and_then(Value::as_str))?;
             // 2.x names the field `path`.
             let location = skill
                 .get("location")
@@ -1279,7 +1408,9 @@ impl OpenCodeServer {
             .context(tr("OpenCode ACP stderr 연결 실패", "OpenCode ACP stderr connection failed"))?;
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Value>();
+        let outbound = Arc::new(StdMutex::new(Some(outbound_tx)));
         let (event_tx, events) = mpsc::unbounded_channel::<ServerEvent>();
+        let inbound: InboundMap = Arc::default();
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let detached: DetachedMap = Arc::new(Mutex::new(HashMap::new()));
         let active_turns: ActiveMap = Arc::default();
@@ -1310,6 +1441,8 @@ impl OpenCodeServer {
         });
 
         let reader_pending = Arc::clone(&pending);
+        let reader_outbound = Arc::clone(&outbound);
+        let reader_inbound = Arc::clone(&inbound);
         let reader_detached = Arc::clone(&detached);
         let reader_active = Arc::clone(&active_turns);
         let reader_loading = Arc::clone(&loading);
@@ -1332,6 +1465,8 @@ impl OpenCodeServer {
                                     &reader_tools,
                                     &reader_streams,
                                     &reader_events,
+                                    &reader_inbound,
+                                    &reader_outbound,
                                 )
                                 .await;
                             }
@@ -1359,6 +1494,7 @@ impl OpenCodeServer {
                 let _ = sender.send(Err(tr("OpenCode ACP 연결이 종료되었습니다.", "The OpenCode ACP connection closed.").to_owned()));
             }
             drop(pending);
+            cancel_inbound_requests(&reader_inbound, &reader_outbound, &reader_events, None);
             // 연결이 죽으면 응답을 기다리던 턴을 닫아 스피너가 영원히 남지
             // 않게 한다.
             reader_active.lock().await.active.clear();
@@ -1442,7 +1578,8 @@ impl OpenCodeServer {
         });
 
         let client = OpenCodeClient {
-            outbound: Arc::new(StdMutex::new(Some(outbound_tx))),
+            outbound,
+            inbound,
             pending,
             detached,
             active_turns,
@@ -1481,6 +1618,7 @@ impl OpenCodeServer {
                     "clientCapabilities": {
                         "fs": { "readTextFile": false, "writeTextFile": false },
                         "terminal": false,
+                        "elicitation": { "form": {} },
                         "_meta": meta
                     },
                     "clientInfo": {
@@ -1876,7 +2014,15 @@ async fn route_message(
     tools: &ToolMap,
     streams: &StreamMap,
     events: &mpsc::UnboundedSender<ServerEvent>,
+    inbound: &InboundMap,
+    outbound: &Outbound,
 ) {
+    if message.get("method").and_then(Value::as_str) == Some("$/cancel_request") {
+        if let Some(id) = message.pointer("/params/requestId") {
+            cancel_inbound_request(inbound, outbound, events, id);
+        }
+        return;
+    }
     if let Some(id) = message.get("id").and_then(Value::as_u64)
         && (message.get("result").is_some() || message.get("error").is_some())
     {
@@ -1891,7 +2037,16 @@ async fn route_message(
         }
         let detached_turn = detached.lock().await.remove(&id);
         if let Some(turn) = detached_turn {
-            let error_detail = message.get("error").map(format_rpc_error);
+            let interrupted = message.pointer("/error/code").and_then(Value::as_i64)
+                == Some(-32800)
+                || message
+                    .pointer("/result/stopReason")
+                    .and_then(Value::as_str)
+                    == Some("cancelled");
+            let error_detail = message
+                .get("error")
+                .filter(|error| error.get("code").and_then(Value::as_i64) != Some(-32800))
+                .map(format_rpc_error);
             if let Some(detail) = &error_detail {
                 let _ = events.send(ServerEvent::Notification {
                     method: "error".to_owned(),
@@ -1921,6 +2076,7 @@ async fn route_message(
             if !finished {
                 return;
             }
+            cancel_inbound_requests(inbound, outbound, events, Some(&turn.session_id));
             if !detached.lock().await.values().any(|pending| {
                 pending.session_id == turn.session_id && pending.turn_id == turn.turn_id
             }) {
@@ -1946,26 +2102,18 @@ async fn route_message(
             if let Some((method, params)) = subagents {
                 notify(events, &method, params);
             }
-            if let Some(detail) = error_detail {
-                let _ = events.send(ServerEvent::Notification {
-                    method: "turn/completed".to_owned(),
-                    params: json!({
-                        "threadId": turn.session_id,
-                        "turn": {
-                            "id": turn.turn_id,
-                            "error": { "message": detail }
-                        }
-                    }),
-                });
-            } else {
-                let _ = events.send(ServerEvent::Notification {
-                    method: "turn/completed".to_owned(),
-                    params: json!({
-                        "threadId": turn.session_id,
-                        "turn": { "id": turn.turn_id }
-                    }),
-                });
+            let mut completed = json!({ "id": turn.turn_id });
+            if interrupted {
+                completed["status"] = json!("interrupted");
             }
+            if let Some(detail) = error_detail {
+                completed["error"] = json!({ "message": detail });
+            }
+            notify(
+                events,
+                "turn/completed",
+                json!({ "threadId": turn.session_id, "turn": completed }),
+            );
             return;
         }
     }
@@ -1977,6 +2125,23 @@ async fn route_message(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
+        if let Some(child) = params
+            .pointer("/update/_meta/opencode~1child-session/id")
+            .and_then(Value::as_str)
+            && child != session_id
+        {
+            route_child_update(
+                &session_id,
+                child,
+                params.get("update"),
+                false,
+                tools,
+                streams,
+                events,
+            )
+            .await;
+            return;
+        }
         // session/load가 재생 중인 세션의 조각은 화면 대신 복원 버퍼로 간다.
         {
             let mut loading = loading.lock().await;
@@ -1997,23 +2162,27 @@ async fn route_message(
         return;
     }
 
-    // 2.x sends subagent sessions here once initialize opts in. Only a child's
-    // end matters, since the parent's subagent tool call carries its row.
+    // 자식 본문은 부모 답변으로 보내지 않고 부모 도구 행의 기록으로 모은다.
     if message.get("method").and_then(Value::as_str) == Some("opencode/session/child_update") {
         let params = message.get("params").unwrap_or(&Value::Null);
-        if let (Some(root), Some(child), Some("completed" | "failed" | "interrupted")) = (
+        if let (Some(root), Some(child)) = (
             params.get("rootSessionId").and_then(Value::as_str),
             params.get("childSessionId").and_then(Value::as_str),
-            params.get("status").and_then(Value::as_str),
         ) {
-            let ended = streams
-                .lock()
-                .await
-                .get_mut(root)
-                .and_then(|stream| stream.background_subagent_ended(root, child));
-            if let Some((method, params)) = ended {
-                notify(events, &method, params);
-            }
+            let ended = matches!(
+                params.get("status").and_then(Value::as_str),
+                Some("completed" | "failed" | "interrupted")
+            );
+            route_child_update(
+                root,
+                child,
+                params.get("update"),
+                ended,
+                tools,
+                streams,
+                events,
+            )
+            .await;
         }
         return;
     }
@@ -2021,15 +2190,243 @@ async fn route_message(
     if let (Some(id), Some(method)) = (
         message.get("id").cloned(),
         message.get("method").and_then(Value::as_str),
-    ) && method == "session/request_permission"
-    {
-        let params =
-            permission_request_params(message.get("params").cloned().unwrap_or(Value::Null));
+    ) {
+        let (kind, method, mut params) = match method {
+            "session/request_permission" => {
+                let (method, params) = permission_request_params(
+                    message.get("params").cloned().unwrap_or(Value::Null),
+                );
+                ("permission", method, params)
+            }
+            "elicitation/create" => {
+                let params = message.get("params").unwrap_or(&Value::Null);
+                (
+                    "elicitation",
+                    "mcpServer/elicitation/request".to_owned(),
+                    json!({
+                        "itemId": params.get("toolCallId"),
+                        "serverName": "OpenCode",
+                        "mode": params.get("mode"),
+                        "message": params.get("message"),
+                        "requestedSchema": params.get("requestedSchema")
+                    }),
+                )
+            }
+            _ => return,
+        };
+        let session_id = message
+            .pointer("/params/sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        params["threadId"] = json!(session_id);
+        let wrapped = json!({ "backend": "opencode", "kind": kind, "id": id });
+        inbound.lock().expect("inbound mutex").insert(
+            id.to_string(),
+            InboundRequest {
+                id: wrapped.clone(),
+                session_id: session_id.to_owned(),
+            },
+        );
         let _ = events.send(ServerEvent::Request {
-            id: json!({ "backend": "opencode", "id": id }),
-            method: params.0,
-            params: params.1,
+            id: wrapped,
+            method,
+            params,
         });
+    }
+}
+
+fn cancel_inbound_request(
+    inbound: &InboundMap,
+    outbound: &Outbound,
+    events: &mpsc::UnboundedSender<ServerEvent>,
+    id: &Value,
+) {
+    let Some(request) = inbound
+        .lock()
+        .expect("inbound mutex")
+        .remove(&id.to_string())
+    else {
+        return;
+    };
+    notify(
+        events,
+        "serverRequest/resolved",
+        json!({
+            "threadId": request.session_id, "requestId": request.id,
+        }),
+    );
+    if let Some(sender) = outbound.lock().expect("outbound mutex").as_ref() {
+        let _ = sender.send(json!({
+            "jsonrpc": "2.0", "id": id,
+            "error": { "code": -32800, "message": "Request cancelled" }
+        }));
+    }
+}
+
+fn cancel_inbound_requests(
+    inbound: &InboundMap,
+    outbound: &Outbound,
+    events: &mpsc::UnboundedSender<ServerEvent>,
+    session_id: Option<&str>,
+) {
+    let ids: Vec<Value> = inbound
+        .lock()
+        .expect("inbound mutex")
+        .values()
+        .filter(|request| session_id.is_none_or(|session_id| request.session_id == session_id))
+        .map(|request| request.id["id"].clone())
+        .collect();
+    for id in ids {
+        cancel_inbound_request(inbound, outbound, events, &id);
+    }
+}
+
+async fn route_child_update(
+    root: &str,
+    child: &str,
+    update: Option<&Value>,
+    ended: bool,
+    tools: &ToolMap,
+    streams: &StreamMap,
+    events: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    if root.is_empty() || child.is_empty() || root == child {
+        return;
+    }
+    let mut tools = tools.lock().await;
+    let mut streams = streams.lock().await;
+    if let Some(stream) = streams.get(child) {
+        if stream
+            .child_root
+            .as_deref()
+            .is_some_and(|parent| parent != root)
+        {
+            return;
+        }
+        if !ended && stream.child_completed_at.is_some() {
+            streams.remove(child);
+        }
+    }
+    let stream = streams.entry(child.to_owned()).or_default();
+    stream.child_root = Some(root.to_owned());
+    if let Some(update) = update {
+        stream.record_child_update(child, update, &mut tools);
+    }
+    if ended {
+        let boundary = stream.close_all(child);
+        stream.record_child_boundary(boundary);
+        stream.child_completed_at = Some(Instant::now());
+        let prefix = format!("{child}:");
+        tools.retain(|id, _| !id.starts_with(&prefix));
+    }
+    let tool_id = streams
+        .get(root)
+        .and_then(|root| root.child_tool_ids.get(child))
+        .cloned();
+    let history = tool_id
+        .as_ref()
+        .and_then(|id| streams.get(child)?.child_history(root, id));
+    if let Some((method, params)) = history {
+        notify(events, &method, params);
+    }
+    if ended {
+        // 재개 자식은 부모 결과보다 먼저 끝날 수 있다. 본문 대신 종료 표식만 남긴다.
+        if let Some(tool) = tool_id.as_ref().and_then(|id| tools.get_mut(id)) {
+            tool["_devezChildCompleted"] = Value::Bool(true);
+        }
+        if let Some(stream) = streams.get_mut(root) {
+            stream.child_tool_ids.remove(child);
+            if let Some((method, params)) = stream.background_subagent_ended(root, child) {
+                notify(events, &method, params);
+            }
+        }
+        if tool_id.is_some() {
+            streams.remove(child);
+        } else {
+            prune_completed_children(&mut streams);
+        }
+    }
+}
+
+fn prune_completed_children(streams: &mut HashMap<String, SessionStreams>) {
+    let mut completed = streams
+        .iter()
+        .filter_map(|(id, stream)| {
+            let at = stream.child_completed_at?;
+            let bytes = serde_json::to_vec(&stream.child_items).map_or(0, |items| items.len())
+                + id.len()
+                + stream.child_root.as_ref().map_or(0, String::len);
+            Some((id.clone(), at, bytes))
+        })
+        .collect::<Vec<_>>();
+    completed.sort_by_key(|(_, at, _)| *at);
+    let mut count = completed.len();
+    let mut bytes = completed.iter().map(|(_, _, bytes)| bytes).sum::<usize>();
+    for (id, _, size) in completed {
+        if count <= COMPLETED_CHILD_LIMIT && bytes <= COMPLETED_CHILD_BYTES {
+            break;
+        }
+        streams.remove(&id);
+        count -= 1;
+        bytes = bytes.saturating_sub(size);
+    }
+}
+
+async fn link_child_session(
+    session_id: &str,
+    update: &Value,
+    streams: &StreamMap,
+    events: &mpsc::UnboundedSender<ServerEvent>,
+) -> bool {
+    if update.get("_devezChildCompleted").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    if update.get("name").and_then(Value::as_str) != Some("subagent") {
+        return false;
+    }
+    let metadata = update.pointer("/rawOutput/metadata/sessionID");
+    let Some(child) = metadata
+        .or_else(|| update.pointer("/rawInput/sessionID"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty() && *id != session_id)
+    else {
+        return false;
+    };
+    let Some(id) = update.get("toolCallId").and_then(Value::as_str) else {
+        return false;
+    };
+    let mut streams = streams.lock().await;
+    if streams
+        .get(child)
+        .and_then(|stream| stream.child_root.as_deref())
+        .is_some_and(|root| root != session_id)
+    {
+        return false;
+    }
+    let completed = streams
+        .get(child)
+        .is_some_and(|stream| stream.child_completed_at.is_some())
+        || update
+            .pointer("/rawOutput/metadata/status")
+            .and_then(Value::as_str)
+            == Some("completed");
+    if completed && metadata.is_none() {
+        streams.remove(child);
+    }
+    if let Some((method, params)) = streams
+        .get(child)
+        .and_then(|stream| stream.child_history(session_id, id))
+    {
+        notify(events, &method, params);
+    }
+    let root = streams.entry(session_id.to_owned()).or_default();
+    if completed && metadata.is_some() {
+        root.child_tool_ids.remove(child);
+        streams.remove(child);
+        true
+    } else {
+        root.child_tool_ids.insert(child.to_owned(), id.to_owned());
+        false
     }
 }
 
@@ -2089,6 +2486,7 @@ async fn route_session_update(
             if let Some(id) = item.get("id").and_then(Value::as_str) {
                 tools.lock().await.insert(id.to_owned(), update.clone());
             }
+            link_child_session(session_id, update, streams, events).await;
             emit_plan(update, session_id, events);
             notify(
                 events,
@@ -2112,6 +2510,7 @@ async fn route_session_update(
                 .unwrap_or("opencode-tool");
             let previous = tools.lock().await.get(id).cloned();
             let merged = merge_tool_update(previous, update);
+            let child_completed = link_child_session(session_id, &merged, streams, events).await;
             emit_plan(&merged, session_id, events);
             match update.get("status").and_then(Value::as_str) {
                 status @ Some("completed" | "failed") => {
@@ -2124,7 +2523,7 @@ async fn route_session_update(
                     let subagents = {
                         let mut streams = streams.lock().await;
                         let entry = streams.entry(session_id.to_owned()).or_default();
-                        if status == Some("completed") {
+                        if status == Some("completed") && !child_completed {
                             entry.subagent_tool_completed(session_id, id, &merged)
                         } else {
                             entry.subagent_finished(session_id, id)
@@ -2163,6 +2562,35 @@ async fn route_session_update(
                     "tokenUsage": token_usage
                 }),
             );
+        }
+        Some("session_info_update" | "compaction_update") => {
+            let compaction = if update.get("sessionUpdate").and_then(Value::as_str)
+                == Some("compaction_update")
+            {
+                update
+            } else {
+                &update["_meta"]["opencode/compaction"]
+            };
+            match compaction.get("status").and_then(Value::as_str) {
+                Some("started") => notify(
+                    events,
+                    "rawResponseItem/completed",
+                    json!({ "threadId": session_id, "item": { "type": "compaction_trigger" } }),
+                ),
+                Some("completed") => notify(
+                    events,
+                    "thread/compacted",
+                    json!({ "threadId": session_id }),
+                ),
+                Some("failed") => notify(
+                    events,
+                    "thread/compaction/failed",
+                    json!({ "threadId": session_id, "error": compaction.get("error").cloned().unwrap_or_else(|| json!({
+                        "message": tr("컨텍스트 압축에 실패했습니다.", "Context compaction failed.")
+                    })) }),
+                ),
+                _ => {}
+            }
         }
         _ => {}
     }
@@ -2803,11 +3231,518 @@ fn image_mime(path: &Path) -> &'static str {
 mod tests {
     use super::*;
 
+    fn test_client() -> (
+        OpenCodeClient,
+        mpsc::UnboundedReceiver<Value>,
+        mpsc::UnboundedReceiver<ServerEvent>,
+    ) {
+        let (outbound, replies) = mpsc::unbounded_channel();
+        let (events, requests) = mpsc::unbounded_channel();
+        (
+            OpenCodeClient {
+                outbound: Arc::new(StdMutex::new(Some(outbound))),
+                inbound: Arc::default(),
+                pending: Arc::default(),
+                detached: Arc::default(),
+                active_turns: Arc::default(),
+                next_id: Arc::new(AtomicU64::new(1)),
+                next_turn: Arc::new(AtomicU64::new(1)),
+                events,
+            },
+            replies,
+            requests,
+        )
+    }
+
+    async fn route_client_message(client: &OpenCodeClient, message: Value) {
+        route_message(
+            message,
+            &client.pending,
+            &client.detached,
+            &client.active_turns,
+            &Arc::default(),
+            &Arc::default(),
+            &Arc::default(),
+            &client.events,
+            &client.inbound,
+            &client.outbound,
+        )
+        .await;
+    }
+
+    fn test_form_request(id: Value, session_id: &str) -> Value {
+        json!({ "id": id, "method": "elicitation/create", "params": {
+            "sessionId": session_id, "mode": "form", "message": "이름", "requestedSchema": {
+                "type": "object", "properties": { "name": { "type": "string" } }, "required": ["name"]
+            }
+        } })
+    }
+
+    #[tokio::test]
+    async fn cancelled_server_requests_resolve_exact_ids_and_release_form_ui() {
+        use crate::state::{Action, AppState};
+
+        let (client, mut replies, mut events) = test_client();
+        let mut btw = AppState::new(
+            "ses_btw".into(),
+            "cwd".into(),
+            "시험".into(),
+            Vec::new(),
+            "opencode:test/test",
+            None,
+        );
+        let mut main = AppState::new(
+            "ses_main".into(),
+            "cwd".into(),
+            "시험".into(),
+            Vec::new(),
+            "opencode:test/test",
+            None,
+        );
+        route_client_message(&client, test_form_request(json!(7), "ses_btw")).await;
+        let ServerEvent::Request {
+            id: form_id,
+            method,
+            params,
+        } = events.recv().await.unwrap()
+        else {
+            panic!("질문 요청");
+        };
+        assert!(matches!(
+            btw.begin_server_request(form_id.clone(), &method, &params),
+            Action::None
+        ));
+        route_client_message(
+            &client,
+            json!({ "id": "7", "method": "session/request_permission", "params": {
+            "sessionId": "ses_main", "toolCall": { "toolCallId": "call_1", "title": "실행" }
+        } }),
+        )
+        .await;
+        let ServerEvent::Request {
+            id: permission_id,
+            method,
+            params,
+        } = events.recv().await.unwrap()
+        else {
+            panic!("승인 요청");
+        };
+        assert_eq!(params["threadId"], "ses_main");
+        assert!(matches!(
+            main.begin_server_request(permission_id.clone(), &method, &params),
+            Action::None
+        ));
+        assert!(main.awaiting_input() && btw.awaiting_input());
+
+        route_client_message(
+            &client,
+            json!({ "method": "$/cancel_request", "params": { "requestId": 99 } }),
+        )
+        .await;
+        assert!(events.try_recv().is_err() && replies.try_recv().is_err());
+        route_client_message(
+            &client,
+            json!({ "method": "$/cancel_request", "params": { "requestId": 7 } }),
+        )
+        .await;
+        let ServerEvent::Notification { method, params } = events.recv().await.unwrap() else {
+            panic!("취소 알림");
+        };
+        assert_eq!(method, "serverRequest/resolved");
+        assert_eq!(
+            params,
+            json!({ "threadId": "ses_btw", "requestId": form_id })
+        );
+        btw.handle_notification(&method, &params);
+        assert!(!btw.awaiting_input());
+        assert!(main.awaiting_input());
+        let error = replies.recv().await.unwrap();
+        assert_eq!(error["id"], 7);
+        assert_eq!(error["error"]["code"], -32800);
+        assert_eq!(client.inbound.lock().unwrap().len(), 1);
+
+        route_client_message(
+            &client,
+            json!({ "method": "$/cancel_request", "params": { "requestId": 7 } }),
+        )
+        .await;
+        assert!(events.try_recv().is_err() && replies.try_recv().is_err());
+        route_client_message(
+            &client,
+            json!({ "method": "$/cancel_request", "params": { "requestId": "7" } }),
+        )
+        .await;
+        let ServerEvent::Notification { method, params } = events.recv().await.unwrap() else {
+            panic!("승인 취소 알림");
+        };
+        assert_eq!(
+            params,
+            json!({ "threadId": "ses_main", "requestId": permission_id })
+        );
+        main.handle_notification(&method, &params);
+        assert!(!main.awaiting_input());
+        assert_eq!(replies.recv().await.unwrap()["id"], "7");
+        assert!(client.inbound.lock().unwrap().is_empty());
+
+        route_client_message(&client, test_form_request(json!(8), "ses_btw")).await;
+        let ServerEvent::Request { id, .. } = events.recv().await.unwrap() else {
+            panic!("질문 요청");
+        };
+        client.respond_error(id, -32602, "잘못된 질문").unwrap();
+        assert!(client.inbound.lock().unwrap().is_empty());
+        assert_eq!(replies.recv().await.unwrap()["error"]["code"], -32602);
+        route_client_message(&client, test_form_request(json!(9), "ses_btw")).await;
+        let ServerEvent::Request { id, .. } = events.recv().await.unwrap() else {
+            panic!("질문 요청");
+        };
+        client.respond(id, json!({ "action": "cancel" })).unwrap();
+        assert!(client.inbound.lock().unwrap().is_empty());
+        assert_eq!(replies.recv().await.unwrap()["result"]["action"], "cancel");
+        route_client_message(&client, test_form_request(json!(10), "ses_btw")).await;
+        events.recv().await.unwrap();
+        client.close();
+        assert!(client.inbound.lock().unwrap().is_empty());
+        assert!(
+            matches!(events.recv().await.unwrap(), ServerEvent::Notification { method, params }
+            if method == "serverRequest/resolved" && params["threadId"] == "ses_btw")
+        );
+        assert_eq!(replies.recv().await.unwrap()["error"]["code"], -32800);
+    }
+
+    #[tokio::test]
+    async fn turn_completion_cancels_only_its_unanswered_requests() {
+        let (client, mut replies, mut events) = test_client();
+        for (session_id, steer) in [("ses_1", false), ("ses_1", true), ("ses_2", false)] {
+            client
+                .start_prompt(session_id, Vec::new(), steer)
+                .await
+                .unwrap();
+        }
+        let first = replies.recv().await.unwrap()["id"].clone();
+        let joined = replies.recv().await.unwrap()["id"].clone();
+        let other = replies.recv().await.unwrap()["id"].clone();
+        while events.try_recv().is_ok() {}
+        for (id, session_id) in [("form_1", "ses_1"), ("form_2", "ses_2")] {
+            route_client_message(&client, test_form_request(json!(id), session_id)).await;
+            events.recv().await.unwrap();
+        }
+        route_client_message(&client, json!({ "id": first, "result": {} })).await;
+        assert!(events.try_recv().is_err() && replies.try_recv().is_err());
+        assert_eq!(client.inbound.lock().unwrap().len(), 2);
+        route_client_message(
+            &client,
+            json!({ "id": joined, "error": { "code": -32800, "message": "Request cancelled" } }),
+        )
+        .await;
+        let notifications = drain_notifications(&mut events);
+        assert_eq!(notifications.len(), 2);
+        assert_eq!(notifications[0].0, "serverRequest/resolved");
+        assert_eq!(notifications[0].1["requestId"]["id"], "form_1");
+        assert_eq!(notifications[0].1["threadId"], "ses_1");
+        assert_eq!(notifications[1].0, "turn/completed");
+        assert_eq!(notifications[1].1["turn"]["status"], "interrupted");
+        assert!(notifications[1].1["turn"].get("error").is_none());
+        assert_eq!(replies.recv().await.unwrap()["id"], "form_1");
+        assert_eq!(client.inbound.lock().unwrap().len(), 1);
+        route_client_message(
+            &client,
+            json!({ "id": other, "result": { "stopReason": "cancelled" } }),
+        )
+        .await;
+        let notifications = drain_notifications(&mut events);
+        assert_eq!(notifications.len(), 2);
+        assert_eq!(notifications[1].1["turn"]["status"], "interrupted");
+        assert_eq!(replies.recv().await.unwrap()["id"], "form_2");
+        assert!(client.inbound.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn elicitation_requests_round_trip_through_existing_form_ui() {
+        use crate::state::{Action, AppState};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (outbound, mut replies) = mpsc::unbounded_channel();
+        let (events, mut requests) = mpsc::unbounded_channel();
+        let client = OpenCodeClient {
+            outbound: Arc::new(StdMutex::new(Some(outbound))),
+            inbound: Arc::default(),
+            pending: Arc::default(),
+            detached: Arc::default(),
+            active_turns: Arc::default(),
+            next_id: Arc::new(AtomicU64::new(1)),
+            next_turn: Arc::new(AtomicU64::new(1)),
+            events,
+        };
+        for (key, action) in [
+            (KeyEvent::from(KeyCode::Enter), "accept"),
+            (KeyEvent::from(KeyCode::Esc), "cancel"),
+            (
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT),
+                "decline",
+            ),
+        ] {
+            route_message(
+                json!({ "id": "question_1", "method": "elicitation/create", "params": {
+                    "mode": "form", "sessionId": "ses_1", "toolCallId": "call_1",
+                    "message": "Which package manager?", "requestedSchema": {
+                        "type": "object", "properties": { "pm": {
+                            "type": "string", "oneOf": [{ "const": "bun", "title": "Bun" }]
+                        } }, "required": ["pm"]
+                    }
+                } }),
+                &client.pending,
+                &client.detached,
+                &client.active_turns,
+                &Arc::default(),
+                &Arc::default(),
+                &Arc::default(),
+                &client.events,
+                &client.inbound,
+                &client.outbound,
+            )
+            .await;
+            let ServerEvent::Request { id, method, params } = requests.recv().await.unwrap() else {
+                panic!("질문 폼 요청이어야 한다");
+            };
+            assert_eq!(id["kind"], "elicitation");
+            assert_eq!(params["threadId"], "ses_1");
+            assert_eq!(params["itemId"], "call_1");
+            let mut state = AppState::new(
+                "ses_1".into(),
+                "cwd".into(),
+                "시험".into(),
+                Vec::new(),
+                "opencode:test/test",
+                None,
+            );
+            assert!(matches!(
+                state.begin_server_request(id.clone(), &method, &params),
+                Action::None
+            ));
+            let Action::RpcResponse {
+                id: returned_id,
+                result,
+            } = state.handle_key(key)
+            else {
+                panic!("질문 폼 응답이어야 한다");
+            };
+            assert_eq!(returned_id, id);
+            assert_eq!(result["action"], action);
+            if action == "accept" {
+                assert_eq!(result["content"], json!({ "pm": "bun" }));
+            }
+            client.respond(returned_id, result.clone()).unwrap();
+            let reply = replies.recv().await.unwrap();
+            assert_eq!(reply["id"], "question_1");
+            assert_eq!(reply["result"], result);
+            assert!(reply["result"].get("outcome").is_none());
+        }
+        client
+            .respond_error(
+                json!({ "backend": "opencode", "kind": "elicitation", "id": 9 }),
+                -32602,
+                "잘못된 질문",
+            )
+            .unwrap();
+        assert_eq!(
+            replies.recv().await.unwrap(),
+            json!({
+                "jsonrpc": "2.0", "id": 9,
+                "error": { "code": -32602, "message": "잘못된 질문" }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_requests_keep_acp_decisions_after_elicitation_support() {
+        let (outbound, mut replies) = mpsc::unbounded_channel();
+        let (events, mut requests) = mpsc::unbounded_channel();
+        let client = OpenCodeClient {
+            outbound: Arc::new(StdMutex::new(Some(outbound))),
+            inbound: Arc::default(),
+            pending: Arc::default(),
+            detached: Arc::default(),
+            active_turns: Arc::default(),
+            next_id: Arc::new(AtomicU64::new(1)),
+            next_turn: Arc::new(AtomicU64::new(1)),
+            events,
+        };
+        route_message(
+            json!({ "id": 12, "method": "session/request_permission", "params": {
+                "sessionId": "ses_1", "toolCall": { "toolCallId": "call_1", "title": "실행" }
+            } }),
+            &client.pending,
+            &client.detached,
+            &client.active_turns,
+            &Arc::default(),
+            &Arc::default(),
+            &Arc::default(),
+            &client.events,
+            &client.inbound,
+            &client.outbound,
+        )
+        .await;
+        let ServerEvent::Request { id, .. } = requests.recv().await.unwrap() else {
+            panic!("승인 요청이어야 한다");
+        };
+        assert_eq!(id["kind"], "permission");
+        for (result, option) in [
+            (json!({ "decision": "accept" }), "once"),
+            (json!({ "decision": "acceptForSession" }), "always"),
+            (json!({ "decision": "decline" }), "reject"),
+        ] {
+            client.respond(id.clone(), result).unwrap();
+            let reply = replies.recv().await.unwrap();
+            assert_eq!(reply["id"], 12);
+            assert_eq!(
+                reply["result"],
+                json!({
+                    "outcome": { "outcome": "selected", "optionId": option }
+                })
+            );
+        }
+        client
+            .respond(
+                json!({ "backend": "opencode", "id": "legacy" }),
+                json!({ "decision": "accept" }),
+            )
+            .unwrap();
+        assert_eq!(
+            replies.recv().await.unwrap()["result"]["outcome"]["optionId"],
+            "once"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_uses_the_runtime_api_and_reports_failed_writes() {
+        use tokio::io::AsyncReadExt;
+
+        for v2 in [false, true] {
+            for success in [true, false] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let mut api =
+                    ProviderAuthServer::new(listener.local_addr().unwrap().port()).unwrap();
+                if v2 {
+                    api.password = Some("test-password".to_owned());
+                }
+                let server = tokio::spawn(async move {
+                    for health in [true, false] {
+                        let (stream, _) = listener.accept().await.unwrap();
+                        let mut stream = BufReader::new(stream);
+                        let mut line = String::new();
+                        stream.read_line(&mut line).await.unwrap();
+                        let path = if health {
+                            if v2 { "/api/info" } else { "/global/health" }
+                        } else if v2 {
+                            "/api/session/ses_test"
+                        } else {
+                            "/session/ses_test"
+                        };
+                        let method = if health { "GET" } else { "PATCH" };
+                        assert_eq!(line.trim(), format!("{method} {path} HTTP/1.1"));
+                        let mut length = 0;
+                        let mut authenticated = false;
+                        loop {
+                            line.clear();
+                            stream.read_line(&mut line).await.unwrap();
+                            if line == "\r\n" || line.is_empty() {
+                                break;
+                            }
+                            let lower = line.to_ascii_lowercase();
+                            if let Some(value) = lower.strip_prefix("content-length:") {
+                                length = value.trim().parse::<usize>().unwrap();
+                            }
+                            authenticated |= lower.starts_with("authorization: basic ");
+                        }
+                        assert_eq!(authenticated, v2);
+                        let mut body = vec![0; length];
+                        stream.read_exact(&mut body).await.unwrap();
+                        if !health {
+                            assert_eq!(
+                                serde_json::from_slice::<Value>(&body).unwrap(),
+                                json!({ "title": "새 이름" })
+                            );
+                        }
+                        let response = if health || success {
+                            "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_owned()
+                        } else {
+                            let body = r#"{"message":"rename denied"}"#;
+                            format!(
+                                "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                        };
+                        stream
+                            .get_mut()
+                            .write_all(response.as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                });
+                let result = api.rename_session("ses_test", "새 이름").await;
+                server.await.unwrap();
+                if success {
+                    assert!(result.unwrap().is_null());
+                } else {
+                    assert!(result.unwrap_err().to_string().contains("rename denied"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_updates_report_start_success_and_failure() {
+        let tools: ToolMap = Arc::default();
+        let streams: StreamMap = Arc::default();
+        let (events, mut rx) = mpsc::unbounded_channel();
+        for native in [false, true] {
+            for (status, expected) in [
+                ("started", "rawResponseItem/completed"),
+                ("completed", "thread/compacted"),
+                ("failed", "thread/compaction/failed"),
+            ] {
+                let marker = json!({ "status": status, "error": { "message": "provider failed" } });
+                let update = if native {
+                    let mut update = marker;
+                    update["sessionUpdate"] = json!("compaction_update");
+                    update
+                } else {
+                    json!({ "sessionUpdate": "session_info_update", "_meta": { "opencode/compaction": marker } })
+                };
+                route_session_update(
+                    json!({ "sessionId": "ses_test", "update": update }),
+                    &tools,
+                    &streams,
+                    &events,
+                )
+                .await;
+                let notices = drain_notifications(&mut rx);
+                assert_eq!(notices.len(), 1);
+                assert_eq!(notices[0].0, expected);
+                assert_eq!(notices[0].1["threadId"], "ses_test");
+                if status == "failed" {
+                    assert_eq!(notices[0].1["error"]["message"], "provider failed");
+                }
+            }
+        }
+        route_session_update(
+            json!({ "sessionId": "ses_test", "update": {
+            "sessionUpdate": "session_info_update", "_meta": { "opencode/retry": null }
+        } }),
+            &tools,
+            &streams,
+            &events,
+        )
+        .await;
+        assert!(drain_notifications(&mut rx).is_empty());
+    }
+
     #[tokio::test]
     async fn completed_turn_status_is_bounded_and_never_marks_a_new_prompt_idle() {
         let (outbound, mut requests) = mpsc::unbounded_channel();
         let client = OpenCodeClient {
             outbound: Arc::new(StdMutex::new(Some(outbound))),
+            inbound: Arc::default(),
             pending: Arc::default(),
             detached: Arc::default(),
             active_turns: Arc::default(),
@@ -2828,6 +3763,8 @@ mod tests {
                 &Arc::default(),
                 &Arc::default(),
                 &client.events,
+                &client.inbound,
+                &client.outbound,
             )
             .await;
             ids.push(turn);
@@ -2977,6 +3914,7 @@ mod tests {
         let (outbound, _inbox) = mpsc::unbounded_channel();
         let client = OpenCodeClient {
             outbound: Arc::new(StdMutex::new(Some(outbound))),
+            inbound: Arc::default(),
             pending: Arc::new(Mutex::new(HashMap::new())),
             detached: Arc::new(Mutex::new(HashMap::new())),
             active_turns: Arc::default(),
@@ -3022,6 +3960,23 @@ mod tests {
         assert_eq!(skills[1]["path"], "opencode://skill/built-in");
         assert_eq!(skills[1]["scope"], "system");
         assert_eq!(skills[1]["enabled"], true);
+    }
+
+    #[test]
+    fn open_code_2_skills_use_native_ids_instead_of_display_names() {
+        let catalog = normalize_skill_catalog(json!({ "data": [
+            { "id": "project-review", "name": "Review", "path": "C:/project/SKILL.md" },
+            { "id": "user-review", "name": "Review", "path": "C:/user/SKILL.md" }
+        ] }));
+        let skills = catalog["data"][0]["skills"].as_array().unwrap();
+        assert_eq!(skills[0]["name"], "project-review");
+        assert_eq!(skills[1]["name"], "user-review");
+        let instruction = explicit_skill_instruction(&[json!({
+            "type": "skill", "name": skills[1]["name"], "path": skills[1]["path"]
+        })]).unwrap();
+        assert!(instruction.contains("user-review"));
+        assert!(!instruction.contains("project-review"));
+        assert!(!instruction.contains("Review"));
     }
 
     #[test]
@@ -3507,6 +4462,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ServerEvent>();
         let client = OpenCodeClient {
             outbound: Arc::new(StdMutex::new(Some(outbound_tx))),
+            inbound: Arc::default(),
             pending: Arc::new(Mutex::new(HashMap::new())),
             detached: Arc::new(Mutex::new(HashMap::new())),
             active_turns: Arc::default(),
@@ -3571,6 +4527,8 @@ mod tests {
             &tools,
             &streams,
             &event_tx,
+            &client.inbound,
+            &client.outbound,
         )
         .await;
         assert!(event_rx.try_recv().is_err());
@@ -3590,6 +4548,8 @@ mod tests {
             &tools,
             &streams,
             &event_tx,
+            &client.inbound,
+            &client.outbound,
         )
         .await;
         let completed = event_rx.recv().await.expect("turn/completed");
@@ -3638,6 +4598,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ServerEvent>();
         let client = OpenCodeClient {
             outbound: Arc::new(StdMutex::new(Some(outbound_tx))),
+            inbound: Arc::default(),
             pending: Arc::new(Mutex::new(HashMap::new())),
             detached: Arc::new(Mutex::new(HashMap::new())),
             active_turns: Arc::default(),
@@ -3658,6 +4619,8 @@ mod tests {
                 &tools,
                 &streams,
                 &event_tx,
+                &client.inbound,
+                &client.outbound,
             )
         };
 
@@ -3893,6 +4856,8 @@ mod tests {
 
     #[tokio::test]
     async fn open_code_2_subagent_rows_follow_child_session_updates() {
+        let route_inbound: InboundMap = Arc::default();
+        let route_outbound: Outbound = Arc::default();
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let detached: DetachedMap = Arc::new(Mutex::new(HashMap::new()));
         let active: ActiveMap = Arc::default();
@@ -3903,6 +4868,8 @@ mod tests {
         let route = |message: Value| {
             route_message(
                 message, &pending, &detached, &active, &loading, &tools, &streams, &event_tx,
+                &route_inbound,
+                &route_outbound,
             )
         };
         let update = |update: Value| {
@@ -3956,7 +4923,7 @@ mod tests {
         let kept = rows(&drain_notifications(&mut event_rx)).expect("백그라운드 행 유지");
         assert_eq!(kept[0]["taskId"], "ses_child");
 
-        // 자식의 본문은 부모 답변으로 나오지 않고, 끝나면 행만 지운다.
+        // 자식의 본문은 부모 답변 대신 부모 도구 행의 기록으로만 보낸다.
         let child = |event: Value| {
             let mut params = json!({
                 "rootSessionId": "ses_1",
@@ -3979,10 +4946,263 @@ mod tests {
             }
         })))
         .await;
-        assert!(drain_notifications(&mut event_rx).is_empty());
+        let history = drain_notifications(&mut event_rx);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].0, "turn/subagent/history");
+        assert_eq!(history[0].1["threadId"], "ses_1");
+        assert_eq!(history[0].1["id"], "call_1");
+        assert_eq!(history[0].1["turns"][0]["items"][0]["text"], "자식 답변");
+
+        route(child(json!({
+            "type": "update",
+            "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "ses_child:tool_1",
+                "kind": "execute",
+                "title": "shell",
+                "rawInput": { "command": "cargo check" }
+            }
+        })))
+        .await;
+        drain_notifications(&mut event_rx);
+        route(child(json!({
+            "type": "update",
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "ses_child:tool_1",
+                "status": "completed",
+                "content": [{ "type": "content", "content": { "type": "text", "text": "검사 통과" } }]
+            }
+        }))).await;
+        let history = drain_notifications(&mut event_rx);
+        let items = history[0].1["turns"][0]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["text"], "자식 답변");
+        assert_eq!(items[1]["command"], "cargo check");
+        assert_eq!(items[1]["aggregatedOutput"], "검사 통과");
+        assert_eq!(items[1]["status"], "completed");
+        route(update(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "msg_child_next",
+            "_meta": { "opencode/child-session": { "id": "ses_child", "parentID": "ses_1", "depth": 1 } },
+            "content": { "type": "text", "text": "메타 경로 답변" }
+        }))).await;
+        let history = drain_notifications(&mut event_rx);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].0, "turn/subagent/history");
+        assert_eq!(
+            history[0].1["turns"][0]["items"][2]["text"],
+            "메타 경로 답변"
+        );
+        route(child(json!({
+            "type": "update",
+            "update": { "sessionUpdate": "tool_call", "toolCallId": "ses_child:pending", "kind": "execute", "title": "shell" }
+        }))).await;
+        drain_notifications(&mut event_rx);
         route(child(json!({ "type": "status", "status": "completed" }))).await;
         let ended = rows(&drain_notifications(&mut event_rx)).expect("자식 종료 시 행 제거");
         assert_eq!(ended.as_array().map(Vec::len), Some(0));
+        let streams = streams.lock().await;
+        assert!(!streams.contains_key("ses_child"));
+        assert!(streams["ses_1"].child_tool_ids.is_empty());
+        assert!(!tools.lock().await.contains_key("ses_child:pending"));
+    }
+
+    #[tokio::test]
+    async fn child_history_waits_for_a_confirmed_parent_tool_session_id() {
+        let tools: ToolMap = Arc::default();
+        let streams: StreamMap = Arc::default();
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        route_child_update(
+            "root",
+            "child",
+            Some(&json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "연결 전 기록" }
+            })),
+            true,
+            &tools,
+            &streams,
+            &events,
+        )
+        .await;
+        assert!(drain_notifications(&mut receiver).is_empty());
+        link_child_session("root", &json!({
+            "name": "task", "toolCallId": "v1", "rawOutput": { "metadata": { "sessionId": "child" } }
+        }), &streams, &events).await;
+        assert!(drain_notifications(&mut receiver).is_empty());
+        link_child_session("root", &json!({
+            "name": "subagent", "toolCallId": "foreground", "rawOutput": { "metadata": { "sessionID": "child" } }
+        }), &streams, &events).await;
+        let history = drain_notifications(&mut receiver);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].1["id"], "foreground");
+        assert_eq!(history[0].1["turns"][0]["items"][0]["text"], "연결 전 기록");
+        let streams = streams.lock().await;
+        assert!(!streams.contains_key("child"));
+        assert!(streams["root"].child_tool_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_child_history_has_count_and_size_limits_before_parent_link() {
+        let tools: ToolMap = Arc::default();
+        let streams: StreamMap = Arc::default();
+        let (events, _receiver) = mpsc::unbounded_channel();
+        for index in 0..COMPLETED_CHILD_LIMIT + 2 {
+            route_child_update(
+                "root",
+                &format!("child_{index}"),
+                Some(&json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "연결 대기" }
+                })),
+                true,
+                &tools,
+                &streams,
+                &events,
+            )
+            .await;
+        }
+        {
+            let streams = streams.lock().await;
+            assert_eq!(streams.len(), COMPLETED_CHILD_LIMIT);
+            assert!(!streams.contains_key("child_0"));
+            assert!(streams.contains_key(&format!("child_{}", COMPLETED_CHILD_LIMIT + 1)));
+        }
+        route_child_update(
+            "root",
+            "oversized",
+            Some(&json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "x".repeat(COMPLETED_CHILD_BYTES + 1) }
+            })),
+            true,
+            &tools,
+            &streams,
+            &events,
+        )
+        .await;
+        assert!(streams.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_parent_metadata_releases_child_without_a_terminal_notification() {
+        let tools: ToolMap = Arc::default();
+        let streams: StreamMap = Arc::default();
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        route_child_update("root", "child", Some(&json!({
+            "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "종료 알림 없는 기록" }
+        })), false, &tools, &streams, &events).await;
+        assert!(
+            link_child_session(
+                "root",
+                &json!({
+                    "name": "subagent", "toolCallId": "parent",
+                    "rawOutput": { "metadata": { "sessionID": "child", "status": "completed" } }
+                }),
+                &streams,
+                &events
+            )
+            .await
+        );
+        assert_eq!(
+            drain_notifications(&mut receiver)[0].1["turns"][0]["items"][0]["text"],
+            "종료 알림 없는 기록"
+        );
+        let streams = streams.lock().await;
+        assert!(!streams.contains_key("child"));
+        assert!(streams["root"].child_tool_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reused_child_history_keeps_parent_and_current_tool_separate() {
+        let tools: ToolMap = Arc::default();
+        let streams: StreamMap = Arc::default();
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let link = |child: &str, tool: &str| {
+            json!({
+                "name": "subagent", "toolCallId": tool, "rawInput": { "sessionID": child }
+            })
+        };
+        link_child_session("root_a", &link("child_a", "old"), &streams, &events).await;
+        route_child_update("root_a", "child_a", Some(&json!({
+            "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "지난 실행" }
+        })), true, &tools, &streams, &events).await;
+        let history = drain_notifications(&mut receiver);
+        assert_eq!(history[0].1["id"], "old");
+        assert!(!streams.lock().await.contains_key("child_a"));
+        link_child_session("root_a", &link("child_a", "new"), &streams, &events).await;
+        route_child_update("root_a", "child_a", Some(&json!({
+            "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "새 실행" }
+        })), false, &tools, &streams, &events).await;
+        let history = drain_notifications(&mut receiver);
+        assert_eq!(history[0].1["id"], "new");
+        assert_eq!(
+            history[0].1["turns"][0]["items"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(history[0].1["turns"][0]["items"][0]["text"], "새 실행");
+
+        route_child_update("root_b", "child_b", Some(&json!({
+            "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "다른 부모" }
+        })), true, &tools, &streams, &events).await;
+        assert!(!link_child_session("root_a", &json!({
+            "name": "subagent", "toolCallId": "wrong", "rawOutput": { "metadata": { "sessionID": "child_b" } }
+        }), &streams, &events).await);
+        assert!(drain_notifications(&mut receiver).is_empty());
+        assert!(link_child_session("root_b", &json!({
+            "name": "subagent", "toolCallId": "b", "rawOutput": { "metadata": { "sessionID": "child_b" } }
+        }), &streams, &events).await);
+        let history = drain_notifications(&mut receiver);
+        assert_eq!(history[0].1["threadId"], "root_b");
+        assert_eq!(history[0].1["id"], "b");
+        let streams = streams.lock().await;
+        assert!(!streams.contains_key("child_b"));
+        assert_eq!(
+            streams["root_a"]
+                .child_tool_ids
+                .get("child_a")
+                .map(String::as_str),
+            Some("new")
+        );
+        assert!(streams["root_b"].child_tool_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn child_ending_before_parent_result_does_not_leave_a_background_row() {
+        for resumed in [false, true] {
+            let tools: ToolMap = Arc::default();
+            let streams: StreamMap = Arc::default();
+            let (events, mut receiver) = mpsc::unbounded_channel();
+            route_session_update(json!({
+            "sessionId": "root", "update": {
+                "sessionUpdate": "tool_call", "toolCallId": "parent", "name": "subagent", "title": "subagent",
+                "rawInput": if resumed { json!({ "sessionID": "child" }) } else { json!({}) }
+            }
+        }), &tools, &streams, &events).await;
+            drain_notifications(&mut receiver);
+            route_child_update("root", "child", Some(&json!({
+            "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "먼저 종료" }
+        })), true, &tools, &streams, &events).await;
+            route_session_update(json!({
+            "sessionId": "root", "update": {
+                "sessionUpdate": "tool_call_update", "toolCallId": "parent", "status": "completed",
+                "rawOutput": { "metadata": { "sessionID": "child", "status": "running" } }
+            }
+        }), &tools, &streams, &events).await;
+            let notifications = drain_notifications(&mut receiver);
+            assert!(
+                notifications
+                    .iter()
+                    .any(|(method, params)| method == "turn/subagent/history"
+                        && params["id"] == "parent")
+            );
+            let streams = streams.lock().await;
+            assert!(!streams.contains_key("child"));
+            assert!(streams["root"].subagents.is_empty());
+            assert!(streams["root"].child_tool_ids.is_empty());
+            assert!(tools.lock().await.is_empty());
+        }
     }
 
     #[test]
@@ -4031,6 +5251,8 @@ mod tests {
 
     #[tokio::test]
     async fn session_updates_during_load_fill_the_history_buffer() {
+        let route_inbound: InboundMap = Arc::default();
+        let route_outbound: Outbound = Arc::default();
         let tools: ToolMap = Arc::new(Mutex::new(HashMap::new()));
         let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
         let loading: LoadingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -4062,6 +5284,8 @@ mod tests {
             &tools,
             &streams,
             &event_tx,
+            &route_inbound,
+            &route_outbound,
         )
         .await;
 
@@ -4075,6 +5299,8 @@ mod tests {
 
     #[tokio::test]
     async fn usage_updates_during_load_restore_context_immediately() {
+        let route_inbound: InboundMap = Arc::default();
+        let route_outbound: Outbound = Arc::default();
         let tools: ToolMap = Arc::new(Mutex::new(HashMap::new()));
         let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
         let loading: LoadingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -4102,6 +5328,8 @@ mod tests {
             &tools,
             &streams,
             &event_tx,
+            &route_inbound,
+            &route_outbound,
         )
         .await;
 
@@ -4152,6 +5380,8 @@ mod tests {
 
     #[tokio::test]
     async fn plan_updates_during_load_are_buffered_instead_of_discarded() {
+        let route_inbound: InboundMap = Arc::default();
+        let route_outbound: Outbound = Arc::default();
         let loading: LoadingMap = Arc::new(Mutex::new(HashMap::new()));
         loading
             .lock()
@@ -4171,6 +5401,8 @@ mod tests {
             &Arc::default(),
             &Arc::default(),
             &event_tx,
+            &route_inbound,
+            &route_outbound,
         )
         .await;
         assert!(event_rx.try_recv().is_err());

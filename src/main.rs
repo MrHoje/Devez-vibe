@@ -4456,8 +4456,31 @@ async fn run_action(
             }
         }
         Action::ShowSkills => {
-            let provider = SkillProvider::from_model(state.selected_model_name());
-            open_skills(server, state, renderer, provider, None).await?;
+            if open_code::is_open_code_model(state.selected_model_name()) {
+                open_integration_loading(state, renderer, "Skills")?;
+                let cwd = PathBuf::from(&state.cwd);
+                let result = match server.open_code_provider_api() {
+                    Some(api) => await_integration_panel(state, renderer, api.skills(&cwd)).await?,
+                    None => Err(anyhow::anyhow!(tr(
+                        "OpenCode의 Skill 조회 연결이 없습니다.",
+                        "OpenCode has no connection for looking up skills.",
+                    ))),
+                };
+                match result {
+                    Ok(response) => state.open_skills_picker(None, &response, None),
+                    Err(error) => {
+                        state.close_integration_loading();
+                        state.push_notice(
+                            BlockKind::Error,
+                            "Skill lookup failed",
+                            error.to_string(),
+                        );
+                    }
+                }
+            } else {
+                let provider = SkillProvider::from_model(state.selected_model_name());
+                open_skills(server, state, renderer, provider, None).await?;
+            }
         }
         Action::OpenSkills { provider, notice } => {
             open_skills(server, state, renderer, provider, notice).await?;
@@ -4697,13 +4720,19 @@ async fn activate_open_code(
                 // 전환 직후 헤더가 이전 런타임의 계정·플랜을 들고 있지 않게 한다.
                 refresh_account(server, state).await;
             }
-            Err(error) => state.push_notice(
-                BlockKind::Error,
-                "Failed to load OpenCode models",
-                error.to_string(),
-            ),
+            Err(error) => {
+                state.clear_pending_provider_model();
+                state.push_notice(
+                    BlockKind::Error,
+                    "Failed to load OpenCode models",
+                    error.to_string(),
+                );
+            }
         },
-        Err(error) => state.push_notice(BlockKind::Error, "OpenCode unavailable", error.to_string()),
+        Err(error) => {
+            state.clear_pending_provider_model();
+            state.push_notice(BlockKind::Error, "OpenCode unavailable", error.to_string());
+        }
     }
     state.set_provider_changing(None);
     Ok(())
@@ -4811,8 +4840,9 @@ async fn refresh_new_thread_catalogs(
 ) -> Result<Vec<String>> {
     let model = state.selected_model_name().to_owned();
     if open_code::is_open_code_model(&model) {
+        let cwd = PathBuf::from(&state.cwd);
         return Ok(match server.open_code_provider_api() {
-            Some(api) => match await_integration_panel(state, renderer, api.skills()).await? {
+            Some(api) => match await_integration_panel(state, renderer, api.skills(&cwd)).await? {
                 Ok(response) => {
                     state.update_skills(&response);
                     Vec::new()
@@ -5852,6 +5882,7 @@ async fn refresh_provider_models(
             state.activate_first_opencode_model();
         }
         Err(error) => {
+            state.clear_pending_provider_model();
             state.provider_connected(provider_name);
             state.push_notice(BlockKind::Warning, "Model refresh failed", error.to_string());
         }
@@ -6287,7 +6318,9 @@ async fn start_skills_refresh(
         let result = if let Some(error) = startup_error {
             Err(error)
         } else if let Some(api) = open_code_api {
-            api.skills().await.map_err(|error| error.to_string())
+            api.skills(Path::new(&cwd))
+                .await
+                .map_err(|error| error.to_string())
         } else if let Some(client) = client {
             client
                 .request(
