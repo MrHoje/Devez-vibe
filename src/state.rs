@@ -663,6 +663,7 @@ const SLASH_COMMANDS: [SlashCommand; 35] = [
 /// Whether `/name` is one of Devez Vibe's own commands, listed or alias.
 fn is_slash_command_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("reload-skills")
+        || name.eq_ignore_ascii_case("p")
         || SLASH_COMMANDS
             .iter()
             .any(|command| command.name[1..].eq_ignore_ascii_case(name))
@@ -11092,7 +11093,11 @@ impl AppState {
     }
 
     pub(crate) fn run_slash_command(&mut self, command: &str) -> Action {
-        let parts = command.split_whitespace().collect::<Vec<_>>();
+        let mut parts = command.split_whitespace().collect::<Vec<_>>();
+        // `/p NAME` is an unlisted shorthand for `/provider NAME`; nothing else.
+        if parts.len() == 2 && parts[0] == "/p" {
+            parts[0] = "/provider";
+        }
         if self.busy
             && matches!(
                 parts.first().copied(),
@@ -34812,6 +34817,9 @@ mod tests {
         state.run_slash_command("/model 3");
         assert_eq!(state.selected_model_name(), "claude:haiku");
 
+        state.run_slash_command("/p");
+        assert_eq!(state.committed.last().unwrap().title, "Unknown command");
+        assert!(matches!(state.run_slash_command("/p codex"), Action::ActivateCodex));
         assert!(matches!(
             state.run_slash_command("/provider codex"),
             Action::ActivateCodex
