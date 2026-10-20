@@ -4910,10 +4910,16 @@ async function dispatch(method, params = {}) {
   // re-stamps session metadata, so a rename from here survives a live session.
   if (method === "session/rename") {
     const id = liveSessionId(params.sessionId);
+    const session = sessions.get(id);
+    if (!params.unnamedOnly && session) delete session.inheritedTitle;
     const dir = await readableCwd(id, params.cwd);
-    // An automatic title never replaces a name given in the meantime.
-    if (params.unnamedOnly && (await getSessionInfo(id, { dir }))?.customTitle) return {};
+    // /clear가 복사한 제목만 교체한다. 그 뒤 직접 지정한 이름은 그대로 둔다.
+    if (params.unnamedOnly) {
+      const title = (await getSessionInfo(id, { dir }))?.customTitle;
+      if (title && title !== session?.inheritedTitle) return {};
+    }
     await renameSession(id, String(params.name ?? ""), { dir });
+    if (session) delete session.inheritedTitle;
     return {};
   }
   // dvz titles a new session with one Haiku reply.
@@ -4968,6 +4974,8 @@ async function dispatch(method, params = {}) {
       || session.pendingPrompts?.length || session.queue?.values?.length) {
       return { released: false, busy: true };
     }
+    const inheritedTitle = getSessionInfo(session.id, { dir: session.cwd })
+      .then((info) => info?.customTitle).catch(() => undefined);
     let timer;
     const id = await new Promise((resolve) => {
       session.clearWaiter = resolve;
@@ -4980,6 +4988,7 @@ async function dispatch(method, params = {}) {
       });
     });
     clearTimeout(timer);
+    if (id) session.inheritedTitle = await inheritedTitle;
     session.clearWaiter = null;
     session.clearPending = false;
     // CLI가 /clear에 답하지 않아도 남은 작업이 없으면 연결을 닫고 새 대화를 연다.
@@ -5526,29 +5535,63 @@ async function runSelfTest() {
     await resumedConsumer;
     // 백그라운드 작업만 남은 세션은 같은 프로세스에서 새 대화로 넘어가 작업을 이어받는다.
     const { session: clearSession } = await createSession({ cwd: process.cwd() });
-    const clearPreviousId = clearSession.id;
     const clearConsumer = clearSession.consumer;
+    const titleProjectDir = join(releaseConfigDir, "projects", process.cwd().replace(/[^a-zA-Z0-9]/g, "-"));
+    await mkdir(titleProjectDir, { recursive: true });
+    const titleTranscript = (id, title, prompt) => [
+      { type: "custom-title", sessionId: id, customTitle: title },
+      { type: "user", uuid: randomUUID(), parentUuid: null, sessionId: id, cwd: process.cwd(),
+        message: { role: "user", content: prompt } },
+    ].map((entry) => JSON.stringify(entry)).join("\n") + "\n";
+    await writeFile(join(titleProjectDir, `${clearSession.id}.jsonl`),
+      titleTranscript(clearSession.id, "앞 대화 제목", "앞 대화 질문"));
     clearSession.subagents.set("clear-child", { id: "clear-child", background: true, taskId: "clear-task" });
-    const clearing = dispatch("session/clear", { sessionId: clearPreviousId });
-    await new Promise((resolve) => setImmediate(resolve));
-    if (clearSession.queue.values.at(-1)?.message?.content !== "/clear") {
-      throw new Error("Claude clear did not send /clear to the live query");
+    for (const mode of ["automatic", "manual-same", "external", "automatic-again"]) {
+      const previousId = clearSession.id;
+      const previousPath = join(titleProjectDir, `${previousId}.jsonl`);
+      const previousTranscript = await readFile(previousPath, "utf8");
+      const previousTitle = (await getSessionInfo(previousId, { dir: process.cwd() }))?.customTitle;
+      const nextId = randomUUID();
+      const nextPrompt = `새 질문 ${mode}`;
+      // CLI의 /clear가 새 전사에 이전 customTitle을 복사하는 조건을 재현한다.
+      await writeFile(join(titleProjectDir, `${nextId}.jsonl`), titleTranscript(nextId, previousTitle, nextPrompt));
+      const clearing = dispatch("session/clear", { sessionId: previousId });
+      await new Promise((resolve) => setImmediate(resolve));
+      if (clearSession.queue.values.at(-1)?.message?.content !== "/clear") {
+        throw new Error("Claude clear did not send /clear to the live query");
+      }
+      clearSession.queue.values.length = 0;
+      clearSession.query.events.push({ type: "conversation_reset", session_id: previousId, new_conversation_id: randomUUID() });
+      clearSession.query.events.push({ type: "system", subtype: "init", session_id: nextId });
+      const cleared = await clearing;
+      const clearRows = releaseNotices.filter((notice) => notice.method === "turn/subagents/updated");
+      if (cleared.id !== nextId || lookupSession(nextId) !== clearSession
+        || lookupSession(previousId) || clearSession.query.closeCalls
+        || !clearRows.some((notice) => notice.params.threadId === nextId
+          && notice.params.subagents.some((row) => row.id === "clear-child"))) {
+        throw new Error("Claude in-process clear did not move the live work to a new conversation");
+      }
+      const autoTitle = `새 대화 제목 ${mode}`;
+      let expectedTitle = autoTitle;
+      if (mode === "manual-same") {
+        expectedTitle = previousTitle;
+        await dispatch("session/rename", { sessionId: nextId, cwd: process.cwd(), name: expectedTitle });
+      } else if (mode === "external") {
+        expectedTitle = "다른 클라이언트가 지정한 제목";
+        await renameSession(nextId, expectedTitle, { dir: process.cwd() });
+      }
+      await dispatch("session/rename", { sessionId: nextId, cwd: process.cwd(), name: autoTitle, unnamedOnly: true });
+      const listed = await claudeSessionList({ cwd: process.cwd() });
+      const prompt = transcriptPreview(await sessionMessages(nextId, process.cwd()));
+      if (listed.find((row) => row.id === visibleSession(nextId))?.name !== expectedTitle
+        || prompt !== nextPrompt || await readFile(previousPath, "utf8") !== previousTranscript) {
+        throw new Error(`Claude clear title self-test failed: ${mode}`);
+      }
+      releaseNotices.splice(0, releaseNotices.length,
+        ...releaseNotices.filter((notice) => !clearRows.includes(notice)));
     }
-    clearSession.queue.values.length = 0;
-    clearSession.query.events.push({ type: "conversation_reset", session_id: clearPreviousId, new_conversation_id: randomUUID() });
-    clearSession.query.events.push({ type: "system", subtype: "init", session_id: "cleared-session" });
-    const cleared = await clearing;
-    const clearRows = releaseNotices.filter((notice) => notice.method === "turn/subagents/updated");
-    if (cleared.id !== "cleared-session" || lookupSession("cleared-session") !== clearSession
-      || lookupSession(clearPreviousId) || clearSession.query.closeCalls
-      || !clearRows.some((notice) => notice.params.threadId === "cleared-session"
-        && notice.params.subagents.some((row) => row.id === "clear-child"))) {
-      throw new Error("Claude in-process clear did not move the live work to a new conversation");
-    }
-    releaseNotices.splice(0, releaseNotices.length,
-      ...releaseNotices.filter((notice) => !clearRows.includes(notice)));
     clearSession.subagents.clear();
-    await dispatch("session/release", { sessionId: "cleared-session" });
+    await dispatch("session/release", { sessionId: clearSession.id });
     await clearConsumer;
     const { session: mainSession } = await createSession({ cwd: process.cwd() });
     const mainQuery = mainSession.query;
