@@ -5,6 +5,7 @@ mod backend;
 mod child_process;
 mod claude;
 mod completion;
+mod cursor_recovery;
 mod doctor;
 mod devezcode;
 mod editor;

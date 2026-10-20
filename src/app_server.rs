@@ -137,6 +137,7 @@ pub struct AppServer {
     child: Child,
     /// app-server가 띄운 MCP 서버까지 함께 끝낸다.
     _job: Option<crate::child_process::BackendJob>,
+    _cursor_restore: Option<crate::cursor_recovery::RestoreOnDrop>,
     client: AppServerClient,
     events: mpsc::UnboundedReceiver<ServerEvent>,
     permission_events: mpsc::UnboundedSender<ServerEvent>,
@@ -154,6 +155,10 @@ impl AppServer {
             .as_deref()
             .and_then(|path| std::fs::read_to_string(path).ok())
             .and_then(|config| computer_use_pipe_config(&config));
+        let cursor_restore = computer_use_pipe.as_ref().map(|_| crate::cursor_recovery::RestoreOnDrop);
+        if cursor_restore.is_some() {
+            let _ = crate::cursor_recovery::restore_if_idle();
+        }
         let resolved_codex = resolve_command(codex_path);
         let mut command = codex_command(&resolved_codex);
         apply_originator_override(&mut command);
@@ -214,6 +219,7 @@ impl AppServer {
         let reader_pending = Arc::clone(&pending);
         let reader_events = event_tx.clone();
         let reader_stderr = Arc::clone(&stderr_tail);
+        let restore_cursor = cursor_restore.is_some();
         let reader_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             loop {
@@ -224,6 +230,12 @@ impl AppServer {
                         }
                         match serde_json::from_str::<Value>(&line) {
                             Ok(message) => {
+                                if matches!(
+                                    message.get("method").and_then(Value::as_str),
+                                    Some("turn/completed" | "turn/failed" | "turn/aborted")
+                                ) {
+                                    restore_computer_cursor(reader_events.clone(), restore_cursor);
+                                }
                                 route_message(message, &reader_pending, &reader_events).await;
                             }
                             Err(error) => {
@@ -245,6 +257,7 @@ impl AppServer {
                 }
             }
 
+            restore_computer_cursor(reader_events.clone(), restore_cursor);
             let tail = reader_stderr.lock().await;
             let closed = tr("app-server 연결이 종료되었습니다.", "The app-server connection closed.");
             let detail = if tail.is_empty() {
@@ -282,6 +295,7 @@ impl AppServer {
         Ok(Self {
             child,
             _job: job,
+            _cursor_restore: cursor_restore,
             client,
             events,
             permission_events,
@@ -305,7 +319,11 @@ impl AppServer {
                 refresh_computer_use(&self.client, path, &self.computer_use_pipe).await?;
             }
             let thread = params.get("threadId").cloned();
-            let (response, profile, lowered) = request_with_permissions(&self.client, method, params).await?;
+            let response = request_with_permissions(&self.client, method, params).await;
+            if response.is_err() {
+                restore_computer_cursor(self.permission_events.clone(), self._cursor_restore.is_some());
+            }
+            let (response, profile, lowered) = response?;
             if let Some(thread) = response.pointer("/thread/id").cloned().or(thread) {
                 let _ = self.permission_events.send(ServerEvent::Notification {
                     method: "devez/permissions/updated".to_owned(),
@@ -320,7 +338,11 @@ impl AppServer {
         } else {
             None
         };
-        let response = self.client.request(method, params).await?;
+        let response = self.client.request(method, params).await;
+        if method == "turn/interrupt" {
+            restore_computer_cursor(self.permission_events.clone(), self._cursor_restore.is_some());
+        }
+        let response = response?;
         if let Some(config) = reloaded_config {
             *self.computer_use_pipe.lock().await = computer_use_pipe_config(&config);
         }
@@ -361,7 +383,25 @@ impl AppServer {
 
         self.reader_task.abort();
         self.stderr_task.abort();
+        drop(self._job.take());
+        if self._cursor_restore.is_some() {
+            let _ = crate::cursor_recovery::restore_after_turn().await;
+        }
     }
+}
+
+fn restore_computer_cursor(events: mpsc::UnboundedSender<ServerEvent>, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    tokio::spawn(async move {
+        if let Err(error) = crate::cursor_recovery::restore_after_turn().await {
+            let _ = events.send(ServerEvent::ProtocolWarning(tr(
+                format!("Windows 마우스 커서 자동 복원 실패: {error}"),
+                format!("Couldn't restore the Windows mouse cursor: {error}"),
+            )));
+        }
+    });
 }
 
 /// The desktop supplies this pipe address through the Codex configuration.
