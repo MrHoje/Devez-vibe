@@ -26,6 +26,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 textwrap = "0.16"
+toml = "0.8"
 tokio = { version = "1.48", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tree-sitter = "0.26"
 tree-sitter-bash = "0.25"
@@ -49,6 +50,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_Media",
     "Win32_Security_Credentials",
     "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }

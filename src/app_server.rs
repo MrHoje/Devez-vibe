@@ -6,7 +6,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, mpsc, oneshot, watch},
     task::JoinHandle,
     time::timeout,
 };
@@ -30,6 +30,8 @@ type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
 /// 세션 시작이나 큰 롤아웃 복원도 이보다 오래 걸리지는 않으므로, 넘기면
 /// 멈춘 것으로 보고 사용자에게 알린다.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+// A stop request must not hold Escape hostage to the normal 10-minute RPC budget.
+const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The cloneable half of the app-server connection. Background work may issue
 /// requests through it while [`AppServer`] remains the sole reader of events.
@@ -38,10 +40,13 @@ pub struct AppServerClient {
     outbound: Arc<StdMutex<Option<mpsc::UnboundedSender<Value>>>>,
     pending: PendingMap,
     next_id: Arc<AtomicU64>,
+    closed: watch::Sender<bool>,
 }
 
 impl AppServerClient {
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        let mut closed = self.closed.subscribe();
+        if *closed.borrow() { bail!("The app-server connection has already closed."); }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (response_tx, response_rx) = oneshot::channel();
         self.pending.lock().await.insert(id, response_tx);
@@ -57,7 +62,16 @@ impl AppServerClient {
             return Err(error);
         }
 
-        match timeout(REQUEST_TIMEOUT, response_rx).await {
+        let deadline = if method == "turn/interrupt" { INTERRUPT_TIMEOUT } else { REQUEST_TIMEOUT };
+        let response = tokio::select! {
+            biased;
+            _ = closed.changed() => {
+                self.pending.lock().await.remove(&id);
+                bail!(tr("app-server 연결이 종료되었습니다.", "The app-server connection closed."));
+            }
+            response = timeout(deadline, response_rx) => response,
+        };
+        match response {
             Ok(Ok(Ok(result))) => Ok(result),
             Ok(Ok(Err(error))) => bail!("{method}: {error}"),
             Ok(Err(_)) => bail!(tr(
@@ -66,6 +80,12 @@ impl AppServerClient {
             )),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
+                if method == "turn/interrupt" {
+                    bail!(tr(
+                        "Codex가 5초 안에 중단 요청에 응답하지 않았습니다. Esc로 다시 시도할 수 있습니다.",
+                        "Codex did not acknowledge the stop request within 5 seconds. Press Escape to retry.",
+                    ));
+                }
                 let minutes = REQUEST_TIMEOUT.as_secs() / 60;
                 bail!(tr(
                     format!("{method}: Codex app-server가 {minutes}분 동안 응답하지 않아 요청을 중단했습니다."),
@@ -99,6 +119,7 @@ impl AppServerClient {
 
     fn close(&self) {
         self.outbound.lock().expect("outbound mutex").take();
+        self.closed.send_replace(true);
     }
 
     fn send(&self, message: Value) -> Result<()> {
@@ -137,7 +158,9 @@ pub struct AppServer {
     child: Child,
     /// app-server가 띄운 MCP 서버까지 함께 끝낸다.
     _job: Option<crate::child_process::BackendJob>,
-    _cursor_restore: Option<crate::cursor_recovery::RestoreOnDrop>,
+    _cursor_restore: crate::cursor_recovery::RestoreOnDrop,
+    cursor_enabled: Arc<AtomicBool>,
+    computer_use: crate::computer_use::Monitor,
     client: AppServerClient,
     events: mpsc::UnboundedReceiver<ServerEvent>,
     permission_events: mpsc::UnboundedSender<ServerEvent>,
@@ -155,8 +178,9 @@ impl AppServer {
             .as_deref()
             .and_then(|path| std::fs::read_to_string(path).ok())
             .and_then(|config| computer_use_pipe_config(&config));
-        let cursor_restore = computer_use_pipe.as_ref().map(|_| crate::cursor_recovery::RestoreOnDrop);
-        if cursor_restore.is_some() {
+        let cursor_enabled = Arc::new(AtomicBool::new(computer_use_pipe.is_some()));
+        let cursor_restore = crate::cursor_recovery::RestoreOnDrop::new(Arc::clone(&cursor_enabled));
+        if cursor_enabled.load(Ordering::Acquire) {
             let _ = crate::cursor_recovery::restore_if_idle();
         }
         let resolved_codex = resolve_command(codex_path);
@@ -216,10 +240,21 @@ impl AppServer {
             let _ = stdin.shutdown().await;
         });
 
+        let client = AppServerClient {
+            outbound: Arc::new(StdMutex::new(Some(outbound_tx))),
+            pending: Arc::clone(&pending),
+            next_id: Arc::new(AtomicU64::new(1)),
+            closed: watch::channel(false).0,
+        };
+        let computer_use = crate::computer_use::Monitor::start(
+            client.clone(), event_tx.clone(), crate::state::codex_home(), Arc::clone(&cursor_enabled),
+        );
+        let computer_observer = computer_use.observer();
+        let reader_client = client.clone();
+
         let reader_pending = Arc::clone(&pending);
         let reader_events = event_tx.clone();
         let reader_stderr = Arc::clone(&stderr_tail);
-        let restore_cursor = cursor_restore.is_some();
         let reader_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             loop {
@@ -230,12 +265,7 @@ impl AppServer {
                         }
                         match serde_json::from_str::<Value>(&line) {
                             Ok(message) => {
-                                if matches!(
-                                    message.get("method").and_then(Value::as_str),
-                                    Some("turn/completed" | "turn/failed" | "turn/aborted")
-                                ) {
-                                    restore_computer_cursor(reader_events.clone(), restore_cursor);
-                                }
+                                computer_observer.observe(&message);
                                 route_message(message, &reader_pending, &reader_events).await;
                             }
                             Err(error) => {
@@ -257,7 +287,8 @@ impl AppServer {
                 }
             }
 
-            restore_computer_cursor(reader_events.clone(), restore_cursor);
+            reader_client.close();
+            computer_observer.closed();
             let tail = reader_stderr.lock().await;
             let closed = tr("app-server 연결이 종료되었습니다.", "The app-server connection closed.");
             let detail = if tail.is_empty() {
@@ -286,16 +317,12 @@ impl AppServer {
             }
         });
 
-        let client = AppServerClient {
-            outbound: Arc::new(StdMutex::new(Some(outbound_tx))),
-            pending,
-            next_id: Arc::new(AtomicU64::new(1)),
-        };
-
         Ok(Self {
             child,
             _job: job,
             _cursor_restore: cursor_restore,
+            cursor_enabled,
+            computer_use,
             client,
             events,
             permission_events,
@@ -317,13 +344,27 @@ impl AppServer {
         if matches!(method, "thread/start" | "thread/resume" | "thread/fork" | "turn/start") {
             if let Some(path) = &self.config_path {
                 refresh_computer_use(&self.client, path, &self.computer_use_pipe).await?;
+                if self.computer_use_pipe.lock().await.is_some() {
+                    self.cursor_enabled.store(true, Ordering::Release);
+                }
             }
             let thread = params.get("threadId").cloned();
+            let cwd = params.get("cwd").and_then(Value::as_str).map(str::to_owned);
+            if method == "turn/start" {
+                self.computer_use.observer().begin_turn_request(thread.as_ref().and_then(Value::as_str), cwd.as_deref());
+            }
             let response = request_with_permissions(&self.client, method, params).await;
+            if method == "turn/start" {
+                self.computer_use.observer().end_turn_request(thread.as_ref().and_then(Value::as_str), cwd.as_deref());
+            }
             if response.is_err() {
-                restore_computer_cursor(self.permission_events.clone(), self._cursor_restore.is_some());
+                self.computer_use.observer().recover();
             }
             let (response, profile, lowered) = response?;
+            self.computer_use.observer().register_thread(&response, cwd.as_deref());
+            if method == "turn/start" {
+                self.computer_use.observer().register_turn_response(thread.as_ref().and_then(Value::as_str), &response, cwd.as_deref());
+            }
             if let Some(thread) = response.pointer("/thread/id").cloned().or(thread) {
                 let _ = self.permission_events.send(ServerEvent::Notification {
                     method: "devez/permissions/updated".to_owned(),
@@ -340,11 +381,13 @@ impl AppServer {
         };
         let response = self.client.request(method, params).await;
         if method == "turn/interrupt" {
-            restore_computer_cursor(self.permission_events.clone(), self._cursor_restore.is_some());
+            self.computer_use.observer().recover();
         }
         let response = response?;
         if let Some(config) = reloaded_config {
-            *self.computer_use_pipe.lock().await = computer_use_pipe_config(&config);
+            let pipe = computer_use_pipe_config(&config);
+            if pipe.is_some() { self.cursor_enabled.store(true, Ordering::Release); }
+            *self.computer_use_pipe.lock().await = pipe;
         }
         Ok(response)
     }
@@ -370,6 +413,7 @@ impl AppServer {
     }
 
     pub async fn shutdown(mut self) {
+        self.computer_use.stop();
         self.client.close();
         let _ = timeout(Duration::from_secs(2), &mut self.writer_task).await;
 
@@ -383,25 +427,25 @@ impl AppServer {
 
         self.reader_task.abort();
         self.stderr_task.abort();
-        drop(self._job.take());
-        if self._cursor_restore.is_some() {
+        self._job = None;
+        self.computer_use.finish_cleanup().await;
+        if self.cursor_enabled.load(Ordering::Acquire) {
             let _ = crate::cursor_recovery::restore_after_turn().await;
         }
     }
 }
 
-fn restore_computer_cursor(events: mpsc::UnboundedSender<ServerEvent>, enabled: bool) {
-    if !enabled {
-        return;
+impl Drop for AppServer {
+    fn drop(&mut self) {
+        self.client.close();
+        self.computer_use.stop();
+        self.writer_task.abort();
+        self.reader_task.abort();
+        self.stderr_task.abort();
+        // Killing owned processes is asynchronous on Windows. The following
+        // RestoreOnDrop field performs the bounded final cursor settle pass.
+        self._job = None;
     }
-    tokio::spawn(async move {
-        if let Err(error) = crate::cursor_recovery::restore_after_turn().await {
-            let _ = events.send(ServerEvent::ProtocolWarning(tr(
-                format!("Windows 마우스 커서 자동 복원 실패: {error}"),
-                format!("Couldn't restore the Windows mouse cursor: {error}"),
-            )));
-        }
-    });
 }
 
 /// The desktop supplies this pipe address through the Codex configuration.
@@ -1078,6 +1122,146 @@ fn condense_error_line(line: &str) -> String {
 mod tests {
     use super::*;
 
+    fn computer_test_client() -> (AppServerClient, mpsc::UnboundedReceiver<Value>) {
+        let (outbound, messages) = mpsc::unbounded_channel();
+        (AppServerClient {
+            outbound: Arc::new(StdMutex::new(Some(outbound))),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+            closed: watch::channel(false).0,
+        }, messages)
+    }
+
+    fn observe_computer_turn(observer: &crate::computer_use::Observer, thread: &str, turn: &str, server: &str) {
+        observer.observe(&json!({"method":"turn/started","params":{"threadId":thread,"turn":{"id":turn}}}));
+        observer.observe(&json!({"method":"item/started","params":{"threadId":thread,"turnId":turn,"item":{
+            "type":"mcpToolCall","server":server,"tool":"js","arguments":{"code":"await sky.click({x:1,y:2})"}
+        }}}));
+    }
+
+    async fn acknowledge_computer_interrupt(client: &AppServerClient, request: &Value, events: &mpsc::UnboundedSender<ServerEvent>, error: bool) {
+        let response = if error { json!({"id":request["id"],"error":{"code":-32000,"message":"temporary stop failure"}}) }
+            else { json!({"id":request["id"],"result":{}}) };
+        route_message(response, &client.pending, events).await;
+    }
+
+    #[tokio::test]
+    async fn physical_escape_interrupts_the_native_pipe_turn_without_a_marker() {
+        let (client, mut messages) = computer_test_client();
+        let (events, mut event_rx) = mpsc::unbounded_channel();
+        let (input, input_rx) = mpsc::unbounded_channel();
+        let monitor = crate::computer_use::Monitor::start_with_test_input(client.clone(), events.clone(), None, input_rx);
+        let observer = monitor.observer();
+        input.send(0).unwrap(); // Escape before any CU turn cannot cancel later work.
+        tokio::task::yield_now().await;
+        observe_computer_turn(&observer, "native-pipe-thread", "turn-1", "cua_repl");
+        input.send(monitor.generation()).unwrap();
+        let request = timeout(Duration::from_secs(1), messages.recv()).await.unwrap().unwrap();
+        assert_eq!(request["method"], "turn/interrupt");
+        assert_eq!(request["params"], json!({"threadId":"native-pipe-thread","turnId":"turn-1"}));
+        acknowledge_computer_interrupt(&client, &request, &events, false).await;
+        tokio::task::yield_now().await;
+        assert!(messages.try_recv().is_err());
+        assert!(event_rx.try_recv().is_err());
+        observer.observe(&json!({"method":"turn/completed","params":{"threadId":"native-pipe-thread","turn":{"id":"turn-1","status":"interrupted"}}}));
+        input.send(monitor.generation()).unwrap();
+        tokio::task::yield_now().await;
+        assert!(messages.try_recv().is_err());
+        monitor.stop();
+    }
+
+    #[tokio::test]
+    async fn queued_escape_keeps_its_original_scope_when_another_session_starts() {
+        let (client, mut messages) = computer_test_client();
+        let (events, _) = mpsc::unbounded_channel();
+        let (input, input_rx) = mpsc::unbounded_channel();
+        let monitor = crate::computer_use::Monitor::start_with_test_input(client.clone(), events.clone(), None, input_rx);
+        let observer = monitor.observer();
+        observe_computer_turn(&observer, "a", "1", "cua_repl");
+        let generation = monitor.generation();
+        observe_computer_turn(&observer, "b", "1", "cua_repl");
+        input.send(generation).unwrap();
+        let request = timeout(Duration::from_secs(1), messages.recv()).await.unwrap().unwrap();
+        assert_eq!(request["params"], json!({"threadId":"a","turnId":"1"}));
+        acknowledge_computer_interrupt(&client, &request, &events, false).await;
+        tokio::task::yield_now().await;
+        assert!(messages.try_recv().is_err());
+        observer.observe(&json!({"method":"turn/completed","params":{"threadId":"a","turn":{"id":"1"}}}));
+        observe_computer_turn(&observer, "a", "2", "cua_repl");
+        input.send(generation).unwrap();
+        tokio::task::yield_now().await;
+        assert!(messages.try_recv().is_err());
+        monitor.stop();
+    }
+
+    #[tokio::test]
+    async fn physical_escape_failure_reports_and_allows_a_fresh_press_retry() {
+        let (client, mut messages) = computer_test_client();
+        let (events, mut event_rx) = mpsc::unbounded_channel();
+        let (input, input_rx) = mpsc::unbounded_channel();
+        let monitor = crate::computer_use::Monitor::start_with_test_input(client.clone(), events.clone(), None, input_rx);
+        observe_computer_turn(&monitor.observer(), "a", "1", "node_repl");
+        input.send(monitor.generation()).unwrap();
+        let request = timeout(Duration::from_secs(1), messages.recv()).await.unwrap().unwrap();
+        input.send(monitor.generation()).unwrap(); // a pending RPC is never duplicated
+        tokio::task::yield_now().await;
+        assert!(messages.try_recv().is_err());
+        acknowledge_computer_interrupt(&client, &request, &events, true).await;
+        assert!(matches!(timeout(Duration::from_secs(1), event_rx.recv()).await.unwrap(), Some(ServerEvent::ProtocolWarning(_))));
+        // The second press happened while A was pending; failure must preserve it.
+        let retry = timeout(Duration::from_secs(1), messages.recv()).await.unwrap().unwrap();
+        assert_eq!(retry["params"], request["params"]);
+        acknowledge_computer_interrupt(&client, &retry, &events, false).await;
+        monitor.stop();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interrupt_deadline_removes_pending_response_and_allows_retry() {
+        let (client, mut messages) = computer_test_client();
+        let waiting = tokio::spawn({ let client = client.clone(); async move {
+            client.request("turn/interrupt", json!({"threadId":"a","turnId":"1"})).await
+        }});
+        let request = messages.recv().await.unwrap();
+        assert!(client.pending.lock().await.contains_key(&request["id"].as_u64().unwrap()));
+        tokio::time::advance(INTERRUPT_TIMEOUT).await;
+        assert!(waiting.await.unwrap().is_err());
+        assert!(client.pending.lock().await.is_empty());
+        let (events, _) = mpsc::unbounded_channel();
+        acknowledge_computer_interrupt(&client, &request, &events, false).await; // late ack harmless
+        assert!(client.pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closing_connection_wakes_a_retained_client_without_reader_cleanup() {
+        let (client, mut messages) = computer_test_client();
+        let request = tokio::spawn({ let client = client.clone(); async move {
+            client.request("thread/read", json!({"threadId":"a"})).await
+        }});
+        messages.recv().await.unwrap();
+        client.close(); // the same synchronous path used by AppServer::drop
+        assert!(timeout(Duration::from_secs(1), request).await.unwrap().unwrap().is_err());
+        assert!(client.pending.lock().await.is_empty());
+        assert!(client.request("thread/read", json!({"threadId":"a"})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stopping_computer_monitor_prevents_late_events_from_rearming_it() {
+        let (client, mut messages) = computer_test_client();
+        let (events, _) = mpsc::unbounded_channel();
+        let (input, input_rx) = mpsc::unbounded_channel();
+        let monitor = crate::computer_use::Monitor::start_with_test_input(client, events, None, input_rx);
+        let observer = monitor.observer();
+        observe_computer_turn(&observer, "a", "1", "cua_repl");
+        let generation = monitor.generation();
+        monitor.stop();
+        observe_computer_turn(&observer, "b", "1", "cua_repl");
+        observer.recover();
+        assert_eq!(monitor.generation(), generation);
+        let _ = input.send(generation);
+        tokio::task::yield_now().await;
+        assert!(messages.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn computer_use_reloads_changed_pipes_and_retries_failed_reload() {
         let path = std::env::temp_dir().join(format!("dvz-computer-use-{}-{}.toml",
@@ -1090,6 +1274,7 @@ mod tests {
         let client = AppServerClient {
             outbound: Arc::new(StdMutex::new(Some(outbound))),
             pending: pending.clone(), next_id: Arc::new(AtomicU64::new(1)),
+            closed: watch::channel(false).0,
         };
         let cached = Arc::new(Mutex::new(computer_use_pipe_config(original)));
         refresh_computer_use(&client, &path, &cached).await.unwrap();
@@ -1139,6 +1324,7 @@ mod tests {
             outbound: Arc::new(StdMutex::new(Some(outbound))),
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
+            closed: watch::channel(false).0,
         };
 
         let error = client
@@ -1172,6 +1358,7 @@ mod tests {
             let client = AppServerClient {
                 outbound: Arc::new(StdMutex::new(Some(outbound))),
                 pending: pending.clone(), next_id: Arc::new(AtomicU64::new(1)),
+            closed: watch::channel(false).0,
             };
             let params = json!({"threadId": "thread", "permissions": requested, "approvalPolicy": "on-request",
                 "model": "model", "input": [{"type": "text", "text": "사용자 작업"}]});
@@ -1531,6 +1718,7 @@ mod tests {
             outbound: Arc::new(std::sync::Mutex::new(Some(outbound))),
             pending: pending.clone(),
             next_id: Arc::new(AtomicU64::new(1)),
+            closed: watch::channel(false).0,
         };
 
         let first = tokio::spawn({
