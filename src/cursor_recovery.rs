@@ -98,11 +98,28 @@ async fn restore_after_turn_with(
 ) -> io::Result<()> {
     let started = tokio::time::Instant::now();
     let mut last_error = None;
+    let mut settle_after = started + Duration::from_millis(MIN_SETTLE_MILLIS);
+    let mut awaiting_settle = false;
     for millis in TURN_PROBE_MILLIS {
         tokio::time::sleep_until(started + Duration::from_millis(millis)).await;
         match probe() {
-            Ok(Observation::Restored | Observation::Cancelled) => return Ok(()),
-            Ok(Observation::Idle) if millis >= MIN_SETTLE_MILLIS => return Ok(()),
+            Ok(Observation::Cancelled) => return Ok(()),
+            Ok(Observation::Idle) if tokio::time::Instant::now() >= settle_after => return Ok(()),
+            Ok(Observation::Restored) => {
+                // A helper's cursor-manager child can restore a stale snapshot
+                // after the first successful reload. Observe a quiet interval,
+                // rather than equating the Win32 return value with completion.
+                settle_after = tokio::time::Instant::now()
+                    + Duration::from_millis(MIN_SETTLE_MILLIS);
+                awaiting_settle = true;
+                last_error = None;
+            }
+            Ok(Observation::Deferred) => {
+                // Another active helper owns this desktop now. Do not mistake
+                // intentional deferral for our unsuccessful restoration.
+                awaiting_settle = false;
+                last_error = None;
+            }
             Ok(_) => last_error = None,
             // A transient desktop/enumeration failure must not discard the
             // remaining cleanup attempts. Only report a still-unresolved error.
@@ -111,7 +128,32 @@ async fn restore_after_turn_with(
     }
     // An active helper may belong to the next turn or another client. Deferring
     // to it is intentional and is not a restoration failure or timeout.
-    last_error.map_or(Ok(()), Err)
+    if let Some(error) = last_error {
+        Err(error)
+    } else if awaiting_settle {
+        Err(io::Error::other(
+            "Windows cursor reload could not be confirmed stable before the recovery deadline",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(any(windows, test))]
+fn reload_and_verify_with(
+    reload: impl FnOnce() -> io::Result<()>,
+    still_blank: impl FnOnce() -> bool,
+) -> io::Result<Observation> {
+    reload()?;
+    // SPI_SETCURSORS can return success without replacing the blank resource.
+    // Keep the bounded retry path alive and surface a persistent failure.
+    if still_blank() {
+        Err(io::Error::other(
+            "Windows accepted the cursor reload, but a system cursor is still transparent",
+        ))
+    } else {
+        Ok(Observation::Restored)
+    }
 }
 
 #[cfg(any(windows, test))]
@@ -144,7 +186,7 @@ pub fn restore_if_idle() -> io::Result<bool> {
 
 #[cfg(windows)]
 mod windows {
-    use super::Observation;
+    use super::{Observation, reload_and_verify_with};
     use std::{io, mem::size_of, ptr};
 
     use windows_sys::Win32::{
@@ -184,11 +226,17 @@ mod windows {
             }
             // Reload the user's current scheme; do not replace it with a default
             // arrow or change ShowCursor's per-thread display counter.
-            if SystemParametersInfoW(SPI_SETCURSORS, 0, ptr::null_mut(), 0) == 0 {
-                return Err(io::Error::last_os_error());
-            }
+            reload_and_verify_with(
+                || {
+                    if SystemParametersInfoW(SPI_SETCURSORS, 0, ptr::null_mut(), 0) == 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                },
+                has_blank_system_cursor,
+            )
         }
-        Ok(Observation::Restored)
     }
 
     fn has_blank_system_cursor() -> bool {
@@ -432,7 +480,7 @@ mod tests {
         let started = Instant::now();
         let mut restored = false;
         restore_after_turn_with(|| {
-            if started.elapsed() >= Duration::from_millis(750) {
+            if !restored && started.elapsed() >= Duration::from_millis(750) {
                 restored = true;
                 Ok(Observation::Restored)
             } else {
@@ -442,7 +490,7 @@ mod tests {
         .await
         .unwrap();
         assert!(restored, "late helper teardown was not observed");
-        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
     }
 
     #[tokio::test(start_paused = true)]
@@ -450,7 +498,9 @@ mod tests {
         let started = Instant::now();
         let mut restored = false;
         restore_after_turn_with(|| {
-            if started.elapsed() >= Duration::from_secs(2) {
+            if restored {
+                Ok(Observation::Idle)
+            } else if started.elapsed() >= Duration::from_secs(2) {
                 restored = true;
                 Ok(Observation::Restored)
             } else {
@@ -460,7 +510,7 @@ mod tests {
         .await
         .unwrap();
         assert!(restored);
-        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
     }
 
     #[tokio::test(start_paused = true)]
@@ -498,13 +548,15 @@ mod tests {
             probes += 1;
             if probes < 4 {
                 Err(io::Error::other("desktop is switching"))
-            } else {
+            } else if probes == 4 {
                 Ok(Observation::Restored)
+            } else {
+                Ok(Observation::Idle)
             }
         })
         .await
         .unwrap();
-        assert_eq!(probes, 4);
+        assert_eq!(probes, 6);
     }
 
     #[tokio::test(start_paused = true)]
@@ -522,11 +574,135 @@ mod tests {
         let mut probes = 0;
         restore_after_turn_with(|| {
             probes += 1;
-            Ok(Observation::Restored)
+            Ok(if probes == 1 {
+                Observation::Restored
+            } else {
+                Observation::Idle
+            })
         })
         .await
         .unwrap();
-        assert_eq!(probes, 1);
+        assert_eq!(probes, 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_cursor_manager_write_after_reload_is_observed_again() {
+        let started = Instant::now();
+        let mut reloads = Vec::new();
+        restore_after_turn_with(|| {
+            let elapsed = started.elapsed();
+            if reloads.is_empty()
+                || (reloads.len() == 1 && elapsed >= Duration::from_millis(500))
+            {
+                reloads.push(elapsed);
+                Ok(Observation::Restored)
+            } else {
+                Ok(Observation::Idle)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(reloads, [Duration::ZERO, Duration::from_millis(500)]);
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_timer_wakeup_keeps_the_full_real_quiet_interval() {
+        let restored_at = Arc::new(Mutex::new(None));
+        let saved = restored_at.clone();
+        let worker = tokio::spawn(async move {
+            let mut probes = 0;
+            restore_after_turn_with(|| {
+                probes += 1;
+                if probes == 2 {
+                    *saved.lock().unwrap() = Some(Instant::now());
+                    Ok(Observation::Restored)
+                } else {
+                    Ok(Observation::Idle)
+                }
+            })
+            .await
+            .unwrap();
+        });
+        tokio::task::yield_now().await;
+        // Simulate a busy executor waking the 100ms probe much later.
+        tokio::time::advance(Duration::from_millis(1_500)).await;
+        worker.await.unwrap();
+        let quiet = restored_at.lock().unwrap().unwrap().elapsed();
+        assert!(
+            quiet >= Duration::from_millis(MIN_SETTLE_MILLIS),
+            "only {quiet:?} of actual quiet elapsed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn successful_but_ineffective_reload_retries_then_reports_the_blank_cursor() {
+        let started = Instant::now();
+        let mut reloads = 0;
+        let error = restore_after_turn_with(|| {
+            reload_and_verify_with(
+                || {
+                    reloads += 1;
+                    Ok(())
+                },
+                || true,
+            )
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("still transparent"));
+        assert_eq!(reloads, TURN_PROBE_MILLIS.len());
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reload_at_the_deadline_does_not_claim_a_verified_quiet_interval() {
+        let started = Instant::now();
+        let error = restore_after_turn_with(|| {
+            Ok(if started.elapsed() < Duration::from_secs(5) {
+                Observation::Deferred
+            } else {
+                Observation::Restored
+            })
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("confirmed stable"));
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeatedly_rehidden_cursors_do_not_extend_the_deadline_or_claim_success() {
+        let started = Instant::now();
+        let mut reloads = 0;
+        let error = restore_after_turn_with(|| {
+            reloads += 1;
+            Ok(Observation::Restored)
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("confirmed stable"));
+        assert_eq!(reloads, TURN_PROBE_MILLIS.len());
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn successful_reload_must_verify_the_cursor_resource_is_no_longer_blank() {
+        assert_eq!(
+            reload_and_verify_with(|| Ok(()), || false).unwrap(),
+            Observation::Restored
+        );
+        assert!(reload_and_verify_with(|| Ok(()), || true).is_err());
+    }
+
+    #[test]
+    fn failed_reload_does_not_claim_success_from_a_later_probe() {
+        let error = reload_and_verify_with(
+            || Err(io::Error::other("reload failed")),
+            || panic!("failed reload must not be treated as successful"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "reload failed");
     }
 
     #[tokio::test(start_paused = true)]
@@ -600,7 +776,7 @@ mod tests {
                 gate.try_lock(),
                 Err(std::sync::TryLockError::WouldBlock)
             ));
-            Ok(Observation::Restored)
+            Ok(Observation::Idle)
         })
         .await
         .unwrap();
@@ -619,13 +795,15 @@ mod tests {
             ));
             if probes == 1 {
                 Err(io::Error::other("transient native failure"))
-            } else {
+            } else if probes == 2 {
                 Ok(Observation::Restored)
+            } else {
+                Ok(Observation::Idle)
             }
         })
         .await
         .unwrap();
-        assert_eq!(probes, 2, "retry must be able to reacquire the gate");
+        assert_eq!(probes, 6, "retry must be able to reacquire the gate");
         assert!(gate.try_lock().is_ok());
     }
 
