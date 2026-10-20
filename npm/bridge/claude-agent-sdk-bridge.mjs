@@ -2578,6 +2578,19 @@ function applyTaskUpdate(tasks, input, turnId, onIntermediate, at) {
   if (input.subject) task.subject = input.subject;
   const status = input.status;
   if (status === "in_progress" || status === "completed") {
+    // A step reopened after later steps already finished (a follow-up task the
+    // model did before the pending build) moves behind them, so the visible
+    // plan keeps finished steps first and the active one after them.
+    if (status === "in_progress") {
+      const ordered = [...tasks.entries()];
+      const from = ordered.findIndex(([, entry]) => entry === task);
+      const lastDone = ordered.findLastIndex(([, entry]) => entry.status === "completed");
+      if (lastDone > from) {
+        ordered.splice(lastDone, 0, ...ordered.splice(from, 1));
+        tasks.clear();
+        for (const [key, entry] of ordered) tasks.set(key, entry);
+      }
+    }
     const entries = [...tasks.values()];
     const targetIndex = entries.indexOf(task);
 
@@ -6031,6 +6044,20 @@ async function runSelfTest() {
     "completed,completed,completed",
   ].join("|")) {
     throw new Error(`Claude skipped task transition self-test failed: ${transitions.join("|")}`);
+  }
+  // A follow-up step appended after the build, done first, then the build opens.
+  const reopenedTasks = new Map([
+    ["1", { id: "1", subject: "1. 확인", status: "completed" }],
+    ["2", { id: "2", subject: "2. 수정", status: "in_progress" }],
+    ["3", { id: "3", subject: "3. 빌드", status: "pending" }],
+    ["4", { id: "4", subject: "4. 추가 수정", status: "pending" }],
+  ]);
+  applyTaskUpdate(reopenedTasks, { taskId: "2", status: "completed" }, "turn");
+  applyTaskUpdate(reopenedTasks, { taskId: "4", status: "completed" }, "turn");
+  applyTaskUpdate(reopenedTasks, { taskId: "3", status: "in_progress" }, "turn");
+  const reopenedPlan = [...reopenedTasks.entries()].map(([key, task]) => `${key}:${task.status}`).join(",");
+  if (reopenedPlan !== "1:completed,2:completed,4:completed,3:in_progress") {
+    throw new Error(`Claude reopened task order self-test failed: ${reopenedPlan}`);
   }
   const mixedPlans = new Map([
     ["old-1", { subject: "1. 이전 작업", status: "completed" }],
