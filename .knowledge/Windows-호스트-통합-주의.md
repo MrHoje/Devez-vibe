@@ -11,6 +11,7 @@
 - 검색식 때문에 파일이 비워짐·배치 안 PowerShell이 오실행됨: 「cmd.exe 검색 명령」과 「배치 파일 안의 PowerShell 본문」.
 - 재개한 세션이 마지막에 쓴 모델이 아니라 방을 만들 때 고른 모델로 열림: 「DevezCode 재개 인자와 기억된 모델」.
 - 데스크톱에서는 Computer Use가 되지만 Vibe에서는 `native pipe` 연결이 실패함: 「Computer Use의 데스크톱 연결 수명」.
+- 순정 Codex CLI에서는 커서 추적이 되지만 Vibe에서는 다름: 「순정 CLI와 실행 경로 비교」.
 - Claude Computer Use가 터미널에 입력함·사용자 화면 노출 없이 검증해야 함: 「Claude Computer Use(`devez-computer`)」.
 - dvz 화면 동작을 사용자 창 없이 시험해야 함·디버그 빌드가 시작 직후 스택 넘침으로 죽음: 「ConPTY로 실제 화면 시험」.
 - DevezCode에서 dvz 세션을 삭제할 때 화면이 잠시 멈춤: 「DevezCode 세션 삭제 시 화면 멈춤」.
@@ -42,6 +43,13 @@
 - `@oai/cua-repl` README는 선택한 `cua_node` 런타임의 plugin·도구·hook을 함께 사용하도록 설명한다. 런타임 혼용 여부는 확인할 가치가 있지만, 조사 환경은 local Linux 번들로 사용자의 Windows 배포판과 동일하다고 간주하지 않는다. 원격 입력의 Esc는 주입 입력일 수 있으므로 물리 입력 전용 리스너의 해결 범위와도 구분한다.
 
 실기기 확인은 배포와 구분해 수행한다. 일반·고 DPI·다중 모니터에서 물리 마우스 추적, 다른 앱 포커스의 Esc, 에이전트가 입력한 Esc, 길게 누른 Esc 뒤 새 턴, 동시 대화, 정상 완료·실패·provider 변경·앱 종료를 각각 확인한다. 커서 복원 뒤 사용자 설정이 유지되는지와 다른 활성 세션의 오버레이를 지우지 않는지도 확인한다. Linux 단위 검사와 Windows 교차 컴파일은 이 실기기 검증을 대신하지 않는다.
+
+### 순정 CLI와 실행 경로 비교
+
+- 순정 CLI에서 파란 커서 추적이 정상이라면 상류 이슈와 증상이 같다는 이유만으로 네이티브 헬퍼 자체의 문제로 결론 내리지 않는다. [Codex 0.163.0 TUI](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/tui/src/app_server_connection.rs)도 app-server를 사용하며 Windows에서는 기존 로컬 daemon에 연결할 수 있다. 프런트엔드의 `codex --version`뿐 아니라 실제 요청을 받는 app-server·MCP·헬퍼의 실행 파일과 환경을 비교한다.
+- Vibe는 Windows의 `.cmd`·`.bat`를 발견하면 인접 `codex.js` 또는 추정한 vendored `codex.exe`로 바꿔 실행했었다. [공식 npm 실행기](https://github.com/openai/codex/blob/rust-v0.163.0/codex-cli/bin/codex.js)는 `require.resolve`로 선택한 플랫폼 패키지를 사용하고 관리 설치 환경값을 준비한다. 선택된 패키지의 실행 파일이 없는데 오래된 legacy 파일만 남은 경우와, package.json 없는 중첩 실행 파일 옆에 정상 hoisted 패키지가 있는 경우에 두 구현의 선택이 달라지는 것을 격리 fixture로 재현했다. 이 차이는 확인된 실행 계약 결함이지만 해당 환경값이 커서 추적을 직접 바꾼다는 증거는 아니다.
+- 이제 선택한 실행기를 그대로 실행해 공식 패키지 선택과 사용자 shim의 환경 설정을 보존한다. 명시한 `.exe`도 바꾸지 않는다. Windows 배치 인자 처리는 Rust 표준 라이브러리의 배치 전용 escaping을 사용하고, 뒤에 추가하는 `-c`와 공백·따옴표가 있는 인자도 같은 경로로 보낸다.
+- DevezCode 등 이미 실행 중인 GUI 호스트와 별도 터미널은 시작 시점의 `PATH`, `CODEX_HOME`, MCP별 `CODEX_CLI_PATH`, `SKY_CUA_NATIVE_PIPE*`가 다를 수 있다. 같은 머신이라는 사실만으로 같은 런타임이라고 취급하지 않는다. 비교 시 선택된 실행기, 실제 자식 실행 파일, plugin·`cua_node`·Sky 버전, direct-helper/native-pipe 모드, 대상 창 권한과 포커스를 구분한다. 콘솔 분리·작업 개체만으로 물리 마우스 훅이 차단된다고 단정하거나 권한을 넓혀 우회하지 않는다.
 
 ### 컴퓨터 조작 속도 비교와 오류 해석
 

@@ -506,50 +506,11 @@ fn codex_command(resolved: &Path) -> Command {
 }
 
 fn codex_invocation(resolved: &Path, args: &[&str]) -> Command {
-    #[cfg(windows)]
-    {
-        let extension = resolved
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or_default();
-        if extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat") {
-            // `codex.js` only locates the vendored binary and re-spawns it, so going
-            // straight to that binary saves a whole Node boot on every launch.
-            if let Some(root) = resolved.parent()
-                && let Some(binary) = vendored_codex_binary(root)
-            {
-                let mut command = Command::new(binary);
-                command.args(args);
-                return command;
-            }
-
-            if let Some(root) = resolved.parent() {
-                let script = root
-                    .join("node_modules")
-                    .join("@openai")
-                    .join("codex")
-                    .join("bin")
-                    .join("codex.js");
-                if script.is_file() {
-                    let bundled_node = root.join("node.exe");
-                    let node = if bundled_node.is_file() {
-                        bundled_node
-                    } else {
-                        resolve_command(Path::new("node"))
-                    };
-                    let mut command = Command::new(node);
-                    command.arg(script).args(args);
-                    return command;
-                }
-            }
-
-            let shell = env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
-            let mut command = Command::new(shell);
-            command.args(["/d", "/s", "/c"]).arg(resolved).args(args);
-            return command;
-        }
-    }
-
+    // Keep the selected launcher authoritative. The npm shim also selects the
+    // platform package and prepares its environment; a guessed vendored binary
+    // or adjacent codex.js can bypass that logic or a user's custom wrapper.
+    // Rust handles .cmd/.bat with batch-aware escaping on Windows, including
+    // arguments appended by the caller after this function returns.
     let mut command = Command::new(resolved);
     command.args(args);
     command
@@ -904,42 +865,6 @@ const UPDATE_PLAN_TOOL_OVERRIDE: &str = "tools.update_plan.enabled=true";
 const UNSTABLE_WARNING_KEY: &str = "suppress_unstable_features_warning";
 const UNSTABLE_WARNING_OVERRIDE: &str = "suppress_unstable_features_warning=true";
 
-/// Finds the platform binary the `@openai/codex` npm package vendors, mirroring the
-/// lookup `bin/codex.js` performs. `root` is the directory holding the npm shim.
-#[cfg(windows)]
-fn vendored_codex_binary(root: &Path) -> Option<PathBuf> {
-    let triple = match std::env::consts::ARCH {
-        "x86_64" => "x86_64-pc-windows-msvc",
-        "aarch64" => "aarch64-pc-windows-msvc",
-        _ => return None,
-    };
-    let platform_package = format!(
-        "codex-win32-{}",
-        match std::env::consts::ARCH {
-            "x86_64" => "x64",
-            _ => "arm64",
-        }
-    );
-    let codex_package = root.join("node_modules").join("@openai").join("codex");
-    // npm hoists the platform package beside `codex`; nested installs keep their own copy.
-    let roots = [
-        codex_package
-            .join("node_modules")
-            .join("@openai")
-            .join(&platform_package)
-            .join("vendor"),
-        root.join("node_modules")
-            .join("@openai")
-            .join(&platform_package)
-            .join("vendor"),
-        codex_package.join("vendor"),
-    ];
-    roots
-        .into_iter()
-        .map(|vendor| vendor.join(triple).join("bin").join("codex.exe"))
-        .find(|binary| binary.is_file())
-}
-
 pub(crate) fn resolve_command(command: &Path) -> PathBuf {
     if command.components().count() > 1 || command.exists() {
         return command.to_path_buf();
@@ -1121,6 +1046,230 @@ fn condense_error_line(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CodexLauncherFixture(PathBuf);
+
+    impl CodexLauncherFixture {
+        fn new() -> Self {
+            let root = env::temp_dir().join(format!(
+                "dvz codex launcher {} {}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+
+        fn write(&self, relative: &str, contents: &str) -> PathBuf {
+            let path = self.0.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, contents).unwrap();
+            path
+        }
+    }
+
+    impl Drop for CodexLauncherFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn codex_invocation_preserves_explicit_launcher_and_arguments() {
+        for selected in [
+            "codex",
+            "C:/Program Files/Codex/codex.exe",
+            "C:/custom/codex.CMD",
+            "C:/custom/launch.bat",
+        ] {
+            let args = ["exec", "-c", "model_reasoning_effort=\"low\""];
+            let mut command = codex_invocation(Path::new(selected), &args);
+            command.arg("path with spaces");
+            let command = command.as_std();
+            assert_eq!(command.get_program(), std::ffi::OsStr::new(selected));
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                [args.as_slice(), &["path with spaces"]].concat()
+            );
+            assert!(command.get_envs().next().is_none());
+            assert!(command.get_current_dir().is_none());
+        }
+    }
+
+    #[test]
+    fn codex_invocation_does_not_substitute_stale_vendored_binaries() {
+        let fixture = CodexLauncherFixture::new();
+        let shim = fixture.write("codex.cmd", "@echo off\r\n");
+        fixture.write(
+            "node_modules/@openai/codex/bin/codex.js",
+            "// official wrapper owns package resolution",
+        );
+        fixture.write(
+            "node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/package.json",
+            "{}",
+        );
+        for triple in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
+            fixture.write(
+                &format!("node_modules/@openai/codex/vendor/{triple}/bin/codex.exe"),
+                "stale placeholder; never executed",
+            );
+        }
+        let command = codex_command(&shim);
+        assert_eq!(command.as_std().get_program(), shim.as_os_str());
+        assert_eq!(
+            command.as_std().get_args().collect::<Vec<_>>(),
+            ["app-server", "--listen", "stdio://"]
+        );
+    }
+
+    #[test]
+    fn codex_invocation_leaves_orphaned_nested_binary_selection_to_the_wrapper() {
+        let fixture = CodexLauncherFixture::new();
+        let shim = fixture.write("codex.cmd", "@echo off\r\n");
+        fixture.write(
+            "node_modules/@openai/codex/bin/codex.js",
+            "// official wrapper uses require.resolve",
+        );
+        for (package, triple) in [
+            ("codex-win32-x64", "x86_64-pc-windows-msvc"),
+            ("codex-win32-arm64", "aarch64-pc-windows-msvc"),
+        ] {
+            fixture.write(
+                &format!(
+                    "node_modules/@openai/codex/node_modules/@openai/{package}/vendor/{triple}/bin/codex.exe"
+                ),
+                "orphaned placeholder; no package.json",
+            );
+            fixture.write(&format!("node_modules/@openai/{package}/package.json"), "{}");
+            fixture.write(
+                &format!("node_modules/@openai/{package}/vendor/{triple}/bin/codex.exe"),
+                "selected by the official wrapper; never executed",
+            );
+        }
+        assert_eq!(codex_command(&shim).as_std().get_program(), shim.as_os_str());
+    }
+
+    #[test]
+    fn codex_invocation_does_not_replace_custom_shims_with_adjacent_npm_scripts() {
+        let fixture = CodexLauncherFixture::new();
+        fixture.write(
+            "node_modules/@openai/codex/bin/codex.js",
+            "// not the selected custom launcher",
+        );
+        for selected in ["codex.cmd", "custom-launch.bat"] {
+            let shim = fixture.write(selected, "@echo off\r\nset CUSTOM_LAUNCHER=1\r\n");
+            let command = codex_command(&shim);
+            assert_eq!(command.as_std().get_program(), shim.as_os_str());
+        }
+    }
+
+    // Only the batch fixture child sets this marker. A normal test run does not
+    // block on stdin, and the fixture needs no Node.js or Codex installation.
+    #[cfg(windows)]
+    #[test]
+    fn codex_invocation_batch_probe_child() {
+        if env::var("DVZ_LAUNCHER_TEST_MARKER").as_deref() != Ok("from selected shim") {
+            return;
+        }
+        let mut input = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).unwrap();
+        println!(
+            "DVZ_LAUNCHER_TEST_RESULT={}",
+            json!({
+                "args": env::args().skip(1).collect::<Vec<_>>(),
+                "marker": env::var("DVZ_LAUNCHER_TEST_MARKER").unwrap(),
+                "input": input,
+            })
+        );
+    }
+
+    // Exercise the real Windows batch parser and an npm-style %* relay, not a
+    // hand-written model of cmd quoting. The test executable is the argv probe;
+    // --skip carries our literal test arguments without treating them as flags.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn codex_invocation_batch_round_trips_quotes_environment_and_stdio() {
+        let fixture = CodexLauncherFixture::new();
+        fixture.write(
+            "node_modules/@openai/codex/bin/codex.js",
+            "throw new Error('custom launcher was bypassed');",
+        );
+        let args = [
+            "--exact",
+            "app_server::tests::codex_invocation_batch_probe_child",
+            "--nocapture",
+            "--skip",
+            "-c",
+            "--skip",
+            "model_reasoning_effort=\"low\"",
+            "--skip",
+            "path with spaces",
+            "--skip",
+            "%DVZ_LAUNCHER_TEST_MARKER%",
+            "--skip",
+            "!DVZ_LAUNCHER_TEST_MARKER!",
+            "--skip",
+            "a&b|c<d>e^f",
+            "--skip",
+            "C:\\trailing path\\",
+        ];
+        for extension in ["cmd", "bat", "CMD"] {
+            let shim = fixture.write(
+                &format!("custom launcher.{extension}"),
+                concat!(
+                    "@echo off\r\n",
+                    "setlocal\r\n",
+                    "set \"DVZ_LAUNCHER_TEST_MARKER=from selected shim\"\r\n",
+                    "\"%DVZ_LAUNCHER_TEST_EXE%\" %*\r\n",
+                    "exit /b %errorlevel%\r\n",
+                ),
+            );
+            let mut command = codex_invocation(&shim, &args[..3]);
+            command
+                .args(&args[3..])
+                .env("DVZ_LAUNCHER_TEST_EXE", env::current_exe().unwrap())
+                .env("DVZ_LAUNCHER_TEST_MARKER", "before shim")
+                .current_dir(&fixture.0)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            crate::child_process::isolate_backend(&mut command);
+            let mut child = command.spawn().unwrap();
+            let _job = crate::child_process::adopt_backend(&child);
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"{\"jsonrpc\":\"2.0\"}\n")
+                .await
+                .unwrap();
+            let output = timeout(Duration::from_secs(10), child.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let result = stdout
+                .lines()
+                .find_map(|line| {
+                    line.split_once("DVZ_LAUNCHER_TEST_RESULT=")
+                        .map(|(_, value)| value)
+                })
+                .expect("batch wrapper did not run the Rust argv probe");
+            let result: Value = serde_json::from_str(result).unwrap();
+            assert_eq!(result["args"], json!(args));
+            assert_eq!(result["marker"], "from selected shim");
+            assert_eq!(result["input"], "{\"jsonrpc\":\"2.0\"}\n");
+        }
+    }
 
     fn computer_test_client() -> (AppServerClient, mpsc::UnboundedReceiver<Value>) {
         let (outbound, messages) = mpsc::unbounded_channel();
