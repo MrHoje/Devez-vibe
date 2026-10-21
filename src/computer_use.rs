@@ -1,7 +1,7 @@
 //! Host-side Computer Use cancellation. The native helper owns the overlay and
 //! input injection; a tool error or its interrupt marker is NOT a turn interrupt.
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -50,6 +50,7 @@ impl Turn {
 #[derive(Default)]
 struct ActiveTurn {
     computer: bool,
+    computer_calls: BTreeSet<String>,
     armed_generation: u64,
     stop_requested: bool,
     stop_version: u64,
@@ -124,22 +125,22 @@ impl State {
     }
 
     fn observe(&mut self, method: &str, params: &Value) -> Vec<Ended> {
-        let previous = self.targets();
+        let previous = self.escape_targets();
         let ended = self.observe_inner(method, params);
         self.rearm(previous);
         ended
     }
 
     fn rearm(&mut self, previous: Vec<Turn>) {
-        if previous != self.targets() {
+        if previous != self.escape_targets() {
             self.generation = self.generation.wrapping_add(1).max(1);
         }
-        for active in self
-            .turns
-            .values_mut()
-            .filter(|active| active.computer && active.armed_generation == 0)
-        {
-            active.armed_generation = self.generation;
+        for (turn, active) in &mut self.turns {
+            if active.computer_calls.is_empty() && !active.stop_requested {
+                active.armed_generation = 0;
+            } else if active.armed_generation == 0 || !previous.contains(turn) {
+                active.armed_generation = self.generation;
+            }
         }
     }
 
@@ -203,6 +204,12 @@ impl State {
                 let stopped = is_computer_stop(item);
                 if let Some(active) = self.turns.get_mut(&turn) {
                     active.computer |= computer || stopped;
+                    let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+                    if method == "item/completed" {
+                        active.computer_calls.remove(id);
+                    } else if computer {
+                        active.computer_calls.insert(id.to_owned());
+                    }
                     if stopped && !active.stop_requested {
                         active.stop_version = active.stop_version.wrapping_add(1);
                         active.stop_requested = true;
@@ -239,6 +246,14 @@ impl State {
             .collect()
     }
 
+    fn escape_targets(&self) -> Vec<Turn> {
+        self.turns
+            .iter()
+            .filter(|(_, active)| !active.computer_calls.is_empty() || active.stop_requested)
+            .map(|(turn, _)| turn.clone())
+            .collect()
+    }
+
     fn escape(&mut self, generation: u64) {
         // Events carry the arm generation from key-down, not whichever turn is
         // current when the async receiver happens to wake up.
@@ -248,7 +263,11 @@ impl State {
         for active in self
             .turns
             .values_mut()
-            .filter(|active| active.computer && active.armed_generation <= generation)
+            .filter(|active| {
+                active.armed_generation != 0
+                    && active.armed_generation <= generation
+                    && (!active.computer_calls.is_empty() || active.stop_requested)
+            })
         {
             active.stop_requested = true;
             active.stop_version = active.stop_version.wrapping_add(1);
@@ -257,7 +276,7 @@ impl State {
     }
 
     fn mark_interrupts(&mut self, home: Option<&Path>) {
-        let previous = self.targets();
+        let previous = self.escape_targets();
         for (turn, active) in &mut self.turns {
             if !active.marker_seen
                 && home.is_some_and(|home| {
@@ -407,8 +426,8 @@ impl Observer {
         let ended = state.observe(method, params);
         let next = state.targets();
         *self.probe_gate.lock().expect("cursor probe gate") = next.is_empty();
-        self.arm
-            .arm(if next.is_empty() { 0 } else { state.generation });
+        // 종료 정리는 턴 전체를 추적하되 전역 Esc는 실행 중인 호출에만 적용한다.
+        self.arm.arm(if state.escape_targets().is_empty() { 0 } else { state.generation });
         if !next.is_empty() {
             self.enabled.store(true, Ordering::Release);
             if let Some(error) = self.hook_error.lock().expect("hook status").take() {
@@ -655,7 +674,7 @@ impl Monitor {
                     }
                     let armed = !state.targets().is_empty();
                     *shared.probe_gate.lock().expect("cursor probe gate") = !armed;
-                    shared.arm.arm(if armed { state.generation } else { 0 });
+                    shared.arm.arm(if state.escape_targets().is_empty() { 0 } else { state.generation });
                     if armed {
                         shared.enabled.store(true, Ordering::Release);
                         shared.cancel_recovery();
@@ -777,7 +796,7 @@ mod tests {
         json!({"threadId":thread,"turn":{"id":id}})
     }
     fn item(thread: &str, id: &str, server: &str, code: &str) -> Value {
-        json!({"threadId":thread,"turnId":id,"item":{"type":"mcpToolCall","server":server,"tool":"js","arguments":{"code":code}}})
+        json!({"threadId":thread,"turnId":id,"item":{"id":"computer-call","type":"mcpToolCall","server":server,"tool":"js","arguments":{"code":code}}})
     }
 
     #[test]
@@ -798,6 +817,73 @@ mod tests {
             &item("a", "1", "node_repl", "await sky.click({x:1,y:2})"),
         );
         assert_eq!(state.targets(), vec![turn("a", "1")]);
+    }
+
+    #[test]
+    fn completed_computer_calls_do_not_interrupt_later_web_work() {
+        for server in ["node_repl", "cua_repl"] {
+            let mut state = State::default();
+            state.observe("turn/started", &started("a", "1"));
+            let call = item("a", "1", server, "await sky.list_windows()");
+            state.observe("item/started", &call);
+            let generation = state.generation;
+            state.observe("item/completed", &call);
+            state.observe("item/started", &json!({
+                "threadId": "a", "turnId": "1",
+                "item": {"id": "web", "type": "webSearch", "query": "WebView2"}
+            }));
+            state.escape(generation);
+            assert!(take(&mut state).is_empty(), "{server}");
+            assert_eq!(state.targets(), vec![turn("a", "1")]);
+            let ended = state.observe("turn/completed", &started("a", "1"));
+            assert!(ended[0].computer, "turn cleanup must still own the helper");
+        }
+    }
+
+    #[test]
+    fn completed_computer_replays_do_not_arm_escape() {
+        let mut state = State::default();
+        state.observe("turn/started", &started("a", "1"));
+        state.observe("item/completed", &item("a", "1", "node_repl", "await sky.list_windows()"));
+        state.escape(state.generation);
+        assert!(take(&mut state).is_empty());
+    }
+
+    #[test]
+    fn overlapping_computer_calls_stay_interruptible_until_the_last_completion() {
+        for finish_both in [false, true] {
+            let mut state = State::default();
+            state.observe("turn/started", &started("a", "1"));
+            let mut first = item("a", "1", "node_repl", "await sky.list_windows()");
+            first["item"]["id"] = json!("first");
+            let mut second = first.clone();
+            second["item"]["id"] = json!("second");
+            state.observe("item/started", &first);
+            state.observe("item/started", &second);
+            state.observe("item/completed", &first);
+            state.observe("item/completed", &first);
+            if finish_both {
+                state.observe("item/completed", &second);
+            }
+            state.escape(state.generation);
+            assert_eq!(take(&mut state), if finish_both { vec![] } else { vec![turn("a", "1")] });
+        }
+    }
+
+    #[test]
+    fn queued_escape_cannot_cross_a_gap_between_computer_calls() {
+        let mut state = State::default();
+        state.observe("turn/started", &started("a", "1"));
+        let mut call = item("a", "1", "cua_repl", "await tab.click()");
+        state.observe("item/started", &call);
+        let generation = state.generation;
+        state.observe("item/completed", &call);
+        call["item"]["id"] = json!("next-call");
+        state.observe("item/started", &call);
+        state.escape(generation);
+        assert!(take(&mut state).is_empty());
+        state.escape(state.generation);
+        assert_eq!(take(&mut state), vec![turn("a", "1")]);
     }
 
     #[test]

@@ -14827,7 +14827,8 @@ impl AppState {
     }
 
     fn activity_model(&self) -> Option<String> {
-        if self.live_activity_notice().is_some()
+        if self.host_loading
+            || self.live_activity_notice().is_some()
             || (!self.busy && !self.compacting() && self.last_completed_duration.is_none())
         {
             return None;
@@ -30562,10 +30563,17 @@ mod tests {
         state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
 
         state.apply_model(1, Some("high"));
-        assert_eq!(state.activity_model().as_deref(), Some("gpt-5.6-terra"));
-
-        state.handle_notification("turn/completed", &json!({}));
-        assert_eq!(state.activity_model().as_deref(), Some("gpt-5.6-terra"));
+        for completed in [false, true] {
+            if completed {
+                state.handle_notification("turn/completed", &json!({}));
+            }
+            assert_eq!(state.activity_model().as_deref(), Some("gpt-5.6-terra"));
+            for label in ["Changing provider to OpenCode", "Loading", "Loading session", "Reloading"] {
+                state.set_host_activity(Some(label.to_owned()));
+                assert_eq!(state.view().activity_model, None, "{label}");
+                state.set_host_activity(None);
+            }
+        }
     }
 
     #[test]

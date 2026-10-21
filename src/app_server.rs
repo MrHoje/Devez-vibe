@@ -1284,7 +1284,7 @@ mod tests {
     fn observe_computer_turn(observer: &crate::computer_use::Observer, thread: &str, turn: &str, server: &str) {
         observer.observe(&json!({"method":"turn/started","params":{"threadId":thread,"turn":{"id":turn}}}));
         observer.observe(&json!({"method":"item/started","params":{"threadId":thread,"turnId":turn,"item":{
-            "type":"mcpToolCall","server":server,"tool":"js","arguments":{"code":"await sky.click({x:1,y:2})"}
+            "id":"computer-call","type":"mcpToolCall","server":server,"tool":"js","arguments":{"code":"await sky.click({x:1,y:2})"}
         }}}));
     }
 
@@ -1292,6 +1292,23 @@ mod tests {
         let response = if error { json!({"id":request["id"],"error":{"code":-32000,"message":"temporary stop failure"}}) }
             else { json!({"id":request["id"],"result":{}}) };
         route_message(response, &client.pending, events).await;
+    }
+
+    #[tokio::test]
+    async fn physical_escape_after_computer_completion_does_not_send_interrupt() {
+        let (client, mut messages) = computer_test_client();
+        let (events, _) = mpsc::unbounded_channel();
+        let (input, input_rx) = mpsc::unbounded_channel();
+        let monitor = crate::computer_use::Monitor::start_with_test_input(client, events, None, input_rx);
+        let observer = monitor.observer();
+        observe_computer_turn(&observer, "a", "1", "node_repl");
+        let generation = monitor.generation();
+        observer.observe(&json!({"method":"item/completed","params":{
+            "threadId":"a","turnId":"1","item":{"id":"computer-call","type":"mcpToolCall","server":"node_repl","tool":"js"}
+        }}));
+        input.send(generation).unwrap();
+        assert!(timeout(Duration::from_millis(200), messages.recv()).await.is_err());
+        monitor.stop();
     }
 
     #[tokio::test]
@@ -1352,6 +1369,9 @@ mod tests {
         observe_computer_turn(&monitor.observer(), "a", "1", "node_repl");
         input.send(monitor.generation()).unwrap();
         let request = timeout(Duration::from_secs(1), messages.recv()).await.unwrap().unwrap();
+        monitor.observer().observe(&json!({"method":"item/completed","params":{
+            "threadId":"a","turnId":"1","item":{"id":"computer-call","type":"mcpToolCall","server":"node_repl","tool":"js"}
+        }}));
         input.send(monitor.generation()).unwrap(); // a pending RPC is never duplicated
         tokio::task::yield_now().await;
         assert!(messages.try_recv().is_err());
