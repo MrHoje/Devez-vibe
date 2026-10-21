@@ -2989,17 +2989,18 @@ fn is_missing_claude_session(error: &anyhow::Error) -> bool {
 }
 
 fn claude_session_params(params: &Value, cwd: &Path, session_id: Option<&str>) -> Value {
+    let rules = params
+        .get("claudeDeveloperInstructions")
+        .or_else(|| params.pointer("/additionalContext/claude-devez-vibe-rules/value"))
+        .or_else(|| params.get("developerInstructions"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let mut request = json!({
         "cwd": cwd,
         "model": params.get("model").cloned().unwrap_or_else(|| json!("claude:default")),
         // The fixed-model lanes the Planner and Goal Runner roles dispatch by name.
         "agents": crate::subagents::claude_agent_definitions(),
-        "systemPrompt": params
-            .get("claudeDeveloperInstructions")
-            .or_else(|| params.pointer("/additionalContext/claude-devez-vibe-rules/value"))
-            .or_else(|| params.get("developerInstructions"))
-            .cloned()
-            .unwrap_or_else(|| json!(""))
+        "systemPrompt": format!("{rules}{}", tr(crate::KOREAN_SYSTEM_RULE, ""))
     });
     if let Some(effort) = params
         .get("effort")
@@ -4159,6 +4160,13 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
             }
             prepare_codex_turn_context(&mut params);
             assert_eq!(params["additionalContext"]["devez-vibe-language"]["value"], rule);
+            // 응답 중 추가 입력도 같은 묶음을 싣고, Claude 시스템 지침은 한국어일 때만 한 줄 늘어난다.
+            let steering = json!({"additionalContext": crate::steer_additional_context(false)});
+            assert!(combined_turn_instructions(&steering, RuntimeKind::Claude).unwrap().ends_with(&rule));
+            let opening = json!({"claudeDeveloperInstructions": crate::CLAUDE_DEVEZ_INSTRUCTIONS});
+            let system = claude_session_params(&opening, Path::new("."), None)["systemPrompt"].as_str().unwrap().to_owned();
+            assert_eq!(system.ends_with(crate::KOREAN_SYSTEM_RULE), !english);
+            assert!(system.starts_with(crate::CLAUDE_DEVEZ_INSTRUCTIONS));
         }
         crate::language::set_english(false);
     }

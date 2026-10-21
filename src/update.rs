@@ -23,12 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "오류가 발생한 Claude·Codex 턴에서 같은 메시지가 두 번 표시되던 문제를 수정했습니다.",
+    "한국어로 대화하는 Claude 세션에서 긴 작업 후반이나 응답 중 추가 입력 뒤에 영어 문장이 섞이던 빈도를 줄였습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Fixed the same error message appearing twice in a failed Claude or Codex turn.",
+    "Korean Claude sessions now mix in English sentences less often late in long tasks or after input sent mid-response.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

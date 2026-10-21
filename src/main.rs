@@ -5186,9 +5186,7 @@ async fn send_queued_prompt(
         "threadId": state.thread_id,
         "expectedTurnId": turn_id,
         "input": input,
-        "additionalContext": {
-            "devez-vibe-knowledge": auto_knowledge_context(state.auto_knowledge())
-        }
+        "additionalContext": steer_additional_context(state.auto_knowledge())
     });
     if let Err(error) =
         await_with_activity(state, renderer, server.request("turn/steer", params)).await?
@@ -5602,8 +5600,8 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
 /// 식별자만 받는다. description과 prompt의 언어는 응답 언어 규칙이 정한다.
 const CLAUDE_TURN_REMINDER: &str = "Lead with the user impact and the required action. Length and its exceptions follow the current role. Keep evidence and unverified scope, and use technical identifiers only when a decision needs them. Skip progress lines with no new facts. Name Agent calls with lowercase English letters, digits, and underscores describing the target and action, and keep the description short.";
 
-/// 공통 지침은 영어 한 벌이고, 한국어 응답 강제는 이 묶음에만 둔다. `/language`가
-/// 한국어일 때만 매 턴 붙여 세션 중 전환도 다음 턴에 반영된다.
+/// 공통 지침은 영어 한 벌이고, 한국어 응답 강제는 이 묶음과 `KOREAN_SYSTEM_RULE`에만
+/// 둔다. `/language`가 한국어일 때만 매 턴 붙여 세션 중 전환도 다음 턴에 반영된다.
 const KOREAN_RESPONSE_RULES: &str = concat!(
     "최우선 한국어 응답 규칙:\n",
     "- 진행·도구 앞뒤 문장·최종 답변, 작업 목록·계획의 제목과 설명, 하위 에이전트의 description과 prompt는 한국어로 쓴다. 기술 식별자와 사용자가 그대로 인용한 문자열만 예외다.\n",
@@ -5611,6 +5609,10 @@ const KOREAN_RESPONSE_RULES: &str = concat!(
     "- 항목명·상태·판정과 다른 에이전트의 보고도 쉬운 한국어로 풀고, 판정 코드는 괄호 안에서도 한국어 판정으로 바꾼다.\n",
     "- 실제 변경을 마친 마지막 문장은 `~했습니다.`로 끝내고 `~한 내용을 완료했습니다.` 같은 겹친 명사절은 피한다.",
 );
+
+/// 턴 첫 입력에만 붙는 규칙은 긴 턴 후반에 약해져 영어 진행문이 늘었다. 한국어
+/// 화면이면 Claude 시스템 지침 끝에도 한 줄 둔다. 영어 전환은 아래 문장이 거둔다.
+const KOREAN_SYSTEM_RULE: &str = "한국어 응답: 턴이 길어지거나 추가 입력·작업 알림 뒤에도 사용자에게 보이는 모든 문장(진행·도구 앞뒤 문장·최종 답변)은 한국어로 쓴다. 기술 식별자와 인용 원문만 예외다.\n";
 
 /// 영어 화면에서는 응답 언어를 정하지 않는다. 앞선 턴에 남은 한국어 규칙만 거둔다.
 const NO_RESPONSE_LANGUAGE_RULE: &str =
@@ -5709,7 +5711,15 @@ fn turn_additional_context(agent: agent::AgentMode, auto_knowledge: bool) -> Val
     })
 }
 
-/// Steering updates only this choice, preserving the active turn's role.
+/// Steering keeps the active turn's role but restates the knowledge state and
+/// the response language, which a steered message would otherwise lack.
+fn steer_additional_context(auto_knowledge: bool) -> Value {
+    json!({
+        "devez-vibe-knowledge": auto_knowledge_context(auto_knowledge),
+        "devez-vibe-language": response_language_context()
+    })
+}
+
 fn auto_knowledge_context(auto_knowledge: bool) -> Value {
     let knowledge = if auto_knowledge {
         concat!(
@@ -6766,9 +6776,7 @@ async fn steer_turn(
         "threadId": state.thread_id,
         "expectedTurnId": turn_id,
         "input": input,
-        "additionalContext": {
-            "devez-vibe-knowledge": auto_knowledge_context(state.auto_knowledge())
-        }
+        "additionalContext": steer_additional_context(state.auto_knowledge())
     });
     // The running turn keeps its own role, but the turn this input lands
     // in may be a fresh one the backend had to reopen. Carrying the role's
