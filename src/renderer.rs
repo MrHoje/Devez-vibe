@@ -1164,11 +1164,33 @@ fn expand_tabs(text: &str) -> Cow<'_, str> {
 
 /// 셀에 남은 제어문자는 터미널 커서를 움직여 격자를 깨뜨린다.
 fn without_control_characters(unit: &str) -> Cow<'_, str> {
-    if unit.chars().any(char::is_control) {
-        Cow::Owned(unit.chars().filter(|ch| !ch.is_control()).collect())
+    without_chars(unit, |ch| ch.is_control() || is_console_only_invisible(ch))
+}
+
+fn without_chars(text: &str, dropped: impl Fn(char) -> bool) -> Cow<'_, str> {
+    if text.chars().any(&dropped) {
+        Cow::Owned(text.chars().filter(|&ch| !dropped(ch)).collect())
     } else {
-        Cow::Borrowed(unit)
+        Cow::Borrowed(text)
     }
+}
+
+/// 콘솔(ConPTY)은 이 보이지 않는 서식 문자마다 한 칸씩 전진하지만, 폭 계산과
+/// xterm.js는 0칸으로 본다. Windows 파일 속성 창에서 복사한 날짜처럼 한 행에
+/// 여럿 들면 그 행이 콘솔 오른쪽 끝을 넘고, 콘솔이 다음 행을 줄바꿈 없이 이어
+/// 보내 화면에서 두 행이 붙는다. 원문은 두고 출력에서만 뺀다.
+fn is_console_only_invisible(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061c}'
+            | '\u{200b}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+    )
 }
 
 impl CellFrame {
@@ -14849,6 +14871,8 @@ fn print_selected_chunks(
     bold: bool,
     background: Option<Rgb>,
 ) -> Result<()> {
+    let text = without_chars(text, is_console_only_invisible);
+    let text = text.as_ref();
     let Some(selected_columns) = selected_columns else {
         queue!(out, Print(text))?;
         *column += UnicodeWidthStr::width(text);
@@ -18474,6 +18498,27 @@ mod tests {
         // 탭이 차지하던 칸은 빈 칸으로 남아 배경이 그대로 칠해지고, 뒤따르는
         // 글자는 폭 계산과 같은 열에 그려진다.
         assert_eq!(glyphs, vec!["a".to_owned(), String::new(), "b".to_owned()]);
+    }
+
+    #[test]
+    fn copied_windows_dates_never_send_bidi_marks_to_the_console() {
+        // Windows' file Properties dialog formats dates this way. The console
+        // advances a cell per mark while layout and xterm.js count none, so a
+        // padded row carrying them ran past the edge and swallowed the next row.
+        let date = "\u{200e}2026\u{200e}년 \u{200e}10\u{200e}월 \u{200e}22\u{200e}일 \u{200e}목요일, \u{200f}\u{200e}오전 9:03:11";
+        let mut frame = CellFrame::new(60, 1);
+        frame.write(0, 0, date, CellStyle::plain());
+        assert_eq!(frame.cell(36, 0).glyph, "1", "the marks still take no cell");
+
+        let mut fullscreen = Vec::new();
+        emit_row_sequential(&mut fullscreen, &frame, 0, 0).expect("row emits");
+        let mut inline = Vec::new();
+        print_line(&mut inline, &PaintLine::plain(date)).expect("line prints");
+        for output in [fullscreen, inline] {
+            let text = String::from_utf8(output).expect("terminal bytes are UTF-8");
+            assert!(!text.chars().any(is_console_only_invisible), "{text:?}");
+            assert!(text.contains("2026년 10월 22일 목요일, 오전 9:03:11"), "{text:?}");
+        }
     }
 
     #[test]

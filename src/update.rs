@@ -23,14 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Codex Computer Use의 Esc 중단과 종료 후 마우스 커서 복원을 보강하고, 복원 API가 성공해도 커서가 계속 투명한 경우 재검증하도록 했습니다.",
-    "Windows에서 선택한 Codex 실행기를 우회하지 않도록 고쳐, 순정 CLI와 다른 설치본이나 실행 환경을 사용하는 경우를 줄였습니다.",
+    "Windows 파일 속성 창 등에서 복사한 날짜를 붙여넣으면 메시지 줄이 다음 줄과 이어 붙어 깨져 보이던 문제를 고쳤습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Codex Computer Use now stops more reliably on Esc and restores the mouse cursor after it ends, re-checking when the cursor stays transparent even though the restore API succeeded.",
-    "On Windows, the selected Codex launcher is no longer bypassed, so sessions are less likely to run a different install or environment than the stock CLI.",
+    "Fixed message rows running into the next row and looking broken after pasting dates copied from places like the Windows file Properties dialog.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");
