@@ -23,12 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Windows 파일 속성 창 등에서 복사한 날짜를 붙여넣으면 메시지 줄이 다음 줄과 이어 붙어 깨져 보이던 문제를 고쳤습니다.",
+    "Claude Code 2.1.309를 적용해, API 응답이 느릴 때 모델 전환이 거절되거나 중단·모델 전환이 늦게 반영되던 문제와 꺼 둔 MCP 서버가 다시 연결되던 문제를 고쳤습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Fixed message rows running into the next row and looking broken after pasting dates copied from places like the Windows file Properties dialog.",
+    "Updated to Claude Code 2.1.309, fixing model switches being refused when the API was slow, interrupts and model switches taking effect late, and disabled MCP servers reconnecting.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");
