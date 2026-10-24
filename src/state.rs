@@ -447,7 +447,7 @@ impl SlashCommand {
     }
 }
 
-const SLASH_COMMANDS: [SlashCommand; 35] = [
+const SLASH_COMMANDS: [SlashCommand; 36] = [
     SlashCommand {
         name: "/provider",
         korean: "Claude·Codex provider 전환 또는 OpenCode 연결",
@@ -470,6 +470,12 @@ const SLASH_COMMANDS: [SlashCommand; 35] = [
         name: "/auto-knowledge",
         korean: ".knowledge 교훈 자동 기록 켜기·끄기",
         english: "Toggle auto-saving lessons to .knowledge",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/prompt-suggestions",
+        korean: "다음 프롬프트 제안 켜기·끄기",
+        english: "Toggle next-prompt suggestions",
         takes_argument: false,
     },
     SlashCommand {
@@ -1326,6 +1332,7 @@ pub enum Action {
     /// Save whether completed progress responses stay visible or fold away.
     PersistResponseDisplayMode(ResponseDisplayMode),
     PersistAutoKnowledge(bool),
+    PersistPromptSuggestions(bool),
     PersistLanguage(bool),
     /// Save the model ids starred with Space in `/model`.
     PersistModelFavorites(Vec<String>),
@@ -1835,6 +1842,7 @@ enum DisplaySetting {
     Shell,
     Diff,
     AutoKnowledge,
+    PromptSuggestions,
     Language,
 }
 
@@ -1845,6 +1853,7 @@ impl DisplaySetting {
             Self::Shell => "Shell",
             Self::Diff => "Diff",
             Self::AutoKnowledge => "Auto Knowledge",
+            Self::PromptSuggestions => "Prompt Suggestions",
             Self::Language => "Language",
         }
     }
@@ -1853,7 +1862,7 @@ impl DisplaySetting {
         match self {
             Self::Response => &["All", "Completed"],
             Self::Shell | Self::Diff => &["Hide", "Collapse", "Expand"],
-            Self::AutoKnowledge => &["On", "Off"],
+            Self::AutoKnowledge | Self::PromptSuggestions => &["On", "Off"],
             Self::Language => &["Korean", "English"],
         }
     }
@@ -1867,6 +1876,14 @@ impl DisplaySetting {
             (Self::AutoKnowledge, 1) => tr(
                 "다음 요청부터 이 프로젝트의 자동 기록을 끕니다. 기존 지식 인덱스는 계속 먼저 읽습니다.",
                 "Turns off automatic recording for this project from the next request. The existing knowledge index is still read first.",
+            ),
+            (Self::PromptSuggestions, 0) => tr(
+                "응답이 끝나면 다음에 보낼 만한 프롬프트를 빈 입력창에 흐리게 보여줍니다. →로 입력창에 채웁니다. Codex는 제안마다 짧은 요청을 한 번 더 보냅니다.",
+                "After a response, shows a likely next prompt dimmed in the empty composer. Press → to fill it in. Codex sends one extra short request per suggestion.",
+            ),
+            (Self::PromptSuggestions, 1) => tr(
+                "다음 프롬프트 제안을 표시하지 않습니다.",
+                "Stops showing next-prompt suggestions.",
             ),
             (Self::Response, 0) => tr(
                 "Super Vibe 모드 전용입니다. 진행 응답을 모두 표시합니다.",
@@ -4064,6 +4081,15 @@ pub struct AppState {
     five_hour_remaining: Option<String>,
     fast_mode: bool,
     auto_knowledge: bool,
+    prompt_suggestions: bool,
+    /// The runtime's guess at the next prompt, shown dimmed in the empty
+    /// composer until → takes it or the next turn starts.
+    prompt_suggestion: Option<PromptSuggestion>,
+    /// Bumped by every turn and thread change, so a Codex guess that comes back
+    /// after the conversation moved on is dropped.
+    prompt_suggestion_seq: u64,
+    /// A finished Codex turn waiting for the host to ask for its guess.
+    prompt_suggestion_due: bool,
     side_parent: Option<SideParent>,
     /// BTW panes run the plan silently: steps still advance, but the panel and
     /// its transcript cards stay off the split view.
@@ -4374,6 +4400,10 @@ impl AppState {
             five_hour_remaining: remaining_label(five_hour_reset_at, unix_now()),
             fast_mode: read_fast_mode(),
             auto_knowledge,
+            prompt_suggestions: prompt_suggestions_enabled(),
+            prompt_suggestion: None,
+            prompt_suggestion_seq: 0,
+            prompt_suggestion_due: false,
             side_parent: None,
             plan_panel_hidden: false,
             last_assistant_markdown: None,
@@ -6306,6 +6336,59 @@ impl AppState {
             .is_some_and(|armed_at| armed_at.elapsed() < QUIT_ARM_WINDOW)
     }
 
+    fn clear_prompt_suggestion(&mut self) {
+        self.prompt_suggestion = None;
+        self.prompt_suggestion_due = false;
+        self.prompt_suggestion_seq += 1;
+    }
+
+    /// The suggestion only shows where → can take it: an idle, ordinary
+    /// composer with no other hint to give.
+    fn visible_prompt_suggestion(&self) -> Option<&PromptSuggestion> {
+        self.prompt_suggestion.as_ref().filter(|_| {
+            self.prompt_suggestions
+                && !self.busy
+                && !self.shell_mode
+                && !self.provider_switch_pending()
+                && self.stashed_prompt.is_none()
+        })
+    }
+
+    /// `seq` names the Codex request a guess answers; Claude's arrive right
+    /// after their own turn and carry none.
+    pub fn apply_prompt_suggestion(&mut self, seq: Option<u64>, suggestion: &str) {
+        if !self.prompt_suggestions
+            || self.busy
+            || seq.is_some_and(|seq| seq != self.prompt_suggestion_seq)
+        {
+            return;
+        }
+        self.prompt_suggestion = clean_prompt_suggestion(suggestion).map(PromptSuggestion::new);
+    }
+
+    /// What the host sends `codex exec` once a Codex turn finished: the last
+    /// prompt and the answer to it, cut to what a guess needs.
+    pub fn take_prompt_suggestion_request(&mut self) -> Option<PromptSuggestionRequest> {
+        if !std::mem::take(&mut self.prompt_suggestion_due) || self.busy {
+            return None;
+        }
+        let answer = self.last_assistant_markdown.as_deref()?;
+        let prompt = self.turn_prompts.last().map_or("", |prompt| prompt.body.as_str());
+        let prompt = prompt.chars().take(PROMPT_SUGGESTION_PROMPT_CHARS).collect::<String>();
+        let skip = answer.chars().count().saturating_sub(PROMPT_SUGGESTION_ANSWER_CHARS);
+        let answer = answer.chars().skip(skip).collect::<String>();
+        Some(PromptSuggestionRequest {
+            seq: self.prompt_suggestion_seq,
+            model: self
+                .codex_title_model()
+                .unwrap_or_else(|| self.selected_model_name())
+                .to_owned(),
+            conversation: format!(
+                "<user>\n{prompt}\n</user>\n\n<assistant>\n{answer}\n</assistant>"
+            ),
+        })
+    }
+
     /// One-off events (skills reloaded, model rerouted, …) share the composer
     /// notice slot with the copy message: it sits where the eye already is and
     /// `tick` clears it after 1.4s. The status line is for standing state only,
@@ -6441,6 +6524,7 @@ impl AppState {
         });
         side.show_welcome = false;
         side.fast_mode = self.fast_mode;
+        side.prompt_suggestions = self.prompt_suggestions;
         if project_settings_key(&side.cwd) == project_settings_key(&self.cwd) {
             side.auto_knowledge = self.auto_knowledge;
         }
@@ -6696,6 +6780,7 @@ impl AppState {
         }
         self.turn_id = Some(turn_id);
         self.busy = true;
+        self.clear_prompt_suggestion();
         if !self.pending_interrupt {
             self.turn_interrupted = false;
         }
@@ -6854,6 +6939,7 @@ impl AppState {
         // 먼저 일어난 일이므로, 카드가 그 위에 놓이지 않게 먼저 확정한다.
         self.settle_web_search_run();
         self.finish_active_turn_prompt(started_at);
+        self.clear_prompt_suggestion();
         prompt.response_agent = Some(self.active_turn_agent);
         self.turn_prompt_started_at.insert(prompt.id(), started_at);
         self.turn_prompts.push(prompt.clone());
@@ -7538,6 +7624,7 @@ impl AppState {
         self.transient_status = None;
         self.side_parent = None;
         self.last_assistant_markdown = None;
+        self.clear_prompt_suggestion();
         self.composer_notice = None;
         self.activity_notice = None;
         self.quit_armed_at = None;
@@ -7877,6 +7964,8 @@ impl AppState {
                 // An empty composer is the only place the stash can be reclaimed
                 // from, so its own hint sits exactly where the chord applies.
                 "Ctrl+S: restore stashed draft"
+            } else if let Some(suggestion) = self.visible_prompt_suggestion() {
+                suggestion.hint.as_str()
             } else {
                 // Idle is when Tab actually changes the role, so the hint sits
                 // in the empty composer rather than in /help alone.
@@ -9102,6 +9191,16 @@ impl AppState {
             }
             KeyCode::Right if alt || ctrl => {
                 self.editor.move_word_right();
+                Action::None
+            }
+            KeyCode::Right
+                if self.editor.is_empty()
+                    && self.composer_images.is_empty()
+                    && self.visible_prompt_suggestion().is_some() =>
+            {
+                if let Some(suggestion) = self.prompt_suggestion.take() {
+                    self.editor.insert_str(&suggestion.text);
+                }
                 Action::None
             }
             KeyCode::Left => {
@@ -10334,6 +10433,18 @@ impl AppState {
                 // it slots in after everything this turn produced, ahead of the
                 // follow-up cycle the runtime may open for it.
                 self.flush_pending_steer_prompts();
+                // Claude's bridge sends its own guess after the turn; Codex has
+                // to be asked for one.
+                self.prompt_suggestion_due = successful
+                    && self.prompt_suggestions
+                    && self.selected_provider() == ModelProvider::Codex
+                    && self.side_parent.is_none()
+                    && self.queued_prompts.is_empty();
+            }
+            "claude/promptSuggestion" => {
+                if let Some(suggestion) = params.get("suggestion").and_then(Value::as_str) {
+                    self.apply_prompt_suggestion(None, suggestion);
+                }
             }
             "turn/plan/updated" => {
                 let explanation = params
@@ -11303,6 +11414,17 @@ impl AppState {
             }
             "/auto-knowledge" => self.set_display_setting(
                 DisplaySetting::AutoKnowledge,
+                if parts.len() == 2 { parts[1] } else { "" },
+            ),
+            "/prompt-suggestions" if parts.len() == 1 => {
+                self.open_setting_picker(
+                    DisplaySetting::PromptSuggestions,
+                    usize::from(!self.prompt_suggestions),
+                );
+                Action::None
+            }
+            "/prompt-suggestions" => self.set_display_setting(
+                DisplaySetting::PromptSuggestions,
                 if parts.len() == 2 { parts[1] } else { "" },
             ),
             "/fast" if parts.len() == 1 => {
@@ -16482,6 +16604,13 @@ impl AppState {
                 self.auto_knowledge = selected == 0;
                 Action::PersistAutoKnowledge(self.auto_knowledge)
             }
+            DisplaySetting::PromptSuggestions => {
+                self.prompt_suggestions = selected == 0;
+                if !self.prompt_suggestions {
+                    self.clear_prompt_suggestion();
+                }
+                Action::PersistPromptSuggestions(self.prompt_suggestions)
+            }
             DisplaySetting::Language => {
                 language::set_english(selected == 1);
                 self.push_notice(
@@ -19361,6 +19490,48 @@ fn read_vibe_config_value(key: &str) -> Option<String> {
             .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
             .and_then(|config| config_value(&config, key))
     })
+}
+
+pub(crate) const PROMPT_SUGGESTIONS_KEY: &str = "prompt_suggestions";
+/// The Codex guess reads the start of the prompt and the end of the answer,
+/// where a reply usually says what is left to do.
+const PROMPT_SUGGESTION_PROMPT_CHARS: usize = 2_000;
+const PROMPT_SUGGESTION_ANSWER_CHARS: usize = 4_000;
+/// A suggestion is one composer row's worth; anything longer is not a guess.
+const PROMPT_SUGGESTION_CHARS: usize = 200;
+
+/// On unless `/prompt-suggestions off` saved otherwise.
+pub(crate) fn prompt_suggestions_enabled() -> bool {
+    read_vibe_setting(PROMPT_SUGGESTIONS_KEY).as_deref() != Some("false")
+}
+
+pub struct PromptSuggestionRequest {
+    pub seq: u64,
+    pub model: String,
+    pub conversation: String,
+}
+
+struct PromptSuggestion {
+    text: String,
+    /// The dimmed placeholder, naming the key that takes it.
+    hint: String,
+}
+
+impl PromptSuggestion {
+    fn new(text: String) -> Self {
+        let hint = format!("{text}  (→)");
+        Self { text, hint }
+    }
+}
+
+/// The guess's first line, without the quotes or markdown a model may add.
+pub(crate) fn clean_prompt_suggestion(reply: &str) -> Option<String> {
+    let line = reply.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let line = line
+        .trim_start_matches(['>', '*', '"', '\'', '`', '“', '‘', ' '])
+        .trim_end_matches(['*', '"', '\'', '`', '”', '’', ' '])
+        .trim();
+    (!line.is_empty() && line.chars().count() <= PROMPT_SUGGESTION_CHARS).then(|| line.to_owned())
 }
 
 /// settings.toml only, for keys that never lived in Codex's config.toml and so
@@ -27178,6 +27349,100 @@ mod tests {
             state.committed.last().map(|block| block.body.as_str()),
             Some("before [Image #1] after")
         );
+    }
+
+    #[test]
+    fn a_claude_prompt_suggestion_dims_the_empty_composer_and_right_takes_it() {
+        let mut state = claude_test_state();
+        let default_hint = state.view().composer_placeholder.to_owned();
+        state.handle_notification(
+            "claude/promptSuggestion",
+            &json!({ "threadId": "other", "suggestion": "elsewhere" }),
+        );
+        assert_eq!(state.view().composer_placeholder, default_hint);
+        state.handle_notification(
+            "claude/promptSuggestion",
+            &json!({ "threadId": "thread", "suggestion": "\"run the tests\"\n" }),
+        );
+        assert_eq!(state.view().composer_placeholder, "run the tests  (→)");
+        // The stash hint outranks it, and → stays an ordinary cursor key there.
+        state.editor.insert_str("draft");
+        let stash = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        state.handle_key(stash);
+        assert!(state.stashed_prompt.is_some());
+        assert_ne!(state.view().composer_placeholder, "run the tests  (→)");
+        state.handle_key(stash);
+        state.editor.clear();
+
+        state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(state.editor.text(), "run the tests");
+        state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(state.editor.text(), "run the tests", "a taken suggestion is not offered twice");
+
+        state.editor.clear();
+        state.handle_notification(
+            "claude/promptSuggestion",
+            &json!({ "threadId": "thread", "suggestion": "commit it" }),
+        );
+        state.set_turn_started("next".to_owned());
+        state.busy = false;
+        assert_eq!(state.view().composer_placeholder, default_hint, "a new turn drops the old guess");
+    }
+
+    #[test]
+    fn a_finished_codex_turn_asks_for_a_guess_and_drops_one_that_arrives_late() {
+        let mut state = test_state();
+        state.turn_prompts.push(Block::new(BlockKind::User, "gpt-5.6-sol", "fix the parser"));
+        state.last_assistant_markdown = Some("Fixed it. Tests not run yet.".to_owned());
+        state.busy = true;
+        state.turn_id = Some("turn-1".to_owned());
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "threadId": "thread", "turn": { "id": "turn-1", "status": "completed" } }),
+        );
+        let request = state.take_prompt_suggestion_request().expect("a Codex turn asks once");
+        assert!(state.take_prompt_suggestion_request().is_none());
+        assert_eq!(request.model, "gpt-5.6-sol");
+        assert!(request.conversation.contains("<user>\nfix the parser\n</user>"));
+        assert!(request.conversation.contains("Tests not run yet."));
+
+        state.apply_prompt_suggestion(Some(request.seq), "run the tests");
+        assert_eq!(state.view().composer_placeholder, "run the tests  (→)");
+
+        // A guess for a turn the conversation already moved past stays out.
+        state.set_turn_started("turn-2".to_owned());
+        state.busy = false;
+        state.apply_prompt_suggestion(Some(request.seq), "stale guess");
+        assert!(state.prompt_suggestion.is_none());
+    }
+
+    #[test]
+    fn prompt_suggestions_turn_off_and_stop_asking() {
+        let mut state = test_state();
+        state.apply_prompt_suggestion(None, "run the tests");
+        assert!(state.prompt_suggestion.is_some());
+        assert!(matches!(state.run_slash_command("/prompt-suggestions"), Action::None));
+        assert_eq!(state.overlay_view().unwrap().title, "Prompt Suggestions");
+        state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(
+            state.run_slash_command("/prompt-suggestions off"),
+            Action::PersistPromptSuggestions(false)
+        ));
+        assert!(state.prompt_suggestion.is_none());
+        state.apply_prompt_suggestion(None, "run the tests");
+        assert!(state.prompt_suggestion.is_none());
+
+        state.last_assistant_markdown = Some("Done.".to_owned());
+        state.busy = true;
+        state.handle_notification("turn/completed", &json!({ "threadId": "thread" }));
+        assert!(state.take_prompt_suggestion_request().is_none());
+    }
+
+    #[test]
+    fn clean_prompt_suggestion_keeps_one_short_line() {
+        assert_eq!(clean_prompt_suggestion("\n  `run the tests`  \nmore"), Some("run the tests".to_owned()));
+        assert_eq!(clean_prompt_suggestion("   \n"), None);
+        assert_eq!(clean_prompt_suggestion(&"x".repeat(201)), None);
     }
 
     fn claude_test_state() -> AppState {

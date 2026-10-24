@@ -1078,6 +1078,19 @@ impl BackendServer {
         }
     }
 
+    /// Guesses the next prompt after a Codex turn; see
+    /// [`crate::app_server::spawn_prompt_suggestion`].
+    pub fn suggest_codex_prompt(
+        &self,
+        model: &str,
+        conversation: &str,
+        done: impl FnOnce(Option<String>) + Send + 'static,
+    ) {
+        if self.codex.is_some() {
+            crate::app_server::spawn_prompt_suggestion(&self.codex_path, model, conversation, done);
+        }
+    }
+
     pub fn integration_client(&self, model: &str) -> Option<IntegrationClient> {
         if is_claude_model(model) {
             Some(IntegrationClient::Claude(self.claude.client()))
@@ -3000,7 +3013,8 @@ fn claude_session_params(params: &Value, cwd: &Path, session_id: Option<&str>) -
         "model": params.get("model").cloned().unwrap_or_else(|| json!("claude:default")),
         // The fixed-model lanes the Planner and Goal Runner roles dispatch by name.
         "agents": crate::subagents::claude_agent_definitions(),
-        "systemPrompt": format!("{rules}{}", tr(crate::KOREAN_SYSTEM_RULE, ""))
+        "systemPrompt": format!("{rules}{}", tr(crate::KOREAN_SYSTEM_RULE, "")),
+        "promptSuggestions": crate::state::prompt_suggestions_enabled()
     });
     if let Some(effort) = params
         .get("effort")

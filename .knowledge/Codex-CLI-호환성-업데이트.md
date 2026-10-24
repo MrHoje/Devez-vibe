@@ -73,6 +73,12 @@ Codex 0.x.y 기준으로 호환성 업데이트해
 - **주의 필요**: app-server 스키마는 바뀌지 않았지만 Codex CLI의 사용자 경험·명령 의미가
   달라져 DevezCLI의 Codex 정렬 목표에 영향을 줌.
 
+## 다음 프롬프트 제안
+
+- 0.164.0 app-server 스키마에는 다음 프롬프트 제안 요청·이벤트가 없다(`suggest`는 `installSuggestionPluginNames`뿐). 그래서 Codex 턴이 성공하면 제목 생성과 같은 격리 방식의 일회성 `codex exec --ephemeral`로 마지막 프롬프트 앞부분과 답변 뒷부분만 보내 한 줄을 받는다(`app_server::spawn_prompt_suggestion`, 모델은 `codex_title_model`의 최신 luna).
+- 제안마다 짧은 요청이 한 번 더 나가므로 `/prompt-suggestions off`로 끌 수 있다. 응답이 늦게 오면 `prompt_suggestion_seq`로 이미 지난 턴의 제안을 버린다.
+- 버전 동기화 때 app-server에 제안 API가 생겼는지 스키마에서 `suggest`를 검색해 확인하고, 생겼으면 별도 `codex exec` 대신 그 API로 바꾼다.
+
 ## 확인 기록
 
 ### 2026-09-10 필수 호환성 수정 및 검수 — 미배포

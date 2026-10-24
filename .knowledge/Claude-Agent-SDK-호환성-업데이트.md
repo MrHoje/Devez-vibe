@@ -122,6 +122,12 @@ TUI를 띄우지 않고 실제 에이전트 동작을 확인할 때는 브리지
 - `result.queued_turn_count`가 0보다 크면 별도 실행이 이어진다는 뜻이다. 번들 CLI 0.3.283은 결과 시점의 명령 대기열에서 이 값을 채운다. 결과 직후에 읽힌 입력은 0으로 올 수 있어, 0일 때 추가 입력 부채를 지우면 그 답이 턴 없이 버려진다.
 - SDK 갱신 때 이 필드가 빠지면 같은 공백이 다시 생긴다. DevezCode 스피너는 dvz가 쓰는 방 상태 파일만 따르므로, 이런 증상은 호스트보다 브리지의 턴 알림부터 본다.
 
+## 다음 프롬프트 제안
+
+- 브리지는 `promptSuggestions`를 켜고(호스트의 `/prompt-suggestions` 설정을 세션 시작 파라미터로 받음), `result` 뒤에 오는 `prompt_suggestion` 메시지를 `claude/promptSuggestion` 알림으로 넘긴다. 그사이 다음 턴이 시작됐으면 버린다.
+- SDK는 첫 턴, API 오류 직후, plan 모드, 사용 한도 근접 시, `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`, settings의 `promptSuggestionEnabled: false`에서 제안을 보내지 않는다. 이때 제안이 안 보이는 것은 정상이다.
+- 설정을 바꿔도 이미 열린 세션의 쿼리 옵션은 그대로라, 끄면 호스트가 표시만 막고 다음 세션부터 생성도 멈춘다.
+
 ## 하단 실행 목록과 워크플로
 
 - 순정 Claude Code 2.1.296 대화형 화면은 입력창 아래 패널에 백그라운드 에이전트를 한 줄씩, 워크플로는 워크플로마다 집계 한 줄(이름·진행 막대·완료/전체 에이전트·경과 시간·토큰)로 그린다. 워크플로 내부 에이전트는 작업(task)이 아니어서 개별 행이 없고 `/workflows`나 인라인 트리(ctrl+o)에서만 보인다. `N background tasks` 알약은 워크플로를 빼고, coordinator 패널이 켜져 있으면 백그라운드 에이전트도 뺀다.

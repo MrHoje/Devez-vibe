@@ -14044,11 +14044,11 @@ fn input_lines_with_controls(
             && composer_preedit.is_empty()
             && index == 0;
         let content = if is_placeholder {
-            if placeholder.is_empty() {
-                String::new()
-            } else {
-                placeholder.to_owned()
-            }
+            // A prompt suggestion can outrun the row; the hint never wraps.
+            compact_right(
+                placeholder,
+                panel_width.saturating_sub(UnicodeWidthStr::width(first_prefix) + 1),
+            )
         } else {
             raw
         };

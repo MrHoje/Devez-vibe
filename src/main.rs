@@ -1072,6 +1072,7 @@ fn hold_until_thread(
         | Action::Quit
         | Action::SetTheme(_)
         | Action::PersistAutoKnowledge(_)
+        | Action::PersistPromptSuggestions(_)
         | Action::PersistLanguage(_)
         | Action::PersistModelFavorites(_)
         | Action::Copy(_)
@@ -1370,6 +1371,10 @@ enum ManagementUpdate {
     SelfUpdate {
         result: std::result::Result<String, String>,
     },
+    PromptSuggestion {
+        seq: u64,
+        suggestion: String,
+    },
 }
 
 fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
@@ -1472,6 +1477,9 @@ fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
             }
         },
         ManagementUpdate::SelfUpdate { result } => state.finish_self_update(result),
+        ManagementUpdate::PromptSuggestion { seq, suggestion } => {
+            state.apply_prompt_suggestion(Some(seq), &suggestion)
+        }
         ManagementUpdate::McpReconnect { provider, result } => match result {
             Ok(response) => {
                 state.finish_mcp_reconnect(provider, &response, tr("재연결했습니다.", "Reconnected.").to_owned())
@@ -2443,6 +2451,17 @@ async fn event_loop(
             );
             handoff_to_save = None;
         }
+        if let Some(request) = state.take_prompt_suggestion_request() {
+            let sender = management_tx.clone();
+            server.suggest_codex_prompt(&request.model, &request.conversation, move |suggestion| {
+                if let Some(suggestion) = suggestion {
+                    let _ = sender.send(ManagementUpdate::PromptSuggestion {
+                        seq: request.seq,
+                        suggestion,
+                    });
+                }
+            });
+        }
         // The paint above is what tells the renderer where the prompt characters
         // ended up, so the highlight is taken from it and painted by one more.
         if select_all_pending {
@@ -3336,6 +3355,14 @@ async fn run_action(
         Action::PersistModelFavorites(ids) => {
             if let Err(error) = state::write_model_favorites(&ids) {
                 state.push_notice(BlockKind::Warning, "Failed to save favorites", error.to_string());
+            }
+        }
+        Action::PersistPromptSuggestions(enabled) => {
+            if let Err(error) = state::write_vibe_config_value(
+                state::PROMPT_SUGGESTIONS_KEY,
+                if enabled { "true" } else { "false" },
+            ) {
+                state.push_notice(BlockKind::Warning, "Prompt suggestion setting save failed", error.to_string());
             }
         }
         Action::PersistLanguage(english) => {

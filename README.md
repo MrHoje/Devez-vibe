@@ -128,6 +128,7 @@ dvz update
 - `/` 명령 자동완성과 `$`(Plugin·Skill·App), `@`(Plugin·Skill·파일·폴더) 검색
 - `Ctrl+Z`/`Ctrl+Y` 실행 취소·다시 실행, `Ctrl+W`/`Ctrl+K` 단어·줄 삭제, `Ctrl+J` 줄바꿈
 - `Alt+B`/`Alt+F` 단어 이동
+- 응답 뒤 빈 입력창에 다음 프롬프트 제안을 흐리게 표시, `→`로 채우기, `/prompt-suggestions`로 켜고 끄기
 
 ### 렌더링
 

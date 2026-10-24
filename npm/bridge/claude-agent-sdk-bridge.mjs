@@ -826,6 +826,8 @@ function makeOptions(params, sessionId, resume) {
     perTaskStopAffordance: true,
     // 순정처럼 하위 에이전트 줄의 설명을 약 30초마다 진행 요약으로 바꾼다.
     agentProgressSummaries: true,
+    // 턴이 끝나면 다음 프롬프트 제안을 받아 빈 입력창에 흐리게 보여준다.
+    promptSuggestions: params.promptSuggestions !== false,
     systemPrompt: {
       type: "preset",
       preset: "claude_code",
@@ -3950,6 +3952,11 @@ async function consumeMessage(session, message) {
       provider: "Claude",
       message: `${message.tool_name || "Tool"} was denied${reason ? `: ${reason}` : "."}`,
     });
+  } else if (message.type === "prompt_suggestion") {
+    // 제안은 result 뒤에 온다. 그사이 다음 턴이 시작됐으면 이미 지난 제안이다.
+    if (!session.turn && message.suggestion) {
+      notify("claude/promptSuggestion", { threadId: session.id, suggestion: message.suggestion });
+    }
   } else if (message.type === "rate_limit_event") {
     if (session.turn) session.turn.rateLimitInfo = message.rate_limit_info;
     notify("claude/account/updated", { threadId: session.id, rateLimitInfo: message.rate_limit_info });
@@ -5109,6 +5116,30 @@ async function runGuardedPermissionSelfTest() {
   }
 }
 
+async function runPromptSuggestionSelfTest() {
+  if (makeOptions({}, "00000000-0000-4000-8000-000000000001").promptSuggestions !== true
+      || makeOptions({ promptSuggestions: false }, "00000000-0000-4000-8000-000000000002").promptSuggestions !== false) {
+    throw new Error("Claude prompt suggestion option self-test failed");
+  }
+  const captured = [];
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { captured.push(JSON.parse(String(chunk))); return true; };
+  try {
+    const session = { id: "suggestion-session", closed: false, turn: null };
+    await consumeMessage(session, { type: "prompt_suggestion", suggestion: "run the tests" });
+    // 다음 턴이 이미 시작됐다면 지난 턴의 제안은 버린다.
+    session.turn = { id: "next-turn" };
+    await consumeMessage(session, { type: "prompt_suggestion", suggestion: "stale" });
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  if (captured.length !== 1 || captured[0].method !== "claude/promptSuggestion"
+      || captured[0].params.threadId !== "suggestion-session"
+      || captured[0].params.suggestion !== "run the tests") {
+    throw new Error(`Claude prompt suggestion self-test failed: ${JSON.stringify(captured)}`);
+  }
+}
+
 function runToolPolicySelfTest() {
   const cwd = process.platform === "win32" ? "C:\\repo" : "/repo";
   const reviewer = { readOnly: true, writableRoots: [] };
@@ -5295,6 +5326,7 @@ async function runSelfTest() {
   }
   await runPermissionModeSelfTest();
   await runGuardedPermissionSelfTest();
+  await runPromptSuggestionSelfTest();
   runToolPolicySelfTest();
   await runComputerSelfTest();
   await runCommandTimeoutSelfTest();

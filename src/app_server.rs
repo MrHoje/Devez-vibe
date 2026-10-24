@@ -618,6 +618,69 @@ pub(crate) fn spawn_thread_title(
     });
 }
 
+const PROMPT_SUGGESTION_INSTRUCTIONS: &str =
+    "Predict the next message the user is most likely to send in the conversation below.
+Write it the way the user would type it, in the language the user writes in: one short line, ideally under 80 characters.
+If there is no natural next step, reply with nothing. No quotes, labels, or explanations. Do not run commands or use tools.";
+
+/// Claude Code predicts the next prompt after each turn; the Codex app-server
+/// has no such event, so a one-off `codex exec` makes the same guess from the
+/// last exchange, isolated the way thread titles are. `done` gets the cleaned
+/// suggestion, or `None` when the guess failed or came back empty.
+pub(crate) fn spawn_prompt_suggestion(
+    codex_path: &Path,
+    model: &str,
+    conversation: &str,
+    done: impl FnOnce(Option<String>) + Send + 'static,
+) {
+    let mut command = codex_invocation(
+        &resolve_command(codex_path),
+        &[
+            "exec",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "--color",
+            "never",
+            "-c",
+            "model_reasoning_effort=\"low\"",
+            "-m",
+            model,
+        ],
+    );
+    command
+        .arg("-C")
+        .arg(env::temp_dir())
+        .arg("-")
+        .env_remove("DEVEZCODE_ROOM_ID")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    crate::child_process::isolate_backend(&mut command);
+    let input = format!("{PROMPT_SUGGESTION_INSTRUCTIONS}\n\n{conversation}");
+    tokio::spawn(async move {
+        let Ok(mut child) = command.spawn() else {
+            return done(None);
+        };
+        let _job = crate::child_process::adopt_backend(&child);
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(input.as_bytes()).await;
+        }
+        let output = timeout(Duration::from_secs(60), child.wait_with_output())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .filter(|output| output.status.success());
+        done(output.and_then(|output| {
+            crate::state::clean_prompt_suggestion(&String::from_utf8_lossy(&output.stdout))
+        }));
+    });
+}
+
 /// The reply's first line, without the quotes or markdown a model may add.
 pub(crate) fn clean_title(reply: &str) -> Option<String> {
     let line = reply.lines().map(str::trim).find(|line| !line.is_empty())?;
