@@ -75,8 +75,10 @@ Codex 0.x.y 기준으로 호환성 업데이트해
 
 ## 다음 프롬프트 제안
 
-- 0.164.0 app-server 스키마에는 다음 프롬프트 제안 요청·이벤트가 없다(`suggest`는 `installSuggestionPluginNames`뿐). 그래서 Codex 턴이 성공하면 제목 생성과 같은 격리 방식의 일회성 `codex exec --ephemeral`로 마지막 프롬프트 앞부분과 답변 뒷부분만 보내 한 줄을 받는다(`app_server::spawn_prompt_suggestion`, 모델은 `codex_title_model`의 최신 luna).
-- 제안마다 짧은 요청이 한 번 더 나가므로 `/prompt-suggestions off`로 끌 수 있다. 응답이 늦게 오면 `prompt_suggestion_seq`로 이미 지난 턴의 제안을 버린다.
+- 0.164.0 app-server 스키마에는 다음 프롬프트 제안 요청·이벤트가 없다(`suggest`는 `installSuggestionPluginNames`뿐). 그래서 Codex 턴이 답변을 남기고 성공하면 제목 생성과 같은 격리 방식의 일회성 `codex exec --ephemeral --json`으로 마지막 프롬프트 앞부분과 답변 뒷부분만 보내 한 줄을 받는다(`app_server::spawn_prompt_suggestion`).
+- 모델은 `codex_title_model`의 최신 luna뿐이다. luna가 목록에 없으면 주 모델로 대신하지 않고 제안을 건너뛴다(턴마다 주 모델 요청 비용이 생기므로).
+- 답변은 외부 문서를 인용할 수 있어 프롬프트 주입 경로가 된다. 대화의 `</user>`·`</assistant>`를 무력화하고, JSON 이벤트에 `agent_message`·`reasoning` 말고 다른 항목(명령·검색·MCP 등)이 하나라도 있으면 결과를 버린다. 0.164.0 바이너리에서 `item.started`·`item.completed`·`agent_message`·`command_execution` 이름을 확인했고, 인증이 없어 실제 실행 출력은 보지 못했다.
+- 턴 제공자는 선택 중인 모델이 아니라 그 턴을 실행한 모델(`active_cost_model`)로 판단한다. 새 턴·세션 전환으로 `prompt_suggestion_seq`가 바뀌면 진행 중인 실행을 중단하고, 늦게 온 결과도 버린다. 제안마다 짧은 요청이 한 번 더 나가므로 `/prompt-suggestions off`로 끌 수 있다.
 - 버전 동기화 때 app-server에 제안 API가 생겼는지 스키마에서 `suggest`를 검색해 확인하고, 생겼으면 별도 `codex exec` 대신 그 API로 바꾼다.
 
 ## 확인 기록

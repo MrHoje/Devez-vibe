@@ -1085,10 +1085,10 @@ impl BackendServer {
         model: &str,
         conversation: &str,
         done: impl FnOnce(Option<String>) + Send + 'static,
-    ) {
-        if self.codex.is_some() {
-            crate::app_server::spawn_prompt_suggestion(&self.codex_path, model, conversation, done);
-        }
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        self.codex.is_some().then(|| {
+            crate::app_server::spawn_prompt_suggestion(&self.codex_path, model, conversation, done)
+        })
     }
 
     pub fn integration_client(&self, model: &str) -> Option<IntegrationClient> {

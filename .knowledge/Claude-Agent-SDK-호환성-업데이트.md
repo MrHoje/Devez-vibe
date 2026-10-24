@@ -126,7 +126,7 @@ TUI를 띄우지 않고 실제 에이전트 동작을 확인할 때는 브리지
 
 - 브리지는 `promptSuggestions`를 켜고(호스트의 `/prompt-suggestions` 설정을 세션 시작 파라미터로 받음), `result` 뒤에 오는 `prompt_suggestion` 메시지를 `claude/promptSuggestion` 알림으로 넘긴다. 그사이 다음 턴이 시작됐으면 버린다.
 - SDK는 첫 턴, API 오류 직후, plan 모드, 사용 한도 근접 시, `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`, settings의 `promptSuggestionEnabled: false`에서 제안을 보내지 않는다. 이때 제안이 안 보이는 것은 정상이다.
-- 설정을 바꿔도 이미 열린 세션의 쿼리 옵션은 그대로라, 끄면 호스트가 표시만 막고 다음 세션부터 생성도 멈춘다.
+- 설정을 바꿔도 이미 열린 세션의 쿼리 옵션은 그대로다. 번들 CLI는 시작 시 `promptSuggestions && (환경 변수 또는 설정)`으로 앱 상태를 한 번 정하므로, 끄면 호스트가 표시만 즉시 막고 생성은 다음 세션부터 멈춘다. 꺼진 채 시작한 세션은 다시 켜도 다음 세션부터 제안이 온다. 턴마다 `applyFlagSettings({ promptSuggestionEnabled })`로 실시간 반영되는지는 검증하지 못해 쓰지 않았다.
 
 ## 하단 실행 목록과 워크플로
 

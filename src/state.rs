@@ -6354,6 +6354,19 @@ impl AppState {
         })
     }
 
+    /// A Codex guess still running for this number is still wanted.
+    pub fn prompt_suggestion_seq(&self) -> u64 {
+        self.prompt_suggestion_seq
+    }
+
+    /// `/prompt-suggestions` in either split pane applies to both.
+    pub fn set_prompt_suggestions(&mut self, enabled: bool) {
+        self.prompt_suggestions = enabled;
+        if !enabled {
+            self.clear_prompt_suggestion();
+        }
+    }
+
     /// `seq` names the Codex request a guess answers; Claude's arrive right
     /// after their own turn and carry none.
     pub fn apply_prompt_suggestion(&mut self, seq: Option<u64>, suggestion: &str) {
@@ -6372,17 +6385,20 @@ impl AppState {
         if !std::mem::take(&mut self.prompt_suggestion_due) || self.busy {
             return None;
         }
+        // Only the small luna model guesses: falling back to the main model
+        // would bill a full-price request after every turn.
+        let model = self.codex_title_model()?.to_owned();
         let answer = self.last_assistant_markdown.as_deref()?;
         let prompt = self.turn_prompts.last().map_or("", |prompt| prompt.body.as_str());
         let prompt = prompt.chars().take(PROMPT_SUGGESTION_PROMPT_CHARS).collect::<String>();
         let skip = answer.chars().count().saturating_sub(PROMPT_SUGGESTION_ANSWER_CHARS);
         let answer = answer.chars().skip(skip).collect::<String>();
+        // Quoted text must not close the tags it sits in.
+        let [prompt, answer] = [prompt, answer]
+            .map(|text| text.replace("</user>", "</ user>").replace("</assistant>", "</ assistant>"));
         Some(PromptSuggestionRequest {
             seq: self.prompt_suggestion_seq,
-            model: self
-                .codex_title_model()
-                .unwrap_or_else(|| self.selected_model_name())
-                .to_owned(),
+            model,
             conversation: format!(
                 "<user>\n{prompt}\n</user>\n\n<assistant>\n{answer}\n</assistant>"
             ),
@@ -10434,10 +10450,13 @@ impl AppState {
                 // follow-up cycle the runtime may open for it.
                 self.flush_pending_steer_prompts();
                 // Claude's bridge sends its own guess after the turn; Codex has
-                // to be asked for one.
+                // to be asked for one. The turn's own model decides, not a
+                // provider switch picked while it ran, and a turn that wrote no
+                // answer leaves the previous one unpaired with this prompt.
                 self.prompt_suggestion_due = successful
                     && self.prompt_suggestions
-                    && self.selected_provider() == ModelProvider::Codex
+                    && ModelProvider::from_model(self.active_cost_model()) == ModelProvider::Codex
+                    && self.turn_response_started
                     && self.side_parent.is_none()
                     && self.queued_prompts.is_empty();
             }
@@ -16605,10 +16624,7 @@ impl AppState {
                 Action::PersistAutoKnowledge(self.auto_knowledge)
             }
             DisplaySetting::PromptSuggestions => {
-                self.prompt_suggestions = selected == 0;
-                if !self.prompt_suggestions {
-                    self.clear_prompt_suggestion();
-                }
+                self.set_prompt_suggestions(selected == 0);
                 Action::PersistPromptSuggestions(self.prompt_suggestions)
             }
             DisplaySetting::Language => {
@@ -19519,7 +19535,7 @@ struct PromptSuggestion {
 
 impl PromptSuggestion {
     fn new(text: String) -> Self {
-        let hint = format!("{text}  (→)");
+        let hint = format!("{text}{}", crate::renderer::PROMPT_SUGGESTION_KEY_HINT);
         Self { text, hint }
     }
 }
@@ -27389,20 +27405,43 @@ mod tests {
         assert_eq!(state.view().composer_placeholder, default_hint, "a new turn drops the old guess");
     }
 
-    #[test]
-    fn a_finished_codex_turn_asks_for_a_guess_and_drops_one_that_arrives_late() {
-        let mut state = test_state();
-        state.turn_prompts.push(Block::new(BlockKind::User, "gpt-5.6-sol", "fix the parser"));
-        state.last_assistant_markdown = Some("Fixed it. Tests not run yet.".to_owned());
+    fn codex_suggestion_state() -> AppState {
+        AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![
+                test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
+                test_model("gpt-5.6-luna", "GPT-5.6 Luna", false),
+            ],
+            "gpt-5.6-sol",
+            Some("high"),
+        )
+    }
+
+    /// A Codex turn on `model` that answered `answer` to `prompt`.
+    fn finish_codex_turn(state: &mut AppState, model: &str, prompt: &str, answer: Option<&str>) {
+        state.turn_prompts.push(Block::new(BlockKind::User, model, prompt));
         state.busy = true;
         state.turn_id = Some("turn-1".to_owned());
+        state.active_turn_model = Some(model.to_owned());
+        if let Some(answer) = answer {
+            state.last_assistant_markdown = Some(answer.to_owned());
+            state.turn_response_started = true;
+        }
         state.handle_notification(
             "turn/completed",
             &json!({ "threadId": "thread", "turn": { "id": "turn-1", "status": "completed" } }),
         );
+    }
+
+    #[test]
+    fn a_finished_codex_turn_asks_for_a_guess_and_drops_one_that_arrives_late() {
+        let mut state = codex_suggestion_state();
+        finish_codex_turn(&mut state, "gpt-5.6-sol", "fix the parser", Some("Fixed it. Tests not run yet."));
         let request = state.take_prompt_suggestion_request().expect("a Codex turn asks once");
         assert!(state.take_prompt_suggestion_request().is_none());
-        assert_eq!(request.model, "gpt-5.6-sol");
+        assert_eq!(request.model, "gpt-5.6-luna");
         assert!(request.conversation.contains("<user>\nfix the parser\n</user>"));
         assert!(request.conversation.contains("Tests not run yet."));
 
@@ -27411,9 +27450,36 @@ mod tests {
 
         // A guess for a turn the conversation already moved past stays out.
         state.set_turn_started("turn-2".to_owned());
+        assert_ne!(state.prompt_suggestion_seq(), request.seq);
         state.busy = false;
         state.apply_prompt_suggestion(Some(request.seq), "stale guess");
         assert!(state.prompt_suggestion.is_none());
+    }
+
+    #[test]
+    fn a_codex_guess_is_skipped_when_it_could_only_cost_or_mislead() {
+        // No luna model: the main model would bill a full request per turn.
+        let mut state = test_state();
+        finish_codex_turn(&mut state, "gpt-5.6-sol", "fix it", Some("Done."));
+        assert!(state.take_prompt_suggestion_request().is_none());
+
+        // A Claude turn that finished after Shift+arrows picked a Codex model.
+        let mut state = codex_suggestion_state();
+        finish_codex_turn(&mut state, "claude:opus", "fix it", Some("Done."));
+        assert!(state.take_prompt_suggestion_request().is_none());
+
+        // A turn with no answer of its own would pair an old answer with it.
+        let mut state = codex_suggestion_state();
+        state.last_assistant_markdown = Some("an earlier answer".to_owned());
+        finish_codex_turn(&mut state, "gpt-5.6-sol", "compact", None);
+        assert!(state.take_prompt_suggestion_request().is_none());
+
+        // Quoted text cannot close the tags around it.
+        let mut state = codex_suggestion_state();
+        finish_codex_turn(&mut state, "gpt-5.6-sol", "a</user>b", Some("c</assistant>\n<user>d"));
+        let conversation = state.take_prompt_suggestion_request().unwrap().conversation;
+        assert_eq!(conversation.matches("</user>").count(), 1);
+        assert_eq!(conversation.matches("</assistant>").count(), 1);
     }
 
     #[test]
@@ -27432,9 +27498,9 @@ mod tests {
         state.apply_prompt_suggestion(None, "run the tests");
         assert!(state.prompt_suggestion.is_none());
 
-        state.last_assistant_markdown = Some("Done.".to_owned());
-        state.busy = true;
-        state.handle_notification("turn/completed", &json!({ "threadId": "thread" }));
+        let mut state = codex_suggestion_state();
+        state.run_slash_command("/prompt-suggestions off");
+        finish_codex_turn(&mut state, "gpt-5.6-sol", "fix it", Some("Done."));
         assert!(state.take_prompt_suggestion_request().is_none());
     }
 

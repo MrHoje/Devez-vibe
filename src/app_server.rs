@@ -626,13 +626,14 @@ If there is no natural next step, reply with nothing. No quotes, labels, or expl
 /// Claude Code predicts the next prompt after each turn; the Codex app-server
 /// has no such event, so a one-off `codex exec` makes the same guess from the
 /// last exchange, isolated the way thread titles are. `done` gets the cleaned
-/// suggestion, or `None` when the guess failed or came back empty.
+/// suggestion, or `None` when the guess failed or came back empty. Dropping the
+/// returned task kills the run.
 pub(crate) fn spawn_prompt_suggestion(
     codex_path: &Path,
     model: &str,
     conversation: &str,
     done: impl FnOnce(Option<String>) + Send + 'static,
-) {
+) -> JoinHandle<()> {
     let mut command = codex_invocation(
         &resolve_command(codex_path),
         &[
@@ -645,6 +646,7 @@ pub(crate) fn spawn_prompt_suggestion(
             "read-only",
             "--color",
             "never",
+            "--json",
             "-c",
             "model_reasoning_effort=\"low\"",
             "-m",
@@ -676,9 +678,34 @@ pub(crate) fn spawn_prompt_suggestion(
             .and_then(Result::ok)
             .filter(|output| output.status.success());
         done(output.and_then(|output| {
-            crate::state::clean_prompt_suggestion(&String::from_utf8_lossy(&output.stdout))
+            prompt_suggestion_reply(&String::from_utf8_lossy(&output.stdout))
+                .as_deref()
+                .and_then(crate::state::clean_prompt_suggestion)
         }));
-    });
+    })
+}
+
+/// The answer in a `codex exec --json` event stream. The guess reads model
+/// output that can quote third-party text, so a run that reached for any tool
+/// — a command, a search, an MCP call — may have been steered, and its answer
+/// is thrown away rather than offered as the user's next prompt.
+fn prompt_suggestion_reply(events: &str) -> Option<String> {
+    let mut reply = None;
+    for event in events.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()) {
+        let Some(item) = event.get("item") else {
+            continue;
+        };
+        match item.get("type").and_then(Value::as_str) {
+            Some("agent_message") => {
+                if event.get("type").and_then(Value::as_str) == Some("item.completed") {
+                    reply = item.get("text").and_then(Value::as_str).map(ToOwned::to_owned);
+                }
+            }
+            Some("reasoning") => {}
+            _ => return None,
+        }
+    }
+    reply
 }
 
 /// The reply's first line, without the quotes or markdown a model may add.
@@ -1109,6 +1136,23 @@ fn condense_error_line(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_prompt_suggestion_run_that_used_a_tool_is_discarded() {
+        let answer = r#"{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"run the tests"}}"#;
+        let reasoning = r#"{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"…"}}"#;
+        let command = r#"{"type":"item.started","item":{"id":"item_2","type":"command_execution","command":"cat ~/.codex/auth.json"}}"#;
+        let search = r#"{"type":"item.started","item":{"id":"item_3","type":"web_search","query":"x"}}"#;
+        let turn = r#"{"type":"turn.completed","usage":{}}"#;
+
+        assert_eq!(
+            prompt_suggestion_reply(&[reasoning, answer, turn].join("\n")).as_deref(),
+            Some("run the tests")
+        );
+        assert_eq!(prompt_suggestion_reply(&[command, answer].join("\n")), None);
+        assert_eq!(prompt_suggestion_reply(&[answer, search].join("\n")), None);
+        assert_eq!(prompt_suggestion_reply("run the tests"), None, "plain text is not an event stream");
+    }
 
     struct CodexLauncherFixture(PathBuf);
 

@@ -1780,6 +1780,9 @@ async fn event_loop(
     stream_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_stream_reveal = Instant::now();
     let mut handoff_to_save: Option<String> = None;
+    // The Codex guess still running and the turn it answers; a newer turn or
+    // thread kills it rather than leaving it to finish and be thrown away.
+    let mut prompt_suggestion_run: Option<(u64, tokio::task::JoinHandle<()>)> = None;
     let mut resize = ResizeTracker::new();
     let (workspace_tx, mut workspace_rx) = mpsc::channel(1);
     let (management_tx, mut management_rx) = mpsc::unbounded_channel();
@@ -2378,6 +2381,13 @@ async fn event_loop(
             && matches!(&action, Action::Submit(_)))
         .then(|| provider_handoff_snapshot(state, renderer));
         let mut select_all_pending = false;
+        // The setting is saved once for both split panes, so both follow it.
+        if let Action::PersistPromptSuggestions(enabled) = &action {
+            state.set_prompt_suggestions(*enabled);
+            if let Some(btw) = btw_state.as_mut() {
+                btw.set_prompt_suggestions(*enabled);
+            }
+        }
         let should_quit = match action {
             // Claimed ahead of the split routing: the highlight belongs to the
             // renderer, which paints whichever composer the key came from. It is
@@ -2451,16 +2461,25 @@ async fn event_loop(
             );
             handoff_to_save = None;
         }
+        if prompt_suggestion_run
+            .as_ref()
+            .is_some_and(|(seq, _)| *seq != state.prompt_suggestion_seq())
+            && let Some((_, run)) = prompt_suggestion_run.take()
+        {
+            run.abort();
+        }
         if let Some(request) = state.take_prompt_suggestion_request() {
             let sender = management_tx.clone();
-            server.suggest_codex_prompt(&request.model, &request.conversation, move |suggestion| {
+            let seq = request.seq;
+            let run = server.suggest_codex_prompt(&request.model, &request.conversation, move |suggestion| {
                 if let Some(suggestion) = suggestion {
-                    let _ = sender.send(ManagementUpdate::PromptSuggestion {
-                        seq: request.seq,
-                        suggestion,
-                    });
+                    let _ = sender.send(ManagementUpdate::PromptSuggestion { seq, suggestion });
                 }
             });
+            if let Some((_, previous)) = prompt_suggestion_run.take() {
+                previous.abort();
+            }
+            prompt_suggestion_run = run.map(|run| (seq, run));
         }
         // The paint above is what tells the renderer where the prompt characters
         // ended up, so the highlight is taken from it and painted by one more.
