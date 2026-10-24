@@ -23,12 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude Code 2.1.309를 적용해, API 응답이 느릴 때 모델 전환이 거절되거나 중단·모델 전환이 늦게 반영되던 문제와 꺼 둔 MCP 서버가 다시 연결되던 문제를 고쳤습니다.",
+    "다음 프롬프트 제안 기능을 추가했습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Updated to Claude Code 2.1.309, fixing model switches being refused when the API was slow, interrupts and model switches taking effect late, and disabled MCP servers reconnecting.",
+    "Added next-prompt suggestions.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

@@ -1878,8 +1878,8 @@ impl DisplaySetting {
                 "Turns off automatic recording for this project from the next request. The existing knowledge index is still read first.",
             ),
             (Self::PromptSuggestions, 0) => tr(
-                "응답이 끝나면 다음에 보낼 만한 프롬프트를 빈 입력창에 흐리게 보여줍니다. →로 입력창에 채웁니다. Codex는 제안마다 짧은 요청을 한 번 더 보냅니다.",
-                "After a response, shows a likely next prompt dimmed in the empty composer. Press → to fill it in. Codex sends one extra short request per suggestion.",
+                "응답이 끝나면 다음에 보낼 만한 프롬프트를 빈 입력창에 흐리게 보여줍니다. →나 Enter로 입력창에 채웁니다. Codex는 제안마다 짧은 요청을 한 번 더 보냅니다.",
+                "After a response, shows a likely next prompt dimmed in the empty composer. Press → or Enter to fill it in. Codex sends one extra short request per suggestion.",
             ),
             (Self::PromptSuggestions, 1) => tr(
                 "다음 프롬프트 제안을 표시하지 않습니다.",
@@ -9175,6 +9175,19 @@ impl AppState {
             }
             KeyCode::Tab if self.shell_mode => Action::None,
             KeyCode::Tab => self.cycle_agent_mode(),
+            // The first Enter takes the suggestion like →; the next one sends it.
+            KeyCode::Right | KeyCode::Enter
+                if !alt
+                    && !ctrl
+                    && self.editor.is_empty()
+                    && self.composer_images.is_empty()
+                    && self.visible_prompt_suggestion().is_some() =>
+            {
+                if let Some(suggestion) = self.prompt_suggestion.take() {
+                    self.editor.insert_str(&suggestion.text);
+                }
+                Action::None
+            }
             KeyCode::Enter => self.submit_editor(),
             KeyCode::Esc if self.busy => {
                 let action = self.request_interrupt();
@@ -9207,16 +9220,6 @@ impl AppState {
             }
             KeyCode::Right if alt || ctrl => {
                 self.editor.move_word_right();
-                Action::None
-            }
-            KeyCode::Right
-                if self.editor.is_empty()
-                    && self.composer_images.is_empty()
-                    && self.visible_prompt_suggestion().is_some() =>
-            {
-                if let Some(suggestion) = self.prompt_suggestion.take() {
-                    self.editor.insert_str(&suggestion.text);
-                }
                 Action::None
             }
             KeyCode::Left => {
@@ -27394,6 +27397,18 @@ mod tests {
         assert_eq!(state.editor.text(), "run the tests");
         state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(state.editor.text(), "run the tests", "a taken suggestion is not offered twice");
+
+        // Enter takes it the same way, and only the second Enter sends it.
+        state.editor.clear();
+        state.handle_notification(
+            "claude/promptSuggestion",
+            &json!({ "threadId": "thread", "suggestion": "fix the lint" }),
+        );
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(state.handle_key(enter), Action::None));
+        assert_eq!(state.editor.text(), "fix the lint");
+        assert!(!matches!(state.handle_key(enter), Action::None), "the second Enter sends");
+        assert!(state.editor.is_empty());
 
         state.editor.clear();
         state.handle_notification(
