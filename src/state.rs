@@ -4084,7 +4084,7 @@ pub struct AppState {
     prompt_suggestions: bool,
     /// The runtime's guess at the next prompt, shown dimmed in the empty
     /// composer until → takes it or the next turn starts.
-    prompt_suggestion: Option<PromptSuggestion>,
+    prompt_suggestion: Option<String>,
     /// Bumped by every turn and thread change, so a Codex guess that comes back
     /// after the conversation moved on is dropped.
     prompt_suggestion_seq: u64,
@@ -6342,10 +6342,10 @@ impl AppState {
         self.prompt_suggestion_seq += 1;
     }
 
-    /// The suggestion only shows where → can take it: an idle, ordinary
+    /// The suggestion only shows where → or Enter can take it: an idle, ordinary
     /// composer with no other hint to give.
-    fn visible_prompt_suggestion(&self) -> Option<&PromptSuggestion> {
-        self.prompt_suggestion.as_ref().filter(|_| {
+    fn visible_prompt_suggestion(&self) -> Option<&str> {
+        self.prompt_suggestion.as_deref().filter(|_| {
             self.prompt_suggestions
                 && !self.busy
                 && !self.shell_mode
@@ -6376,7 +6376,7 @@ impl AppState {
         {
             return;
         }
-        self.prompt_suggestion = clean_prompt_suggestion(suggestion).map(PromptSuggestion::new);
+        self.prompt_suggestion = clean_prompt_suggestion(suggestion);
     }
 
     /// What the host sends `codex exec` once a Codex turn finished: the last
@@ -7981,7 +7981,7 @@ impl AppState {
                 // from, so its own hint sits exactly where the chord applies.
                 "Ctrl+S: restore stashed draft"
             } else if let Some(suggestion) = self.visible_prompt_suggestion() {
-                suggestion.hint.as_str()
+                suggestion
             } else {
                 // Idle is when Tab actually changes the role, so the hint sits
                 // in the empty composer rather than in /help alone.
@@ -9184,7 +9184,7 @@ impl AppState {
                     && self.visible_prompt_suggestion().is_some() =>
             {
                 if let Some(suggestion) = self.prompt_suggestion.take() {
-                    self.editor.insert_str(&suggestion.text);
+                    self.editor.insert_str(&suggestion);
                 }
                 Action::None
             }
@@ -19530,19 +19530,6 @@ pub struct PromptSuggestionRequest {
     pub conversation: String,
 }
 
-struct PromptSuggestion {
-    text: String,
-    /// The dimmed placeholder, naming the key that takes it.
-    hint: String,
-}
-
-impl PromptSuggestion {
-    fn new(text: String) -> Self {
-        let hint = format!("{text}{}", crate::renderer::PROMPT_SUGGESTION_KEY_HINT);
-        Self { text, hint }
-    }
-}
-
 /// The guess's first line, without the quotes or markdown a model may add.
 pub(crate) fn clean_prompt_suggestion(reply: &str) -> Option<String> {
     let line = reply.lines().map(str::trim).find(|line| !line.is_empty())?;
@@ -27383,13 +27370,13 @@ mod tests {
             "claude/promptSuggestion",
             &json!({ "threadId": "thread", "suggestion": "\"run the tests\"\n" }),
         );
-        assert_eq!(state.view().composer_placeholder, "run the tests  (→)");
+        assert_eq!(state.view().composer_placeholder, "run the tests");
         // The stash hint outranks it, and → stays an ordinary cursor key there.
         state.editor.insert_str("draft");
         let stash = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
         state.handle_key(stash);
         assert!(state.stashed_prompt.is_some());
-        assert_ne!(state.view().composer_placeholder, "run the tests  (→)");
+        assert_ne!(state.view().composer_placeholder, "run the tests");
         state.handle_key(stash);
         state.editor.clear();
 
@@ -27461,7 +27448,7 @@ mod tests {
         assert!(request.conversation.contains("Tests not run yet."));
 
         state.apply_prompt_suggestion(Some(request.seq), "run the tests");
-        assert_eq!(state.view().composer_placeholder, "run the tests  (→)");
+        assert_eq!(state.view().composer_placeholder, "run the tests");
 
         // A guess for a turn the conversation already moved past stays out.
         state.set_turn_started("turn-2".to_owned());

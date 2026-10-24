@@ -1296,23 +1296,13 @@ fn composer_hint_columns(
     }
 }
 
-/// Ends a prompt suggestion's placeholder, naming the key that takes it.
-pub(crate) const PROMPT_SUGGESTION_KEY_HINT: &str = "  (→)";
-
 /// The placeholder as the empty composer row paints it. A prompt suggestion
-/// can outrun the row, so its text is cut and its key hint kept; the host's
-/// hint mask covers exactly these columns.
+/// can outrun the row, so its text is cut; the host's hint mask covers
+/// exactly these columns.
 fn fitted_composer_placeholder(placeholder: &str, width: u16) -> String {
     let panel_width = (width as usize).saturating_sub(1).max(16);
     // "❯ " and "! " both take two columns, and one more stays for the cursor.
-    let room = panel_width.saturating_sub(3);
-    match placeholder.strip_suffix(PROMPT_SUGGESTION_KEY_HINT) {
-        Some(text) => format!(
-            "{}{PROMPT_SUGGESTION_KEY_HINT}",
-            compact_right(text, room.saturating_sub(UnicodeWidthStr::width(PROMPT_SUGGESTION_KEY_HINT)))
-        ),
-        None => compact_right(placeholder, room),
-    }
+    compact_right(placeholder, panel_width.saturating_sub(3))
 }
 
 /// Where the docked panel sits once the terminal is wide enough to carry it
@@ -28965,13 +28955,13 @@ mod tests {
     }
 
     #[test]
-    fn a_long_prompt_suggestion_keeps_its_key_hint_and_masks_only_what_is_painted() {
+    fn a_long_prompt_suggestion_is_cut_and_masks_only_what_is_painted() {
         let empty = Editor::default();
-        let hint = format!("{}{PROMPT_SUGGESTION_KEY_HINT}", "테스트 ".repeat(30));
+        let hint = "테스트 ".repeat(30);
         let (rows, _, _, _) = input_lines(&empty, &[], 40, "", &hint, None, None);
         let painted: String = rows[1].tail.iter().map(|span| span.text.as_str()).collect();
         let painted = painted.trim_end();
-        assert!(painted.ends_with("…  (→)"), "{painted}");
+        assert!(painted.ends_with('…'), "{painted}");
         assert_eq!(
             composer_hint_columns(&empty, &[], &hint, "", 40),
             UnicodeWidthStr::width(painted)
