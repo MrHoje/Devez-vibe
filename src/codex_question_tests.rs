@@ -397,6 +397,89 @@ async fn live_codex_steer_cuts_the_answer_in_order() {
     }
 }
 
+#[tokio::test]
+#[ignore = "설치된 Codex와 실제 하위 에이전트 실행 필요"]
+async fn live_codex_background_results_and_consecutive_turns_finish_behind_paced_text() {
+    let model = "gpt-6-luna";
+    let mut server = AppServer::spawn(Path::new("codex"), None).await.unwrap();
+    let result = std::panic::AssertUnwindSafe(async {
+        server.initialize().await.unwrap();
+        let response = server.request("thread/start", json!({
+            "model": model, "ephemeral": true, "cwd": std::env::temp_dir(),
+            "approvalPolicy": "never", "permissions": ":danger-full-access",
+            "config": { "features.multi_agent": true },
+            "developerInstructions": "백그라운드 완료 알림 시험입니다. 사용자가 명시한 하위 에이전트만 실행하세요. 파일을 변경하지 마세요."
+        })).await.unwrap();
+        let thread = response["thread"]["id"].as_str().unwrap();
+        let mut state = AppState::new(thread.into(), std::env::temp_dir().to_string_lossy().into(),
+            "시험".into(), Vec::new(), model, Some("low"));
+        let trace_path = std::env::temp_dir().join(format!("devez-codex-turns-{}.jsonl",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let mut trace = std::fs::File::create(&trace_path).unwrap();
+        use std::io::Write;
+        println!("백그라운드 및 연속 턴 검증 기록: {}", trace_path.display());
+        let mut answers = Vec::new();
+        for round in 0..3 {
+            server.request("turn/start", json!({
+                "threadId": thread, "model": model, "effort": "low",
+                "input": [{ "type": "text", "text": format!(
+                    "백그라운드 시험 {round}입니다. 하위 에이전트를 정확히 하나 생성하세요. 하위 에이전트에게 셸로 8초 기다린 뒤 자동완료{round}만 답하도록 지시하세요. 주 에이전트는 기다리는 도구를 호출하지 말고 즉시 시작{round}만 답하여 현재 턴을 끝내세요. 파일은 변경하지 마세요.") }]
+            })).await.unwrap();
+            let deadline = Instant::now() + Duration::from_secs(180);
+            let mut parent_done = false;
+            let mut child_done = false;
+            let mut child_answer_seen = false;
+            while !parent_done || !child_done {
+                let event = tokio::time::timeout_at(deadline, server.next_event()).await
+                    .expect("백그라운드 완료 대기 시간 초과").expect("연결 종료");
+                match event {
+                    ServerEvent::Notification { method, params } => {
+                        writeln!(trace, "{}", json!({ "method": method, "params": params })).unwrap();
+                        state.handle_notification(&method, &params);
+                        if params.get("threadId").and_then(Value::as_str) != Some(thread) {
+                            if method == "item/completed" && params["item"]["type"] == "agentMessage" {
+                                child_answer_seen |= params["item"]["text"].as_str()
+                                    .is_some_and(|text| text.contains(&format!("자동완료{round}")));
+                            }
+                            if method == "turn/completed" {
+                                assert_eq!(params["turn"]["status"], "completed", "{params}");
+                                child_done = true;
+                            }
+                            continue;
+                        }
+                        if method == "item/completed" && params["item"]["type"] == "agentMessage" {
+                            answers.push(params["item"]["text"].as_str().unwrap_or_default().to_owned());
+                        }
+                        if method == "turn/completed" {
+                            assert_eq!(params["turn"]["status"], "completed", "{params}");
+                            parent_done = true;
+                        }
+                    }
+                    ServerEvent::Request { method, params, .. } => panic!("예상하지 않은 요청: {method} {params}"),
+                    ServerEvent::Closed(message) => panic!("{message}"),
+                    _ => {}
+                }
+            }
+            assert!(child_answer_seen, "하위 에이전트의 완료 응답이 없음");
+            println!("백그라운드 반복 {}회: 주 턴과 하위 에이전트 완료 수신", round + 1);
+        }
+        assert!(state.stream_events_pending(), "연속 턴의 출력 대기가 재현되지 않음");
+        for _ in 0..2000 {
+            if !state.stream_events_pending() { break; }
+            state.drain_stream_text(Duration::from_millis(50));
+        }
+        assert!(!state.stream_events_pending(), "출력 대기열이 남음");
+        assert!(!state.host_busy(), "완료 뒤에도 처리 중 표시가 남음");
+        let displayed = state.drain_committed().into_iter()
+            .filter(|block| matches!(block.kind, crate::renderer::BlockKind::Assistant))
+            .map(|block| block.body).collect::<Vec<_>>();
+        assert_eq!(displayed, answers, "실제 응답과 화면 기록이 다름");
+        println!("연속 주 턴 3개: 응답 {}개 표시 및 대기 종료 확인", displayed.len());
+    }).catch_unwind().await;
+    server.shutdown().await;
+    if let Err(panic) = result { std::panic::resume_unwind(panic); }
+}
+
 async fn event(server: &mut AppServer, state: &mut AppState) -> ServerEvent {
     let event = timeout(Duration::from_secs(120), server.next_event())
         .await

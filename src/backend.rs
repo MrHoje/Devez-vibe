@@ -999,7 +999,7 @@ impl BackendServer {
             }
             "config/value/write" if vibe_setting_write(&params)? => Ok(json!({})),
             "config/value/write" if provider_default_write(&params)? => Ok(json!({})),
-            _ => self.codex()?.request(method, params).await,
+            _ => self.codex()?.request(method, self.codex_thread_params(params)?).await,
         }
     }
 
@@ -1140,6 +1140,15 @@ impl BackendServer {
         Ok(params)
     }
 
+    fn codex_thread_params(&self, mut params: Value) -> Result<Value> {
+        if let Some(visible) = params.get("threadId").and_then(Value::as_str)
+            && !visible.is_empty()
+        {
+            params["threadId"] = json!(self.backing_id(visible, RuntimeKind::Codex)?);
+        }
+        Ok(params)
+    }
+
     pub fn claude_thread_id(&self, visible: &str) -> Option<String> {
         if visible.is_empty() {
             return None;
@@ -1205,11 +1214,12 @@ impl BackendServer {
     /// 첫 프롬프트 전에는 스레드 id가 비어 있다. 빈 id를 그대로 넘기면 app-server가
     /// `invalid thread id`로 거절하므로 아직 스레드가 없다고 답한다.
     pub fn codex_thread_id(&self, visible: &str) -> Option<String> {
-        self.route(visible)
+        let visible = self.canonical_visible(visible);
+        self.route(&visible)
             .and_then(|route| route.codex_id)
             .or_else(|| {
-                (!visible.is_empty() && !is_claude_thread(visible) && !visible.starts_with("ses_"))
-                    .then(|| visible.to_owned())
+                (!visible.is_empty() && !is_claude_thread(&visible) && !visible.starts_with("ses_"))
+                    .then_some(visible)
             })
     }
 
@@ -1919,6 +1929,7 @@ impl BackendServer {
             }
         }
         self.persist_routes();
+        self.note_resume_id(visible);
     }
 
     fn is_open_code_thread(&self, visible: &str) -> bool {
@@ -2022,6 +2033,7 @@ impl BackendServer {
                 json!({
                     "cwd": cwd,
                     "model": model,
+                    "developerInstructions": crate::DEVEZ_INSTRUCTIONS,
                     "experimentalRawEvents": false,
                     "persistExtendedHistory": true
                 }),
@@ -3255,6 +3267,41 @@ mod tests {
             route_store_path: None,
             cwd,
         }
+    }
+
+    #[test]
+    fn codex_requests_resolve_mixed_thread_ids_and_resume_aliases() {
+        let server = backend_with_routes(HashMap::from([(
+            "claude:visible-room".to_owned(),
+            route(RuntimeKind::Codex, Some("codex-backing"), Some("claude-backing")),
+        )]));
+        for id in ["claude:visible-room", "claude-backing", "claude:claude-backing", "codex-backing"] {
+            assert_eq!(server.codex_thread_id(id).as_deref(), Some("codex-backing"), "{id}");
+            let params = server.codex_thread_params(json!({"threadId":id,"serviceTier":"priority"})).unwrap();
+            assert_eq!(params, json!({"threadId":"codex-backing","serviceTier":"priority"}));
+        }
+        for params in [json!({}), json!({"threadId":""}), json!({"threadId":null})] {
+            assert_eq!(server.codex_thread_params(params.clone()).unwrap(), params);
+        }
+        assert!(server.codex_thread_id("").is_none());
+        assert!(server.codex_thread_id("claude:unregistered").is_none());
+        assert_eq!(server.codex_thread_id("native-codex").as_deref(), Some("native-codex"));
+    }
+
+    #[test]
+    fn failed_provider_switch_restores_the_published_resume_id() {
+        let visible = "claude:claude-backing";
+        let server = backend_with_routes(HashMap::from([(
+            visible.to_owned(),
+            route(RuntimeKind::Claude, Some("codex-backing"), Some("claude-backing")),
+        )]));
+        server.register_route(visible, RuntimeKind::Codex, None, None, None, server.cwd.clone());
+        server.restore_active_route(visible, RuntimeKind::Claude);
+        let restored = server.resume_id(visible);
+        assert_eq!(server.resume_ids.lock().unwrap().get(visible), Some(&restored));
+        let notices = server.pending_events.lock().unwrap();
+        assert!(matches!(notices.back(), Some(ServerEvent::Notification { method, params })
+            if method == "thread/rebound" && params["newThreadId"] == restored));
     }
 
     #[test]

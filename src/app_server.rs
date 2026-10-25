@@ -14,7 +14,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     process::{Child, Command},
     sync::{Mutex, mpsc, oneshot, watch},
     task::JoinHandle,
@@ -24,7 +24,18 @@ use tokio::{
 use crate::language::tr;
 
 type PendingResponse = oneshot::Sender<Result<Value, String>>;
-type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
+type PendingMap = Arc<StdMutex<HashMap<u64, PendingResponse>>>;
+
+struct PendingRequest<'a> {
+    pending: &'a PendingMap,
+    id: u64,
+}
+
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        self.pending.lock().expect("pending mutex").remove(&self.id);
+    }
+}
 
 /// app-server가 죽지 않고 응답만 멈추면 요청이 영원히 매달려 스피너만 남는다.
 /// 세션 시작이나 큰 롤아웃 복원도 이보다 오래 걸리지는 않으므로, 넘기면
@@ -49,7 +60,9 @@ impl AppServerClient {
         if *closed.borrow() { bail!("The app-server connection has already closed."); }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (response_tx, response_rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, response_tx);
+        self.pending.lock().expect("pending mutex").insert(id, response_tx);
+        // A caller's timeout or task cancellation also drops the response slot.
+        let _pending_request = PendingRequest { pending: &self.pending, id };
 
         let message = json!({
             "id": id,
@@ -57,16 +70,12 @@ impl AppServerClient {
             "params": params
         });
 
-        if let Err(error) = self.send(message) {
-            self.pending.lock().await.remove(&id);
-            return Err(error);
-        }
+        self.send(message)?;
 
         let deadline = if method == "turn/interrupt" { INTERRUPT_TIMEOUT } else { REQUEST_TIMEOUT };
         let response = tokio::select! {
             biased;
             _ = closed.changed() => {
-                self.pending.lock().await.remove(&id);
                 bail!(tr("app-server 연결이 종료되었습니다.", "The app-server connection closed."));
             }
             response = timeout(deadline, response_rx) => response,
@@ -79,7 +88,6 @@ impl AppServerClient {
                 format!("{method}: the app-server response channel closed."),
             )),
             Err(_) => {
-                self.pending.lock().await.remove(&id);
                 if method == "turn/interrupt" {
                     bail!(tr(
                         "Codex가 5초 안에 중단 요청에 응답하지 않았습니다. Esc로 다시 시도할 수 있습니다.",
@@ -216,29 +224,11 @@ impl AppServer {
         let stdout = child.stdout.take().context(tr("app-server stdout 연결 실패", "app-server stdout connection failed"))?;
         let stderr = child.stderr.take().context(tr("app-server stderr 연결 실패", "app-server stderr connection failed"))?;
 
-        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Value>();
+        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Value>();
         let (event_tx, events) = mpsc::unbounded_channel::<ServerEvent>();
         let permission_events = event_tx.clone();
-        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(StdMutex::new(HashMap::new()));
         let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(20)));
-
-        let writer_task = tokio::spawn(async move {
-            let mut stdin = stdin;
-            while let Some(message) = outbound_rx.recv().await {
-                let mut encoded = match serde_json::to_vec(&message) {
-                    Ok(encoded) => encoded,
-                    Err(_) => continue,
-                };
-                encoded.push(b'\n');
-                if stdin.write_all(&encoded).await.is_err() {
-                    break;
-                }
-                if stdin.flush().await.is_err() {
-                    break;
-                }
-            }
-            let _ = stdin.shutdown().await;
-        });
 
         let client = AppServerClient {
             outbound: Arc::new(StdMutex::new(Some(outbound_tx))),
@@ -246,6 +236,9 @@ impl AppServer {
             next_id: Arc::new(AtomicU64::new(1)),
             closed: watch::channel(false).0,
         };
+        let writer_task = tokio::spawn(write_messages(
+            stdin, outbound_rx, client.clone(), event_tx.clone(),
+        ));
         let computer_use = crate::computer_use::Monitor::start(
             client.clone(), event_tx.clone(), crate::state::codex_home(), Arc::clone(&cursor_enabled),
         );
@@ -298,7 +291,7 @@ impl AppServer {
             };
             drop(tail);
 
-            let mut pending = reader_pending.lock().await;
+            let mut pending = reader_pending.lock().expect("pending mutex");
             for (_, sender) in pending.drain() {
                 let _ = sender.send(Err(detail.clone()));
             }
@@ -446,6 +439,33 @@ impl Drop for AppServer {
         // RestoreOnDrop field performs the bounded final cursor settle pass.
         self._job = None;
     }
+}
+
+async fn write_messages(
+    mut stdin: impl AsyncWrite + Unpin,
+    mut messages: mpsc::UnboundedReceiver<Value>,
+    client: AppServerClient,
+    events: mpsc::UnboundedSender<ServerEvent>,
+) {
+    while let Some(message) = messages.recv().await {
+        let Ok(mut encoded) = serde_json::to_vec(&message) else { continue; };
+        encoded.push(b'\n');
+        let written = async {
+            stdin.write_all(&encoded).await?;
+            stdin.flush().await
+        }.await;
+        if let Err(error) = written {
+            // stdout can stay open after stdin breaks. Wake pending requests
+            // and let the backend release this runtime so the user can retry.
+            client.close();
+            let _ = events.send(ServerEvent::Closed(tr(
+                format!("app-server 입력 쓰기 실패: {error}"),
+                format!("Couldn't write app-server input: {error}"),
+            )));
+            break;
+        }
+    }
+    let _ = stdin.shutdown().await;
 }
 
 /// The desktop supplies this pipe address through the Codex configuration.
@@ -1004,7 +1024,25 @@ async fn request_with_permissions(
             attempt.as_object_mut().unwrap().remove("approvalPolicy");
             attempt.as_object_mut().unwrap().remove("approvalsReviewer");
         }
-        match client.request(method, attempt).await {
+        let mut response = client.request(method, attempt.clone()).await;
+        if method == "turn/start"
+            && let Some(thread) = attempt.get("threadId").and_then(Value::as_str)
+            && response.as_ref().is_err_and(|error| error.to_string() == format!("turn/start: thread not found: {thread} (-32600)"))
+        {
+            // A restarted app-server has none of the router's saved threads
+            // loaded. Only this pre-turn failure is safe to retry.
+            let mut resume = json!({ "threadId": thread, "excludeTurns": true });
+            for key in ["model", "cwd", "serviceTier", "permissions", "approvalPolicy", "approvalsReviewer"] {
+                if let Some(value) = attempt.get(key) {
+                    resume[key] = value.clone();
+                }
+            }
+            response = match client.request("thread/resume", resume).await {
+                Ok(_) => client.request(method, attempt).await,
+                Err(error) => Err(error),
+            };
+        }
+        match response {
             Ok(response) => {
                 let actual = response.pointer("/activePermissionProfile/id")
                     .and_then(Value::as_str).unwrap_or(profile).to_owned();
@@ -1034,7 +1072,7 @@ async fn route_message(
     if let Some(id) = message.get("id").and_then(Value::as_u64)
         && (message.get("result").is_some() || message.get("error").is_some())
     {
-        if let Some(sender) = pending.lock().await.remove(&id) {
+        if let Some(sender) = pending.lock().expect("pending mutex").remove(&id) {
             let response = if let Some(error) = message.get("error") {
                 Err(format_rpc_error(error))
             } else {
@@ -1382,7 +1420,7 @@ mod tests {
         let (outbound, messages) = mpsc::unbounded_channel();
         (AppServerClient {
             outbound: Arc::new(StdMutex::new(Some(outbound))),
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(StdMutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
             closed: watch::channel(false).0,
         }, messages)
@@ -1498,13 +1536,13 @@ mod tests {
             client.request("turn/interrupt", json!({"threadId":"a","turnId":"1"})).await
         }});
         let request = messages.recv().await.unwrap();
-        assert!(client.pending.lock().await.contains_key(&request["id"].as_u64().unwrap()));
+        assert!(client.pending.lock().expect("pending mutex").contains_key(&request["id"].as_u64().unwrap()));
         tokio::time::advance(INTERRUPT_TIMEOUT).await;
         assert!(waiting.await.unwrap().is_err());
-        assert!(client.pending.lock().await.is_empty());
+        assert!(client.pending.lock().expect("pending mutex").is_empty());
         let (events, _) = mpsc::unbounded_channel();
         acknowledge_computer_interrupt(&client, &request, &events, false).await; // late ack harmless
-        assert!(client.pending.lock().await.is_empty());
+        assert!(client.pending.lock().expect("pending mutex").is_empty());
     }
 
     #[tokio::test]
@@ -1516,8 +1554,39 @@ mod tests {
         messages.recv().await.unwrap();
         client.close(); // the same synchronous path used by AppServer::drop
         assert!(timeout(Duration::from_secs(1), request).await.unwrap().unwrap().is_err());
-        assert!(client.pending.lock().await.is_empty());
+        assert!(client.pending.lock().expect("pending mutex").is_empty());
         assert!(client.request("thread/read", json!({"threadId":"a"})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_request_removes_its_pending_response() {
+        let (client, mut messages) = computer_test_client();
+        let waiting = tokio::spawn({ let client = client.clone(); async move {
+            client.request("thread/read", json!({"threadId":"a"})).await
+        }});
+        let request = messages.recv().await.unwrap();
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        assert!(client.pending.lock().expect("pending mutex").is_empty());
+        let (events, _) = mpsc::unbounded_channel();
+        route_message(json!({"id":request["id"],"result":{}}), &client.pending, &events).await;
+        assert!(client.pending.lock().expect("pending mutex").is_empty());
+    }
+
+    #[tokio::test]
+    async fn broken_stdin_wakes_requests_even_if_stdout_stays_open() {
+        let (client, messages) = computer_test_client();
+        let (events, mut event_rx) = mpsc::unbounded_channel();
+        let (stdin, server_stdin) = tokio::io::duplex(1024);
+        drop(server_stdin);
+        let writer = tokio::spawn(write_messages(stdin, messages, client.clone(), events));
+        let result = timeout(Duration::from_secs(1), client.request("thread/read", json!({"threadId":"a"})))
+            .await.expect("a broken stdin must not wait for the RPC deadline");
+        assert!(result.is_err());
+        writer.await.unwrap();
+        assert!(matches!(event_rx.recv().await, Some(ServerEvent::Closed(_))));
+        assert!(client.pending.lock().expect("pending mutex").is_empty());
+        assert!(client.notify("initialized", None).is_err());
     }
 
     #[tokio::test]
@@ -1546,7 +1615,7 @@ mod tests {
         let original = "[mcp_servers.node_repl.env]\nSKY_CUA_NATIVE_PIPE_DIRECTORY = 'old'\n";
         std::fs::write(&path, original).unwrap();
         let (outbound, mut messages) = mpsc::unbounded_channel();
-        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending = Arc::new(StdMutex::new(HashMap::new()));
         let client = AppServerClient {
             outbound: Arc::new(StdMutex::new(Some(outbound))),
             pending: pending.clone(), next_id: Arc::new(AtomicU64::new(1)),
@@ -1598,7 +1667,7 @@ mod tests {
         let (outbound, _inbox) = mpsc::unbounded_channel();
         let client = AppServerClient {
             outbound: Arc::new(StdMutex::new(Some(outbound))),
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(StdMutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
             closed: watch::channel(false).0,
         };
@@ -1611,7 +1680,7 @@ mod tests {
 
         assert!(error.contains("응답하지 않아"), "{error}");
         assert!(
-            client.pending.lock().await.is_empty(),
+            client.pending.lock().expect("pending mutex").is_empty(),
             "끊은 요청은 대기 목록에 남기지 않는다"
         );
     }
@@ -1627,10 +1696,13 @@ mod tests {
             (":danger-full-access", vec![Some("approval_policy never is not allowed"), None], vec![":danger-full-access", ":workspace"]),
             (":danger-full-access", vec![Some("authentication expired")], vec![":danger-full-access"]),
             (":danger-full-access", vec![Some("command execution failed: permission denied")], vec![":danger-full-access"]),
+            (":danger-full-access", vec![Some("thread not found: another-thread")], vec![":danger-full-access"]),
+            (":danger-full-access", vec![Some("thread not found: thread-other")], vec![":danger-full-access"]),
+            (":danger-full-access", vec![Some("quoted error: thread not found: thread")], vec![":danger-full-access"]),
             (":read-only", vec![Some(denied)], vec![":read-only"]),
         ] {
             let (outbound, mut messages) = mpsc::unbounded_channel();
-            let pending = Arc::new(Mutex::new(HashMap::new()));
+            let pending = Arc::new(StdMutex::new(HashMap::new()));
             let client = AppServerClient {
                 outbound: Arc::new(StdMutex::new(Some(outbound))),
                 pending: pending.clone(), next_id: Arc::new(AtomicU64::new(1)),
@@ -1664,6 +1736,54 @@ mod tests {
                 assert_eq!(lowered, profiles.len() > 1);
             }
             assert!(messages.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unloaded_codex_turn_resumes_once_before_retrying() {
+        let (client, mut messages) = computer_test_client();
+        let (events, _) = mpsc::unbounded_channel();
+        let params = json!({"threadId":"saved-thread","model":"gpt-6-luna","effort":"low",
+            "permissions":":read-only","input":[{"type":"text","text":"이어 하기"}]});
+        let task = tokio::spawn({ let client = client.clone(); let params = params.clone(); async move {
+            request_with_permissions(&client, "turn/start", params).await
+        }});
+        let first = messages.recv().await.unwrap();
+        route_message(json!({"id":first["id"],"error":{"code":-32600,"message":"thread not found: saved-thread"}}), &client.pending, &events).await;
+        let resume = timeout(Duration::from_secs(1), messages.recv()).await.unwrap().unwrap();
+        assert_eq!(resume["method"], "thread/resume");
+        assert_eq!(resume["params"]["threadId"], "saved-thread");
+        assert_eq!(resume["params"]["permissions"], ":read-only");
+        assert!(resume["params"].get("input").is_none());
+        route_message(json!({"id":resume["id"],"result":{"thread":{"id":"saved-thread"}}}), &client.pending, &events).await;
+        let retry = messages.recv().await.unwrap();
+        assert_eq!(retry["method"], "turn/start");
+        assert_eq!(retry["params"], params);
+        route_message(json!({"id":retry["id"],"result":{"turn":{"id":"next"}}}), &client.pending, &events).await;
+        assert!(task.await.unwrap().is_ok());
+        assert!(messages.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn similar_thread_errors_do_not_resume_or_repeat_a_turn() {
+        for (code, message) in [
+            (-32600, "thread not found: saved-thread-other"),
+            (-32603, "thread not found: saved-thread"),
+            (-32000, "thread not found: saved-thread"),
+            (-32600, "quoted error: thread not found: saved-thread"),
+            (-32600, "\"thread not found: saved-thread\""),
+        ] {
+            let (client, mut messages) = computer_test_client();
+            let (events, _) = mpsc::unbounded_channel();
+            let task = tokio::spawn({ let client = client.clone(); async move {
+                request_with_permissions(&client, "turn/start", json!({"threadId":"saved-thread"})).await
+            }});
+            let request = messages.recv().await.unwrap();
+            route_message(json!({"id":request["id"],"error":{"code":code,"message":message}}), &client.pending, &events).await;
+            let result = timeout(Duration::from_secs(1), task).await
+                .expect("a different failure must not resume the thread").unwrap();
+            assert!(result.is_err(), "{code}: {message}");
+            assert!(messages.try_recv().is_err(), "{code}: {message}");
         }
     }
 
@@ -1989,7 +2109,7 @@ mod tests {
     #[tokio::test]
     async fn cloned_clients_share_request_ids() {
         let (outbound, mut messages) = mpsc::unbounded_channel();
-        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending = Arc::new(StdMutex::new(HashMap::new()));
         let client = AppServerClient {
             outbound: Arc::new(std::sync::Mutex::new(Some(outbound))),
             pending: pending.clone(),

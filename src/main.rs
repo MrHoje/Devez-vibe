@@ -504,7 +504,7 @@ async fn run_after_startup(
 
     if let Some(text) = queued {
         draw(state, renderer)?;
-        start_turn(server, state, renderer, text, None).await?;
+        send_queued_prompt(server, state, renderer, text).await?;
     }
     event_loop(server, state, renderer, update_rx).await
 }
@@ -5293,12 +5293,7 @@ async fn send_queued_prompt(
     };
     devezcode::note_prompt(&text);
     let input = state.turn_input(text);
-    let params = json!({
-        "threadId": state.thread_id,
-        "expectedTurnId": turn_id,
-        "input": input,
-        "additionalContext": steer_additional_context(state.auto_knowledge())
-    });
+    let params = steer_turn_params(state, &turn_id, input, true);
     if let Err(error) =
         await_with_activity(state, renderer, server.request("turn/steer", params)).await?
     {
@@ -6883,6 +6878,26 @@ async fn steer_turn(
     with_role_policy: bool,
 ) -> bool {
     devezcode::note_prompt(text);
+    let params = steer_turn_params(state, &turn_id, input, with_role_policy);
+    match server.request("turn/steer", params).await {
+        Ok(_) => true,
+        Err(error) => {
+            state.push_notice(
+                BlockKind::Error,
+                "Follow-up input failed",
+                error.to_string(),
+            );
+            false
+        }
+    }
+}
+
+fn steer_turn_params(
+    state: &AppState,
+    turn_id: &str,
+    input: Vec<Value>,
+    with_role_policy: bool,
+) -> Value {
     let mut params = json!({
         "threadId": state.thread_id,
         "expectedTurnId": turn_id,
@@ -6895,17 +6910,7 @@ async fn steer_turn(
     if with_role_policy && let Some(policy) = state.agent_mode().tool_policy() {
         params["toolPolicy"] = policy;
     }
-    match server.request("turn/steer", params).await {
-        Ok(_) => true,
-        Err(error) => {
-            state.push_notice(
-                BlockKind::Error,
-                "Follow-up input failed",
-                error.to_string(),
-            );
-            false
-        }
-    }
+    params
 }
 
 /// Sends the follow-ups `state` held while its turn was opening, once that turn
@@ -7595,7 +7600,9 @@ async fn read_account(server: &BackendServer, state: &AppState) -> (Option<Strin
             .await;
         return (account.ok().as_ref().and_then(claude_account_label), None);
     }
-    (ensure_account(server).await.ok(), Some(read_runtime_account_plan(server, model).await))
+    let label = server.request("account/read", json!({ "refreshToken": false }))
+        .await.ok().as_ref().map(codex_account_label);
+    (label, Some(read_runtime_account_plan(server, model).await))
 }
 
 fn apply_account(state: &mut AppState, (label, plan): (Option<String>, Option<AccountPlan>)) {
@@ -7697,8 +7704,15 @@ async fn ensure_account(server: &BackendServer) -> Result<String> {
             "An OpenAI sign-in is needed. Run the official `codex login` first.",
         ));
     }
+    Ok(codex_account_label(&response))
+}
+
+fn codex_account_label(response: &Value) -> String {
     let account = response.get("account").unwrap_or(&Value::Null);
-    let label = match account.get("type").and_then(Value::as_str) {
+    if account.is_null() && response.get("requiresOpenaiAuth").and_then(Value::as_bool) == Some(true) {
+        return "signed out".to_owned();
+    }
+    match account.get("type").and_then(Value::as_str) {
         // The plan gets its own welcome row, so only the signed-in id is added
         // here. An email already says this is the OAuth sign-in rather than a key
         // or a Bedrock role, so it stands alone — every session here runs against
@@ -7712,8 +7726,7 @@ async fn ensure_account(server: &BackendServer) -> Result<String> {
         Some("amazonBedrock") => "Amazon Bedrock".to_owned(),
         Some(other) => other.to_owned(),
         None => "Local provider".to_owned(),
-    };
-    Ok(label)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

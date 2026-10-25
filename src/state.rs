@@ -5114,15 +5114,27 @@ impl AppState {
     }
 
     pub fn fallback_from_codex(&mut self, message: impl Into<String>) -> bool {
-        if self.selected_provider() != ModelProvider::Codex {
+        let selected_codex = self.selected_provider() == ModelProvider::Codex;
+        let running_codex = self.busy
+            && ModelProvider::from_model(self.active_cost_model()) == ModelProvider::Codex;
+        let pending_id = match self.pending.as_ref() {
+            Some(PendingInteraction::Approval { id, .. }
+                | PendingInteraction::UserInput { id, .. }
+                | PendingInteraction::McpUrl { id, .. }) => Some(id),
+            Some(PendingInteraction::McpForm(form)) => Some(&form.id),
+            Some(PendingInteraction::McpApproval(approval)) => Some(&approval.id),
+            _ => None,
+        };
+        let pending_codex = pending_id.is_some_and(|id|
+            !crate::claude::is_claude_request_id(id) && !crate::open_code::is_open_code_request_id(id));
+        if !selected_codex && !running_codex && !pending_codex {
             return false;
         }
         let message = message.into();
-        let unanswered = matches!(self.pending, Some(PendingInteraction::UserInput { .. }));
-        if self.busy || unanswered {
+        if running_codex || pending_codex {
             self.set_request_failed(message.clone());
         }
-        if unanswered {
+        if pending_codex {
             // A dead transport cannot accept this answer, including after a
             // provider fallback. Keep queued work paused until fresh input.
             if let Some(PendingInteraction::UserInput {
@@ -5146,6 +5158,9 @@ impl AppState {
                 }
             }
             self.turn_interrupted = true;
+        }
+        if !selected_codex {
+            return false;
         }
         if self
             .provider_model_indices(ModelProvider::Claude)
@@ -6754,6 +6769,14 @@ impl AppState {
             self.restore_plan_snapshot(plan);
         } else if let Some(plan) = plan_snapshot_from_history(turns) {
             self.restore_plan_snapshot(&plan);
+        }
+        // 실행 중인 대화로 돌아오면 새 시작 알림 없이도 중단·추가 입력이 가능해야 한다.
+        if let Some(turn) = turns.last()
+            .filter(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))
+            && let Some(id) = turn.get("id").and_then(Value::as_str)
+        {
+            self.restore_running_turn(id.to_owned());
+            self.plan_turn_id = self.plan_summary.as_ref().map(|_| id.to_owned());
         }
     }
 
@@ -9296,6 +9319,17 @@ impl AppState {
     }
 
     pub fn begin_server_request(&mut self, id: Value, method: &str, params: &Value) -> Action {
+        if crate::event_thread_id(params)
+            .is_some_and(|thread| !self.codex_subagent_source_is_known(thread))
+        {
+            if method == "mcpServer/elicitation/request" {
+                return Action::RpcResponse { id, result: mcp_elicitation_response("cancel", None) };
+            }
+            return Action::RpcError {
+                id,
+                message: tr("현재 대화에 속하지 않는 요청입니다.", "The request does not belong to this conversation.").to_owned(),
+            };
+        }
         if method == "item/tool/requestUserInput" {
             // A modal takes over the frame. Apply any paced turn boundary first
             // so cancelling this question cannot target the preceding turn.
@@ -10220,17 +10254,6 @@ impl AppState {
         // Anything this thread says counts as the turn still being alive, so the
         // stall probe only fires on a wait that has genuinely gone silent.
         self.turn_progress_at = Some(Instant::now());
-        // Codex puts a subagent's turn on the parent's stream as well, and such a
-        // notice can carry the parent's thread id or none at all — so the filter
-        // above lets it through. Ending the wait on it drops the spinner while the
-        // answer is still streaming, so only the turn we are waiting on ends it.
-        if method == "turn/completed"
-            && let Some(active) = self.turn_id.as_deref()
-            && let Some(finished) = params.pointer("/turn/id").and_then(Value::as_str)
-            && active != finished
-        {
-            return;
-        }
         // A finishing notice arrives while the last words of the answer are still
         // waiting their turn on screen. Handling it now would flush them all at
         // once, which lands as a block of text appearing at full strength — the
@@ -10333,6 +10356,15 @@ impl AppState {
     }
 
     fn dispatch_notification(&mut self, method: &str, params: &Value) {
+        // 시작 알림도 출력 대기열에 있을 수 있으므로 순서대로 꺼낸 뒤 비교한다.
+        // 다른 하위 에이전트의 완료로 현재 턴을 끝내지는 않는다.
+        if method == "turn/completed"
+            && let Some(active) = self.turn_id.as_deref()
+            && let Some(finished) = params.pointer("/turn/id").and_then(Value::as_str)
+            && active != finished
+        {
+            return;
+        }
         if matches!(
             method,
             "item/completed" | "turn/completed" | "turn/failed" | "turn/aborted"
@@ -20141,6 +20173,7 @@ fn parse_fast_mode(config: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    include!("codex_state_audit_tests.rs");
     include!("question_audit_tests.rs");
     include!("plan_audit_tests.rs");
     use super::*;
@@ -24336,6 +24369,71 @@ mod tests {
             &json!({ "turn": { "id": "parent-turn", "status": "completed" } }),
         );
         assert!(!state.busy, "the turn we waited on ends the wait");
+    }
+
+    #[test]
+    fn consecutive_codex_turns_finish_behind_paced_text() {
+        for count in [1, 2, 3] {
+            let mut state = test_state();
+            let mut answers = Vec::new();
+            for index in 0..count {
+                let turn_id = format!("turn-{index}");
+                let item_id = format!("answer-{index}");
+                let text = format!("자동 응답 {index} ").repeat(20);
+                state.handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread", "turn": { "id": turn_id } }),
+                );
+                state.handle_notification(
+                    "item/agentMessage/delta",
+                    &json!({ "threadId": "thread", "turnId": turn_id, "itemId": item_id, "delta": text }),
+                );
+                state.handle_notification(
+                    "item/completed",
+                    &json!({ "threadId": "thread", "turnId": turn_id, "item": {
+                        "id": item_id, "type": "agentMessage", "phase": "final_answer", "text": text
+                    } }),
+                );
+                state.handle_notification(
+                    "turn/completed",
+                    &json!({ "threadId": "thread", "turn": { "id": turn_id, "status": "completed" } }),
+                );
+                answers.push(text);
+            }
+            assert!(state.stream_events_pending());
+            drain_frames(&mut state, 20000);
+            assert!(!state.stream_events_pending());
+            assert!(!state.busy, "연속 {count}개 턴의 완료 알림이 유실됨");
+            assert!(state.turn_id.is_none());
+            let displayed = state.drain_committed().into_iter()
+                .filter(|block| matches!(block.kind, BlockKind::Assistant))
+                .map(|block| block.body).collect::<Vec<_>>();
+            assert_eq!(displayed, answers, "자동 응답이 순서대로 표시되어야 함");
+        }
+    }
+
+    #[test]
+    fn unrelated_codex_completion_does_not_flush_or_finish_paced_text() {
+        let mut state = test_state();
+        state.set_turn_started("parent-turn".to_owned());
+        state.handle_notification(
+            "item/agentMessage/delta",
+            &json!({ "itemId": "answer", "delta": "아직 표시 중인 본 응답" }),
+        );
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "id": "child-turn", "status": "completed" } }),
+        );
+        assert!(state.drain_committed().is_empty());
+        drain_frames(&mut state, 2000);
+        assert!(state.busy);
+        assert_eq!(state.turn_id.as_deref(), Some("parent-turn"));
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "id": "parent-turn", "status": "completed" } }),
+        );
+        assert!(!state.busy);
+        assert!(state.drain_committed().iter().any(|block| block.body == "아직 표시 중인 본 응답"));
     }
 
     #[test]
@@ -32596,7 +32694,7 @@ mod tests {
                 "mcpServer/elicitation/request",
                 &json!({
                     "serverName": "custom",
-                    "threadId": "another-thread",
+                    "threadId": "thread",
                     "mode": mode,
                     "title": "Verify identity",
                     "description": "Please authenticate",
