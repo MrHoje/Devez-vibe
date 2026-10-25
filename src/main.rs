@@ -1566,6 +1566,33 @@ fn event_thread_id(params: &Value) -> Option<&str> {
         .or_else(|| params.pointer("/turn/threadId").and_then(Value::as_str))
 }
 
+/// Claude names its session with or without the `claude:` prefix by the time an
+/// event reaches the host, so thread ids compare by their raw form.
+fn same_thread(left: &str, right: &str) -> bool {
+    claude::raw_thread_id(left) == claude::raw_thread_id(right)
+}
+
+/// The refusal for a Claude request whose session isn't on screen: approvals
+/// decline, a question is cancelled, anything else is an error.
+fn declined_foreign_request(id: Value, method: &str) -> Action {
+    match method {
+        "item/tool/requestUserInput" => Action::RpcResponse {
+            id,
+            result: json!({ "answers": {}, "cancelled": true }),
+        },
+        "item/commandExecution/requestApproval"
+        | "item/fileChange/requestApproval"
+        | "item/permissions/requestApproval" => Action::RpcResponse {
+            id,
+            result: json!({ "decision": "decline" }),
+        },
+        _ => Action::RpcError {
+            id,
+            message: "화면에 없는 세션의 요청입니다.".to_owned(),
+        },
+    }
+}
+
 fn collapse_main_plan_for_btw(state: &mut AppState) -> Option<bool> {
     let expanded = state.plan_summary_expanded();
     state.set_plan_summary_expanded(false);
@@ -2173,6 +2200,12 @@ async fn event_loop(
                         } else {
                             SplitFocus::Main
                         };
+                        // The bridge serves the side conversation too.
+                        if method == "claude/bridge/closed"
+                            && let Some(btw) = btw_state.as_mut()
+                        {
+                            btw.handle_notification(&method, &params);
+                        }
                         let target = focused_state_mut(state, &mut btw_state, action_focus);
                         if let Some(action) = target.reject_unanswered_question(&method, &params) {
                             action
@@ -2225,16 +2258,36 @@ async fn event_loop(
                         }
                     }
                     Some(ServerEvent::Request { id, method, params }) => {
+                        let request_thread = event_thread_id(&params);
                         let target_is_btw = btw_state.as_ref().is_some_and(|btw| {
-                            event_thread_id(&params) == Some(btw.thread_id.as_str())
+                            request_thread.is_some_and(|thread| same_thread(thread, &btw.thread_id))
                         });
                         action_focus = if target_is_btw {
                             SplitFocus::Btw
                         } else {
                             SplitFocus::Main
                         };
-                        focused_state_mut(state, &mut btw_state, action_focus)
-                            .begin_server_request(id, &method, &params)
+                        if !target_is_btw
+                            && claude::is_claude_request_id(&id)
+                            && let Some(thread) = request_thread
+                            && !state.thread_id.is_empty()
+                            && !same_thread(thread, &state.thread_id)
+                        {
+                            // A busy session the user left behind: its card would
+                            // land on a conversation it has nothing to do with.
+                            state.push_notice(
+                                BlockKind::Warning,
+                                "Request declined",
+                                tr(
+                                    format!("현재 화면에 없는 Claude 세션({thread})의 요청을 거절했습니다."),
+                                    format!("Declined a request from Claude session {thread}, which isn't on screen."),
+                                ),
+                            );
+                            declined_foreign_request(id, &method)
+                        } else {
+                            focused_state_mut(state, &mut btw_state, action_focus)
+                                .begin_server_request(id, &method, &params)
+                        }
                     }
                     Some(ServerEvent::ProtocolWarning(message)) => {
                         state.push_notice(BlockKind::Warning, "Protocol warning", message);
@@ -5099,6 +5152,14 @@ async fn resume_into_state(
     state.load_history(&history, rollout.as_ref());
     state.begin_cost_restore();
     apply_resumed_token_usage(state, &response, rollout.as_ref());
+    // A Claude session the bridge kept alive may still be mid-turn.
+    if let Some(turn_id) = response
+        .get("activeTurnId")
+        .and_then(Value::as_str)
+        .filter(|turn_id| !turn_id.is_empty())
+    {
+        state.restore_running_turn(turn_id.to_owned());
+    }
     state.set_host_loading(false);
     Ok(Switched::Done(queued))
 }
@@ -7430,6 +7491,10 @@ async fn turn_is_running(server: &BackendServer, thread_id: &str, turn_id: &str)
     let Ok(Ok(status)) = timeout(PROBE_TIMEOUT, server.request("turn/status", params)).await else {
         return true;
     };
+    // The bridge restarted and has no such session: nothing is running.
+    if status.get("sessionMissing").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
     if status.get("known").and_then(Value::as_bool) != Some(true) {
         return true;
     }
@@ -10643,6 +10708,32 @@ mod tests {
         assert_eq!(state.thread_id, "thread-1");
         assert!(!state.busy);
         assert_eq!(state.view().activity, None, "the spinner stops");
+    }
+
+    #[test]
+    fn a_request_from_a_session_off_screen_is_declined_by_kind() {
+        assert!(same_thread("claude:abc", "abc"));
+        assert!(!same_thread("claude:abc", "claude:xyz"));
+        let id = json!({ "backend": "claude", "id": "h1" });
+
+        let Action::RpcResponse { result, .. } =
+            declined_foreign_request(id.clone(), "item/tool/requestUserInput")
+        else {
+            panic!("질문은 취소 응답이어야 한다");
+        };
+        assert_eq!(result, json!({ "answers": {}, "cancelled": true }));
+        for method in [
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+            "item/permissions/requestApproval",
+        ] {
+            let Action::RpcResponse { result, .. } = declined_foreign_request(id.clone(), method)
+            else {
+                panic!("권한 요청은 거절 응답이어야 한다");
+            };
+            assert_eq!(result, json!({ "decision": "decline" }));
+        }
+        assert!(matches!(declined_foreign_request(id, "x/y"), Action::RpcError { .. }));
     }
 
     #[test]

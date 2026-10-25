@@ -116,8 +116,12 @@ function hostRequest(method, params, signal, sessionId) {
     };
     if (signal?.aborted) return abort();
     signal?.addEventListener("abort", abort, { once: true });
+    const session = sessionId ? lookupSession(sessionId) : null;
+    // The host routes a card to the pane showing this conversation, not
+    // whichever one is in front.
+    if (session) params = { ...params, threadId: session.id };
     pendingHostRequests.set(id, {
-      session: sessionId ? lookupSession(sessionId) : null,
+      session,
       resolve: (value) => {
         signal?.removeEventListener("abort", abort);
         resolve(value);
@@ -784,7 +788,7 @@ function subdirectories(dir) {
 // live at plugins/cache/<marketplace>/<plugin>/<version>, which is also where
 // the `<plugin>@<marketplace>` id the setting expects comes from.
 function styleShippingPlugins() {
-  const root = join(homedir(), ".claude", "plugins", "cache");
+  const root = join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "plugins", "cache");
   const disabled = {};
   for (const marketplace of subdirectories(root)) {
     const marketplaceDir = join(root, marketplace);
@@ -798,7 +802,9 @@ function styleShippingPlugins() {
   return disabled;
 }
 
-function makeOptions(params, sessionId, resume) {
+// `currentId` follows the live conversation id: /clear moves the same query to a
+// new id with no alias back, so callbacks holding the start id lost the session.
+function makeOptions(params, sessionId, resume, currentId = () => sessionId) {
   const options = {
     cwd: params.cwd || process.cwd(),
     includePartialMessages: true,
@@ -845,14 +851,14 @@ function makeOptions(params, sessionId, resume) {
   if (resume) options.resume = resume;
   else options.sessionId = sessionId;
   options.canUseTool = (toolName, input, permission) =>
-    requestToolPermission(toolName, input, permission, sessionId);
+    requestToolPermission(toolName, input, permission, currentId());
   // Hooks run whatever the permission mode, so a read-only role turn holds even
   // under bypass. The policy itself arrives with each prompt.
   options.hooks = {
-    PreToolUse: [{ hooks: [(input) => toolPolicyHook(sessionId, input)] }],
+    PreToolUse: [{ hooks: [(input) => toolPolicyHook(currentId(), input)] }],
   };
   if (process.platform === "win32" && z) {
-    options.mcpServers = { [COMPUTER_SERVER]: computerServer(sessionId) };
+    options.mcpServers = { [COMPUTER_SERVER]: computerServer(currentId) };
   }
   return options;
 }
@@ -878,6 +884,27 @@ const MUTATING_SHELL_PATTERNS = [
   // A redirect into a file. `2>&1`, `>/dev/null`, `> nul`, `->` and `>=` pass.
   /(?:^|[^<>=-])>{1,2}(?!\s*(?:&|=|\/dev\/null\b|nul\b))/i,
   /\b(?:Set-Content|Add-Content|Out-File|Remove-Item|Move-Item|Copy-Item|New-Item|Rename-Item|Clear-Content|Set-ItemProperty|Export-Csv|Export-Clixml)\b/i,
+  // cmd verbs and PowerShell aliases. Only in command position: as plain words
+  // ("rg move src") they are searches, not writes.
+  /(?:^|[;&|(`]\s*)(?:del|erase|move|copy|ren|rename|md|rd|xcopy|robocopy|ni|ri|mi|cpi|rni|si|clc)\s/i,
+  /\bfind\b[^|;&\n]*\s-delete\b/,
+  // curl writes a file with -o/-O, alone or inside a flag cluster (-sSLo).
+  /\bcurl\b[^|;&\n]*\s(?:-[a-zA-Z]*[oO][a-zA-Z]*|--output|--remote-name)\b/,
+  /\bwget\b/,
+  /\s-OutFile\b/i,
+  // `git config` as the subcommand, writing: a key and a value, or a mutating
+  // flag or verb. A key alone reads, `get`/`list` read, and "config" in a path
+  // or pattern is not this.
+  /\bgit(?:\s+-[cC]\s+\S+|\s+--?[\w-]+(?:=\S+)?)*\s+config\b[^|;&\n]*\s(?:--unset\S*|--add|--replace-all|--rename-section|--remove-section|--edit|-e|set|unset|rename-section|remove-section|edit)\b/,
+  /\bgit(?:\s+-[cC]\s+\S+|\s+--?[\w-]+(?:=\S+)?)*\s+config(?:\s+--[\w-]+(?:=\S+)?|\s+--file\s+\S+|\s+-f\s+\S+)*\s+(?!-|get\b|list\b)[\w.-]+\s+(?!\d*>)[^\s|;&-]/,
+  // Inline interpreter code that writes: the interpreter in command position and
+  // the write inside its quoted code argument, so searching for these names
+  // (rg writeFileSync, `node -v && rg ...`) still reads. Best effort: an
+  // interpreter can always write in ways no pattern sees, so the role prompt
+  // remains the main guard.
+  /(?:^|[;&|(]\s*)(?:node|deno|bun)(?:\s+\S+)*?\s+(?:-e|--eval|-p|--print)\s+(["'])(?:(?!\1)[^\n])*\b(?:writeFileSync|writeFile|appendFileSync|appendFile|rmSync|unlinkSync|renameSync|mkdirSync|copyFileSync|cpSync)\b/,
+  /(?:^|[;&|(]\s*)(?:python3?|py)(?:\s+\S+)*?\s+-c\s+(["'])(?:(?!\1)[^\n])*(?:\bopen\([^)]*,\s*['"][wax+]|\b(?:os\.(?:remove|unlink|rename|replace|makedirs|mkdir|rmdir)|shutil\.(?:rmtree|move|copy\w*))\()/,
+  /\[(?:System\.)?IO\.(?:File|Directory)\]::(?:WriteAll\w+|AppendAll\w+|Delete|Move|Copy|CreateDirectory)\b/i,
 ];
 
 function pathWithin(cwd, root, target) {
@@ -1048,8 +1075,14 @@ async function requestToolPermission(toolName, input, permission, sessionId) {
   // decide that a human answer is needed. Forward every such request to the host;
   // auto-allowing the ordinary cases here would silently defeat default/auto mode.
   const planApproval = toolName === "ExitPlanMode";
+  // A `setMode` suggestion would switch the CLI out of the verified auto mode
+  // behind the bridge's back while the card read "Don't ask again". Rules and
+  // directories still apply.
+  const suggestions = Array.isArray(permission.suggestions)
+    ? permission.suggestions.filter((suggestion) => suggestion?.type !== "setMode")
+    : permission.suggestions;
   const persistentApprovalLabel = permission.suppressAlwaysAllowRule
-    ? "" : permissionSuggestionLabel(permission.suggestions);
+    ? "" : permissionSuggestionLabel(suggestions);
   const common = {
     claudePermission: true,
     title: permission.title || permission.displayName,
@@ -1093,7 +1126,7 @@ async function requestToolPermission(toolName, input, permission, sessionId) {
     updatedInput: input,
     ...(!permission.suppressAlwaysAllowRule
       && (response?.decision === "acceptForSession" || response?.scope === "session")
-      ? { updatedPermissions: permission.suggestions }
+      ? { updatedPermissions: suggestions }
       : {}),
   };
 }
@@ -1544,7 +1577,7 @@ async function performComputerAction(session, input, signal) {
   return computerResult("Clicked.");
 }
 
-function computerServer(sessionId) {
+function computerServer(currentId) {
   const point = () => z.array(z.number().int()).length(2);
   return createSdkMcpServer({
     name: COMPUTER_SERVER,
@@ -1572,7 +1605,7 @@ function computerServer(sessionId) {
         repeat: z.number().int().min(1).max(100).optional().describe("Times to press the key"),
         display: z.number().int().min(1).optional().describe("screenshot only: the display to capture, 1 being the primary. Later actions use the display last captured"),
       },
-      (input, extra) => runComputerAction(sessionId, input, extra),
+      (input, extra) => runComputerAction(currentId(), input, extra),
       { searchHint: "computer use desktop screen screenshot mouse click keyboard type" },
     )],
   });
@@ -1629,7 +1662,7 @@ function runClaudeCommand(params, args, deadlineMs = CLAUDE_COMMAND_TIMEOUT) {
       const output = Buffer.concat(stdout).toString("utf8").trim();
       const detail = Buffer.concat(stderr).toString("utf8").trim();
       if (code === 0) resolve(output);
-      else reject(Object.assign(new Error(detail || output || `Claude 명령이 종료 코드 ${code}로 실패했습니다.`), { exitCode: code }));
+      else reject(Object.assign(new Error(detail || output || `Claude 명령이 종료 코드 ${code}로 실패했습니다.`), { exitCode: code, stdout: output }));
     });
   });
 }
@@ -2056,7 +2089,7 @@ async function createSession(params, resumeId) {
     computerDisplay: 0,
   };
   await ensureClaudeExecutableChoice(params);
-  const agentQuery = await startAgentQuery(queue, makeOptions(params, id, resumeId));
+  const agentQuery = await startAgentQuery(queue, makeOptions(params, id, resumeId, () => session.id));
   session.query = agentQuery;
   sessions.set(id, session);
   const consumer = consume(session)
@@ -2138,7 +2171,10 @@ async function createSession(params, resumeId) {
 // 추가 입력·작업 통지의 후속 턴 예약은 살아 있는 작업의 증거가 아니다. 턴 중에
 // 흡수된 입력·통지는 CLI가 알려 주지 않아 예약이 끝없이 남으므로 전환을 막지 않는다.
 function sessionHasLiveWork(session) {
+  // `runtimeActive`: the CLI is mid-run with no host turn yet (an automatic run
+  // between its init and first frame); closing it then dropped that answer.
   return Boolean(session.initializing || session.promptStarting || session.queryRequests > 0 || session.turn
+    || session.runtimeActive
     || session.pendingPrompts?.length || session.queue?.values?.length || session.usageLimitWait
     || session.subagents?.size || session.hiddenSubagentTasks?.size || session.ambientSubagentTasks?.size
     || [...pendingHostRequests.values()].some((request) => request.session === session));
@@ -2420,11 +2456,13 @@ async function processStreamEvent(session, message) {
 }
 
 function processAssistant(session, message) {
-  if (!session.turn) return;
+  // A background agent keeps working after the turn closes; its row should still
+  // show the tool it is on.
   if (message.parent_tool_use_id) {
     recordSubagentMessage(session, message);
     return;
   }
+  if (!session.turn) return;
   session.lastContextUsage = tokenBreakdown(message.message?.usage);
   const capabilities = modelCapabilities(
     session.models,
@@ -2577,6 +2615,7 @@ function messageTime(message) {
 function applyTaskUpdate(tasks, input, turnId, onIntermediate, at) {
   const task = tasks.get(String(input.taskId));
   if (!task) return false;
+  if (input.status === "deleted") return tasks.delete(String(input.taskId));
   if (input.subject) task.subject = input.subject;
   const status = input.status;
   if (status === "in_progress" || status === "completed") {
@@ -2693,6 +2732,11 @@ function updatePlanFromToolResult(session, pending, message) {
       temporary.subject = created.subject || temporary.subject;
       temporary.status = created.status || temporary.status;
       session.tasks.set(temporary.id, temporary);
+    } else if (temporary) {
+      // A failed TaskCreate leaves no task to update, so its placeholder would
+      // stay pending forever. Redraw only if the plan already went out.
+      session.tasks.delete(temporary.id);
+      if (!session.planCreatePending) emitPlan(session);
     }
   } else if (pending.name === "TaskList" && Array.isArray(value?.tasks || value)) {
     const turnId = session.turn?.id;
@@ -2844,6 +2888,10 @@ function keepBackgroundSubagent(session, toolUseId, result) {
     .find((agent) => agent !== running && agent.taskId === running.taskId) : null;
   if (placeholder && placeholder !== running) {
     running.command ||= placeholder.command;
+    // The snapshot is what names the parent; without it a nested row sat at the
+    // top level until the next snapshot.
+    running.parentTaskId ||= placeholder.parentTaskId;
+    if (!running.tool) running.tool = placeholder.tool;
     if (placeholder.runId && (!running.runId || running.runId < placeholder.runId)) running.runId = placeholder.runId;
     session.subagents.delete(placeholder.id);
   }
@@ -3452,13 +3500,15 @@ function notificationTag(body, name) {
 
 // 완료 통지는 SDK 빌드에 따라 문자열·text 블록·다른 블록 형태로 올 수 있다.
 // 감지가 본문 구조에 좌우되면 백그라운드 서브에이전트가 영원히 남으므로, 잡을 수
-// 있는 모든 문자열을 한데 모은다.
+// 있는 모든 문자열을 한데 모은다. 도구 결과는 통지가 아니다: 통지 XML이 든 파일을
+// 읽은 결과를 통지로 보면 그 도구 항목이 끝나지 않고 살아 있는 행이 지워졌다.
 function messageAllText(message) {
   const content = message.message?.content;
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   const parts = [];
   for (const block of content) {
+    if (block?.type === "tool_result") continue;
     if (typeof block === "string") parts.push(block);
     else if (typeof block?.text === "string") parts.push(block.text);
     else if (typeof block?.content === "string") parts.push(block.content);
@@ -3581,6 +3631,8 @@ function processUser(session, message) {
     } else if (completed.type === "dynamicToolCall") {
       completed.contentItems = structured ?? [{ type: "text", text: output }];
     } else {
+      // A rejected Edit kept its start status, so the host drew it as applied.
+      if (completed.type === "fileChange") completed.status = block.is_error ? "failed" : "completed";
       completed.result = structured ?? output;
     }
     emitItem(session, "completed", completed);
@@ -3605,6 +3657,8 @@ function clearUsageLimitWait(session) {
   return true;
 }
 
+const USAGE_LIMIT_RESUME_TEXT = "사용량 한도로 중단된 작업을 이어서 진행하세요. 이미 완료한 작업은 반복하지 말고 현재 상태를 확인한 뒤 남은 작업을 수행하세요.";
+
 function resumeAfterUsageLimit(session, wait, now = Date.now()) {
   if (!wait || session.usageLimitWait !== wait || now < wait.resetsAt) return;
   clearUsageLimitWait(session);
@@ -3612,6 +3666,8 @@ function resumeAfterUsageLimit(session, wait, now = Date.now()) {
   // A long sleep must not launch unattended work when the machine wakes up.
   if (now - wait.lastTick > 30 * 60 * 1000) {
     finishTurn(session, new Error("사용량 한도가 초기화되었습니다. 계속하려면 요청을 보내 주세요."));
+    // Prompts the user queued behind the limited turn were asked for; they run.
+    drainPendingPrompt(session);
     return;
   }
   session.turn.rateLimitInfo = null;
@@ -3624,12 +3680,13 @@ function resumeAfterUsageLimit(session, wait, now = Date.now()) {
   try {
     session.queue.push({
       type: "user",
-      message: { role: "user", content: [{ type: "text", text: "사용량 한도로 중단된 작업을 이어서 진행하세요. 이미 완료한 작업은 반복하지 말고 현재 상태를 확인한 뒤 남은 작업을 수행하세요." }] },
+      message: { role: "user", content: [{ type: "text", text: USAGE_LIMIT_RESUME_TEXT }] },
       parent_tool_use_id: null,
       session_id: session.id,
     });
   } catch (error) {
     finishTurn(session, error);
+    drainPendingPrompt(session);
   }
 }
 
@@ -3713,7 +3770,13 @@ function abnormalStopOutcome(stopReason) {
 }
 
 async function processResult(session, message) {
-  if (!session.turn) return;
+  // 호스트 턴 없이 끝난 실행(/clear, 응답 없는 자동 실행)의 예약은 쓸 곳이 없다.
+  // 이어지는 자동 실행은 init이 다시 예약한다.
+  if (!session.turn) {
+    session.automaticTurnsPending = 0;
+    drainPendingPrompt(session);
+    return;
+  }
   for (const denial of Array.isArray(message.permission_denials) ? message.permission_denials : []) {
     rememberPermissionDenial(session, {
       tool: denial.tool_name,
@@ -3792,7 +3855,7 @@ async function processResult(session, message) {
   withSessionQuery(session, (query) => Promise.all([safeAccount(query), safeUsage(query)]))
     .then(([account, usage]) => notify("claude/account/updated", { threadId: session.id, account, usage }))
     .catch(() => {});
-  if (!steerFollows) await runPendingPrompt(session);
+  if (!steerFollows) drainPendingPrompt(session);
 }
 
 // Compaction ends the turn's only assistant message, so the context figure would
@@ -3842,7 +3905,7 @@ function rememberPermissionDenial(session, denial) {
 // The turn that was waiting starts on its own, so the host sees it exactly like a
 // prompt sent the moment the previous turn ended.
 async function runPendingPrompt(session) {
-  const next = session.pendingPrompts.shift();
+  const next = session.pendingPrompts?.shift();
   if (!next) return;
   try {
     await runPrompt(session, next);
@@ -3853,7 +3916,7 @@ async function runPendingPrompt(session) {
       error: { message: error instanceof Error ? error.message : String(error) },
       willRetry: false,
     });
-    await runPendingPrompt(session);
+    drainPendingPrompt(session);
   }
 }
 
@@ -3897,10 +3960,20 @@ async function consumeMessage(session, message) {
     if (session.clearWaiter) session.clearPending = true;
     return;
   }
+  // SDK가 스스로 시작한 실행(백그라운드 작업 완료, Monitor 이벤트)은 init으로 시작한다.
+  // 완료 통지는 같은 run_id의 task_updated에 가려 예약되지 않을 수 있고, Monitor
+  // 이벤트는 통지가 없다. 첫 턴 전(재개 재생)의 init은 예약하지 않는다.
+  if (message.type === "system" && message.subtype === "init" && !session.turn && !session.initializing
+    && session.turnSequence > 1 && !session.automaticTurnsPending && !session.steerPending) {
+    session.automaticTurnsPending = 1;
+  }
   adoptSessionId(session, message.session_id);
   beginUntrackedTurn(session, message);
-  // A queued SDK response may beat the timer. It already resumes the work.
-  if (!message.parent_tool_use_id && (message.type === "assistant" || message.type === "stream_event")) {
+  // A queued SDK response may beat the timer. It already resumes the work. A run
+  // that is itself refused by the same limit (an automatic run during the wait)
+  // resumes nothing; clearing on it spent a retry per refusal.
+  if (!message.parent_tool_use_id && (message.type === "assistant" || message.type === "stream_event")
+    && message.error !== "rate_limit") {
     clearUsageLimitWait(session);
     if (session.turn) session.turn.awaitingSteer = false;
   }
@@ -3938,6 +4011,7 @@ async function consumeMessage(session, message) {
     notify("thread/compacted", { threadId: session.id });
   } else if (message.type === "system" && message.subtype === "session_state_changed") {
     noteRuntimeActive(session, message.state !== "idle");
+    if (message.state === "idle") drainPendingPrompt(session);
   } else if (message.type === "system" && message.subtype === "permission_denied") {
     const reason = message.decision_reason || message.decision_reason_type;
     rememberPermissionDenial(session, {
@@ -4045,11 +4119,37 @@ async function startPrompt(params) {
   cancelUsageLimitWait(session);
   // Claude runs one turn at a time, so extra input waits its turn instead of
   // failing — the same queueing the CLI does for a prompt typed while it works.
-  if (session.turn) {
+  // Prompts already waiting (behind a cancelled usage-limit wait) go first.
+  if (promptMustWait(session) || session.pendingPrompts.length) {
     session.pendingPrompts.push(params);
-    return { turn: { id: session.turn.id }, queued: true };
+    drainPendingPrompt(session);
+    // The prompt's own turn does not exist yet; it arrives marked `prompt`.
+    return { turn: { id: null }, queued: true };
   }
-  return runPrompt(session, params);
+  return startQueuedSafely(session, params);
+}
+
+// A turn is running, or another prompt is still being set up (its turn opens
+// after model and effort calls); two setups at once overwrote each other's turn.
+function promptMustWait(session) {
+  return Boolean(session.turn || session.promptStarting > 0);
+}
+
+// A prompt that fails to start must not strand the ones queued behind it.
+function startQueuedSafely(session, params) {
+  return runPrompt(session, params).catch((error) => {
+    drainPendingPrompt(session);
+    throw error;
+  });
+}
+
+// Starts the next waiting prompt once nothing else holds the session. A usage
+// limit wait keeps its queue until the wait resolves. Never awaited from message
+// handling: the prompt's setup awaits SDK calls, and holding the message loop
+// meanwhile hid an automatic run's init from the check that defers to it.
+function drainPendingPrompt(session) {
+  if (session.closed || promptMustWait(session) || session.usageLimitWait) return;
+  runPendingPrompt(session).catch(() => {});
 }
 
 // Steering pushes the prompt straight into the SDK input stream, so the running
@@ -4060,10 +4160,24 @@ async function steerPrompt(params) {
   const session = sessions.get(id);
   if (!session) throw new Error(`Claude 세션을 찾을 수 없습니다: ${id}`);
   cancelUsageLimitWait(session);
-  if (!session.turn) return runPrompt(session, params);
+  if (!session.turn) {
+    // With no turn to join it is a prompt, and waits behind prompts already queued.
+    if (!promptMustWait(session) && !session.pendingPrompts.length) return startQueuedSafely(session, params);
+    session.pendingPrompts.push(params);
+    drainPendingPrompt(session);
+    return { turn: { id: null }, queued: true };
+  }
+  // Typed after a prompt that is still waiting: it follows that prompt instead
+  // of joining the run ahead of it (often an automatic turn).
+  if (session.pendingPrompts.length) {
+    session.pendingPrompts.push(params);
+    return { turn: { id: null }, queued: true };
+  }
   if (params.expectedTurnId && params.expectedTurnId !== session.turn.id) {
     throw new Error(`turn ID가 일치하지 않습니다: ${params.expectedTurnId}`);
   }
+  // Read before awaiting: the turn may close while an image is read.
+  const turnId = session.turn.id;
   // The CLI may answer the steered message in a cycle of its own, ending the
   // running turn first. Remember the debt so that answer opens a fresh turn
   // instead of arriving with no turn to attach to.
@@ -4076,7 +4190,7 @@ async function steerPrompt(params) {
     session_id: id,
     origin: { kind: "human" },
   });
-  return { turn: { id: session.turn.id }, steered: true };
+  return { turn: { id: turnId }, steered: true };
 }
 
 async function runPrompt(session, params) {
@@ -4103,6 +4217,10 @@ async function runPrompt(session, params) {
     const ultracode = (params.ultracode ?? session.ultracode) === true && effort === "xhigh";
     if (effort) {
       await session.query.applyFlagSettings({ effortLevel: effort, ultracode });
+    } else if (session.effort) {
+      // A model without effort levels: clear the previous model's level instead
+      // of leaving it in the flag layer for the next model that has them.
+      await session.query.applyFlagSettings({ effortLevel: null });
     }
     // The SDK takes the flag without complaint even where dynamic workflows are
     // off, so ask whether it actually took hold.
@@ -4123,6 +4241,14 @@ async function runPrompt(session, params) {
         : null;
     }
     const content = await inputContent(params.input, params.handoffContext);
+    // An automatic run may have opened a turn during the awaits above. Taking it
+    // over left that turn without a completion; this prompt goes first after it.
+    if (session.turn) {
+      session.pendingPrompts.unshift(params);
+      return { turn: { id: null }, queued: true };
+    }
+    // 지난 턴에 흡수된 통지의 예약을 비운다. 이후 자동 실행은 init이 다시 예약한다.
+    session.automaticTurnsPending = 0;
     const turnId = beginTurn(session, params.input);
     session.queue.push({
       type: "user",
@@ -4188,6 +4314,7 @@ const INTERNAL_TAGS = [
   "session-start-hook",
   "ide_selection",
   "ide_opened_file",
+  "devez-vibe-explicit-skills",
 ];
 
 /** Drops every internal block, leaving only what the user actually typed. */
@@ -4204,6 +4331,8 @@ function stripInternalTags(text) {
 function isInternalHistoryText(message, text) {
   if (message.isMeta || message.subtype === "local_command") return true;
   if (isCompactSummary(message, text)) return true;
+  // The bridge sends this itself after a usage limit resets; it is not a prompt.
+  if (text.trim() === USAGE_LIMIT_RESUME_TEXT) return true;
   // The interruption marker carries a reason ("… for tool use"), so it has to be
   // matched by prefix rather than by the bare sentence.
   return text.trim().startsWith("[Request interrupted by user");
@@ -4252,7 +4381,9 @@ function historyState(messages) {
     if (completedAt != null) turn.completedAt = Math.floor(completedAt / 1000);
     if (message.type === "assistant") {
       if (message.message?.model === "<synthetic>") {
-        turn.synthetic = true;
+        // Only a turn the model never answered is dropped. An interrupt or API
+        // error appends a synthetic reply after real work, and that turn stays.
+        turn.synthetic ??= true;
         continue;
       }
       turn.synthetic = false;
@@ -4763,11 +4894,38 @@ async function dispatch(method, params = {}) {
   if (method === "skills/list") return claudeSkills(params);
   if (method === "app/list") return { data: [] };
   if (method === "account/read") {
-    return await runClaudeJson(params, ["auth", "status", "--json"]) || {};
+    // Signed out, `auth status --json` still prints {"loggedIn": false} but
+    // exits 1; failing here left the host showing the previous account.
+    const args = ["auth", "status", "--json"];
+    const signedOut = (error) => {
+      try {
+        const status = JSON.parse(error.stdout);
+        if (status?.loggedIn === false) return status;
+      } catch {}
+      return null;
+    };
+    // Checked before the crash retry, which would run the CLI a second time.
+    return await runClaudeCommand(params, args)
+      .then((output) => output ? JSON.parse(output) : null)
+      .catch((error) => signedOut(error) || runClaudeJson(params, args).catch((retry) => {
+        const status = signedOut(retry);
+        if (status) return status;
+        throw retry;
+      })) || {};
   }
   if (method === "account/login/start") return startClaudeLogin(params);
   if (method === "account/login/cancel") return cancelClaudeLogin(params);
-  if (method === "plugin/reload") return {};
+  if (method === "plugin/reload") {
+    // A live session keeps the plugins and MCP servers it started with until its
+    // CLI reloads them; answering without that made /reload-plugins look applied.
+    // One session failing must not report the whole reload as failed.
+    const reloads = await Promise.allSettled([...sessions.values()]
+      .filter((session) => session.query && !session.closed && !session.initializing)
+      .map((session) => withSessionQuery(session, (query) => query.reloadPlugins?.())));
+    const failed = reloads.filter((reload) => reload.status === "rejected");
+    if (failed.length && failed.length === reloads.length) throw failed[0].reason;
+    return {};
+  }
   if (method === "permissions/status") return claudePermissionStatus(params);
   if (method === "permissions/update") return updateClaudePermission(params);
   if (method === "permissions/auto-mode") return setClaudeAutoModeDisabled(params);
@@ -4782,7 +4940,10 @@ async function dispatch(method, params = {}) {
   // turn you are still waiting on actually running?" from the bridge's own state.
   if (method === "session/turnStatus") {
     const session = lookupSession(params.sessionId);
-    if (!session) return { known: false, running: false, turnId: null };
+    // A session this bridge does not hold runs nothing here: the bridge that ran
+    // it has exited or released it. `sessionMissing` lets the host's stall probe
+    // end the turn, where a bare "unknown" kept it waiting forever.
+    if (!session) return { known: false, running: false, turnId: null, sessionMissing: true };
     return { known: true, running: Boolean(session.turn), turnId: session.turn?.id ?? null };
   }
   if (method === "session/start") {
@@ -4814,6 +4975,8 @@ async function dispatch(method, params = {}) {
           id,
           thread: { id, turns: [] },
           initialTurnsPage: { data: [], nextCursor: null },
+          // Returning to a session mid-turn: the host restores its busy state from this.
+          activeTurnId: existing.turn?.id ?? null,
           cwd: existing.cwd,
           model: existing.model,
           reasoningEffort: existing.effort,
@@ -4830,7 +4993,9 @@ async function dispatch(method, params = {}) {
     const messages = await sessionMessages(id, params.cwd);
     if (!messages.length) throw new Error(`Claude 세션을 찾을 수 없습니다: ${id}`);
     const info = await getSessionInfo(id, { dir });
-    const lastModel = [...messages].reverse().find((message) => message.type === "assistant")?.message?.model;
+    // An interrupt or API error leaves a `<synthetic>` reply last; it names no model.
+    const lastModel = [...messages].reverse().find((message) => message.type === "assistant"
+      && message.message?.model && message.message.model !== "<synthetic>")?.message?.model;
     // The transcript's own model outranks the host's fallback, which is only what
     // a new session would have opened on.
     const { session, account, usage } = await createSession({
@@ -4893,13 +5058,18 @@ async function dispatch(method, params = {}) {
     if (session) {
       session.pendingPrompts.length = 0;
       session.steerPending = 0;
+      session.automaticTurnsPending = 0;
       if (cancelUsageLimitWait(session)) return {};
     }
     if (session?.turn) {
       const turn = session.turn;
       turn.interruptRequested = true;
       try {
-        await withSessionQuery(session, (query) => query.interrupt());
+        // A plain interrupt keeps steers the CLI has queued, and they then ran as
+        // a new turn after the stop (measured on 0.3.309). `cancelQueued` drops
+        // them; the runtime has it (capability `interrupt_cancel_queued_v1`)
+        // though the typings do not, and older CLIs ignore the field.
+        await withSessionQuery(session, (query) => query.interrupt({ cancelQueued: true }));
       } catch (error) {
         if (session.turn === turn) delete turn.interruptRequested;
         throw error;
@@ -4960,6 +5130,17 @@ async function dispatch(method, params = {}) {
     if (session) {
       closeLiveSession(session);
       if (params.delete) await deleteSession(session.id, { dir: session.cwd });
+    } else if (params.delete) {
+      // Idle cleanup may already have closed it; the transcript still goes.
+      const id = liveSessionId(params.sessionId);
+      const dir = await readableCwd(id, params.cwd);
+      // Only "already gone" is fine; a locked or unreadable transcript must fail
+      // loudly, or the deleted session returns in /resume.
+      if (dir) {
+        await deleteSession(id, { dir }).catch((error) => {
+          if (error?.code !== "ENOENT" && !/not found/i.test(String(error?.message))) throw error;
+        });
+      }
     }
     return {};
   }
@@ -5158,8 +5339,26 @@ function runToolPolicySelfTest() {
     [planner, "Write", { file_path: "docs/plans/2026-09-05-x.md" }],
     [planner, "Write", { file_path: `${cwd}${sep}docs${sep}plans${sep}x.md` }],
     [reviewer, COMPUTER_TOOL, { action: "screenshot" }],
+    [reviewer, "Bash", { command: "rg move src && git log --grep copy" }],
+    [reviewer, "Bash", { command: "git config --get user.name" }],
+    [reviewer, "Bash", { command: "git diff -- src/config.rs && git log --oneline -- config/ && git show HEAD:config.json" }],
+    [reviewer, "Bash", { command: "rg -n writeFileSync npm/bridge && git log -S writeFileSync" }],
+    [reviewer, "Bash", { command: "git config get user.name; git config core.editor 2>/dev/null" }],
+    [reviewer, "Bash", { command: "node -e \"console.log(process.version)\" && rg -n writeFileSync npm/bridge" }],
+    [reviewer, "Bash", { command: "rg -n \"node\" -e writeFileSync npm/bridge" }],
+    [reviewer, "Bash", { command: "python -c \"print(1)\"" }],
   ];
   const denied = [
+    [reviewer, "PowerShell", { command: "del a.txt" }],
+    [reviewer, "PowerShell", { command: "Invoke-WebRequest https://x -OutFile y" }],
+    [reviewer, "Bash", { command: "find . -delete" }],
+    [reviewer, "Bash", { command: "git config user.name x" }],
+    [reviewer, "Bash", { command: "git config --file=x a.b c" }],
+    [reviewer, "Bash", { command: "git config --show-scope a.b c" }],
+    [reviewer, "Bash", { command: "node -e \"const fs=require('fs'); fs.writeFileSync('a','b')\"" }],
+    [reviewer, "Bash", { command: "curl -sSLo out https://example.com" }],
+    [reviewer, "Bash", { command: "node -e \"require('fs').writeFileSync('a','b')\"" }],
+    [reviewer, "Bash", { command: "python -c \"open('a.txt','w').write('x')\"" }],
     [reviewer, "Edit", { file_path: "src/main.rs" }],
     [reviewer, "Write", { file_path: "docs/plans/x.md" }],
     [reviewer, "NotebookEdit", { notebook_path: "a.ipynb" }],
@@ -5511,6 +5710,8 @@ async function runSelfTest() {
     await consumeMessage(session, { type: "system", subtype: "task_notification", task_id: "absorbed-task", status: "completed" });
     session.steerPending = 1;
     await consumeMessage(session, { type: "result", is_error: false, modelUsage: {}, permission_denials: [], duration_ms: 1, queued_turn_count: 0 });
+    // The result's account lookup runs detached; let it settle.
+    await new Promise((resolve) => setTimeout(resolve, 10));
     if (session.turn || session.automaticTurnsPending !== 1 || sessionHasLiveWork(session)) {
       throw new Error("Claude absorbed follow-up booking kept the session busy");
     }
@@ -5927,6 +6128,26 @@ async function runSelfTest() {
   if (interrupted.length !== 1 || interrupted[0].status !== "interrupted") {
     throw new Error(`Claude interrupted prompt history self-test failed: ${JSON.stringify(interrupted)}`);
   }
+  // 실제 작업 뒤 Esc나 API 오류로 붙은 합성 응답은 그 턴을 지우지 않는다.
+  const stopped = historyTurns([
+    user("stopped", "길게 써 줘"),
+    assistant("partial", "claude-opus-5", "앞부분"),
+    user("marker", "[Request interrupted by user]"),
+    assistant("stop-synthetic", "<synthetic>", "No response requested."),
+  ]);
+  if (stopped.length !== 1 || !stopped[0].items.some((item) => item.type === "agentMessage" && item.text === "앞부분")) {
+    throw new Error(`Claude stopped turn history self-test failed: ${JSON.stringify(stopped)}`);
+  }
+  // 브리지가 붙인 스킬 지시문과 한도 재개 문구는 사용자 입력으로 복원하지 않는다.
+  const injected = historyTurns([
+    user("skill", "<devez-vibe-explicit-skills>\nInvoke each skill\n- /x\n</devez-vibe-explicit-skills>\n고쳐 줘"),
+    assistant("skill-a", "claude-opus-5", "네."),
+    user("resume", USAGE_LIMIT_RESUME_TEXT),
+    assistant("resume-a", "claude-opus-5", "이어서 합니다."),
+  ]);
+  if (injected.length !== 1 || injected[0].items[0].content[0].text !== "고쳐 줘") {
+    throw new Error(`Claude injected prompt history self-test failed: ${JSON.stringify(injected)}`);
+  }
   const taskUse = (uuid, id, name, input) => ({
     type: "assistant",
     uuid,
@@ -6130,6 +6351,18 @@ async function runSelfTest() {
   applyTaskUpdate(reopenedTasks, { taskId: "2", status: "completed" }, "turn");
   applyTaskUpdate(reopenedTasks, { taskId: "4", status: "completed" }, "turn");
   applyTaskUpdate(reopenedTasks, { taskId: "3", status: "in_progress" }, "turn");
+  const deletedTasks = new Map([["1", { id: "1", subject: "1. a", status: "pending" }]]);
+  if (!applyTaskUpdate(deletedTasks, { taskId: "1", status: "deleted" }, "turn") || deletedTasks.size !== 0) {
+    throw new Error("Claude deleted task self-test failed");
+  }
+  const failedCreate = {
+    planCreatePending: true,
+    tasks: new Map([["pending:tu-fail", { id: "pending:tu-fail", subject: "1. a", status: "pending" }]]),
+  };
+  updatePlanFromToolResult(failedCreate, { name: "TaskCreate", toolUseId: "tu-fail" }, {
+    message: { content: [{ type: "tool_result", is_error: true, content: "Error: invalid input" }] },
+  });
+  if (failedCreate.tasks.size !== 0) throw new Error("Claude failed TaskCreate left a placeholder step");
   const reopenedPlan = [...reopenedTasks.entries()].map(([key, task]) => `${key}:${task.status}`).join(",");
   if (reopenedPlan !== "1:completed,2:completed,4:completed,3:in_progress") {
     throw new Error(`Claude reopened task order self-test failed: ${reopenedPlan}`);
@@ -6802,6 +7035,40 @@ async function runSelfTest() {
     if (automaticTurnSession.turn !== null
       || automaticTurnSession.automaticTurnsPending !== 0) {
       throw new Error("Claude consecutive automatic responses left a pending turn");
+    }
+    // 실측 순서: 백그라운드 명령 완료는 완료 task_updated 뒤 같은 run_id의 통지, init,
+    // 응답 순이다. Monitor 이벤트는 통지 없이 init부터 온다. 둘 다 턴 하나를 열고 닫는다.
+    const automaticRun = async (frames) => {
+      for (const frame of frames) await consumeMessage(automaticTurnSession, frame);
+      const opened = automaticTurnSession.turn !== null;
+      await consumeMessage(automaticTurnSession, {
+        type: "result", is_error: false, modelUsage: {}, permission_denials: [], duration_ms: 1,
+      });
+      return opened && automaticTurnSession.turn === null && automaticTurnSession.automaticTurnsPending === 0;
+    };
+    const reply = { type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "text", text: "auto" }] } };
+    const completed = (subtype) => ({
+      type: "system", subtype, task_id: "bash-done", run_id: "r1", status: "completed", patch: { status: "completed" },
+    });
+    if (!await automaticRun([completed("task_updated"), completed("task_notification"), { type: "system", subtype: "init" }, reply])
+      || !await automaticRun([{ type: "system", subtype: "init" }, reply])) {
+      throw new Error("Claude background completion or monitor event did not open one host turn");
+    }
+    // 첫 턴 전(재개 재생)의 init은 예약하지 않는다.
+    const sequence = automaticTurnSession.turnSequence;
+    automaticTurnSession.turnSequence = 1;
+    await consumeMessage(automaticTurnSession, { type: "system", subtype: "init" });
+    automaticTurnSession.turnSequence = sequence;
+    if (automaticTurnSession.automaticTurnsPending !== 0) {
+      throw new Error("Claude init before the first turn booked an automatic turn");
+    }
+    // /clear 실측 순서: init이 예약해도 응답 없이 result로 끝나면 예약이 남지 않는다.
+    await consumeMessage(automaticTurnSession, { type: "system", subtype: "init" });
+    await consumeMessage(automaticTurnSession, {
+      type: "result", is_error: false, modelUsage: {}, permission_denials: [], duration_ms: 1,
+    });
+    if (automaticTurnSession.turn !== null || automaticTurnSession.automaticTurnsPending !== 0) {
+      throw new Error("Claude turnless run left an automatic turn booking");
     }
 
     processUser(lifecycleSession, {
@@ -7759,6 +8026,63 @@ async function runSelfTest() {
     event.method === "item/started" && event.params?.item?.type === "dynamicToolCall");
   if (openingMessageIndex >= 0 || openingToolIndex < 0) {
     throw new Error(`Claude tool-first turn self-test failed: ${JSON.stringify(openingEvents)}`);
+  }
+  // 백그라운드 에이전트가 도는 동안(CLI는 running)에도 프롬프트는 바로 시작한다.
+  const waitSession = {
+    ...openingSession,
+    id: "prompt-wait-self-test",
+    turn: null,
+    turnSequence: 2,
+    pendingPrompts: [],
+    steerPending: 0,
+    automaticTurnsPending: 0,
+    runtimeActive: true,
+    query: { applyFlagSettings: async () => {} },
+    queue: { values: [], push(value) { this.values.push(value); } },
+  };
+  sessions.set(waitSession.id, waitSession);
+  process.stdout.write = () => true;
+  try {
+    const direct = await startPrompt({ sessionId: waitSession.id, input: [{ type: "text", text: "now" }] });
+    if (direct.queued || !waitSession.turn) {
+      throw new Error("Claude prompt waited on a background agent's running state");
+    }
+    // 다른 프롬프트를 준비하는 동안 온 프롬프트·steer는 기다렸다가 idle에 이어 시작한다.
+    Object.assign(waitSession, { turn: null, runtimeActive: false, promptStarting: 1 });
+    waitSession.queue.values.length = 0;
+    const queued = await startPrompt({ sessionId: waitSession.id, input: [{ type: "text", text: "wait" }] });
+    const steered = await steerPrompt({ sessionId: waitSession.id, input: [{ type: "text", text: "steer" }] });
+    if (!queued.queued || queued.turn.id !== null || !steered.queued || waitSession.turn || waitSession.pendingPrompts.length !== 2) {
+      throw new Error("Claude prompt during another prompt's setup did not wait");
+    }
+    waitSession.promptStarting = 0;
+    await consumeMessage(waitSession, { type: "system", subtype: "session_state_changed", state: "idle" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    if (!waitSession.turn || waitSession.queue.values.length !== 1 || waitSession.pendingPrompts.length !== 1) {
+      throw new Error("Claude waiting prompt did not start when the session went idle");
+    }
+    // 아직 기다리는 프롬프트가 있으면 추가 입력은 지금 턴이 아니라 그 뒤에 선다.
+    const behind = await steerPrompt({ sessionId: waitSession.id, input: [{ type: "text", text: "later" }] });
+    if (!behind.queued || waitSession.pendingPrompts.length !== 2 || waitSession.queue.values.length !== 1) {
+      throw new Error("Claude steer overtook a waiting prompt");
+    }
+    waitSession.pendingPrompts.length = 1;
+    // 한도 대기를 취소한 새 프롬프트보다 먼저 기다리던 프롬프트가 먼저 시작한다.
+    Object.assign(waitSession, {
+      turn: { id: "limited" },
+      runtimeActive: false,
+      usageLimitWait: { timer: null },
+      pendingPrompts: [{ input: [{ type: "text", text: "older" }] }],
+    });
+    waitSession.queue.values.length = 0;
+    await startPrompt({ sessionId: waitSession.id, input: [{ type: "text", text: "newer" }] });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    if (waitSession.queue.values[0]?.message?.content?.[0]?.text !== "older" || waitSession.pendingPrompts.length !== 1) {
+      throw new Error(`Claude prompt overtook one queued behind a usage limit: ${JSON.stringify(waitSession.queue.values)}`);
+    }
+  } finally {
+    process.stdout.write = stdoutWrite;
+    sessions.delete(waitSession.id);
   }
   const continuationSession = {
     ...openingSession,

@@ -1383,6 +1383,15 @@ impl BackendServer {
                 Some(ServerEvent::Closed(detail)) => detail,
                 _ => tr("Claude SDK 이벤트 채널이 종료되었습니다.", "The Claude SDK event channel closed.").to_owned(),
             };
+            // The turn that was running will never get its `turn/completed`; the
+            // screen ends it from this notice instead of waiting forever.
+            self.pending_events
+                .lock()
+                .expect("pending events mutex")
+                .push_back(ServerEvent::Notification {
+                    method: "claude/bridge/closed".to_owned(),
+                    params: json!({ "message": detail }),
+                });
             return Some(ServerEvent::ProtocolWarning(detail));
         }
         event.map(|event| {

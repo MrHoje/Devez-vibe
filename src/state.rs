@@ -6786,6 +6786,14 @@ impl AppState {
         self.plan_turn_id = None;
     }
 
+    /// A resumed session whose turn kept running while the screen was elsewhere:
+    /// show it as working again, with the turn id Esc needs to stop it.
+    pub fn restore_running_turn(&mut self, turn_id: String) {
+        self.active_turn_model = Some(self.selected_model_name().to_owned());
+        self.active_turn_effort = Some(self.selected_effort.clone());
+        self.set_turn_started(turn_id);
+    }
+
     pub fn set_turn_started(&mut self, turn_id: String) {
         self.claude_usage_limit_reset = None;
         self.pending_async_answer = None;
@@ -9305,6 +9313,30 @@ impl AppState {
         ) {
             self.pending = None;
         }
+        // 실제 질문·승인은 로컬 선택창보다 우선한다. 입력창·확인창·로그인 대기창과
+        // 다른 답변 대기는 보존한다.
+        if matches!(
+            self.pending,
+            Some(
+                PendingInteraction::ModelPicker { .. }
+                    | PendingInteraction::EffortPicker { .. }
+                    | PendingInteraction::RuntimePicker { .. }
+                    | PendingInteraction::AgentPicker { .. }
+                    | PendingInteraction::SettingPicker { .. }
+                    | PendingInteraction::ClaudePermissionsPanel { .. }
+                    | PendingInteraction::ClaudePermissionScopePicker { .. }
+                    | PendingInteraction::VibeModePicker { .. }
+                    | PendingInteraction::StatusLinePicker { .. }
+                    | PendingInteraction::SkillsPicker { .. }
+                    | PendingInteraction::ModelScope { .. }
+                    | PendingInteraction::ThemePicker { .. }
+                    | PendingInteraction::SessionPicker(_)
+                    | PendingInteraction::McpPicker(_)
+                    | PendingInteraction::PluginPicker(_)
+            )
+        ) {
+            self.pending = None;
+        }
         if self.pending.is_some() {
             if method == "item/tool/requestUserInput" {
                 if matches!(&self.pending, Some(PendingInteraction::UserInput { id: pending_id, .. }) if *pending_id == id) {
@@ -10214,6 +10246,34 @@ impl AppState {
         self.dispatch_notification(method, params);
     }
 
+    /// The Claude bridge exited. A card it was waiting on can't be answered any
+    /// more, and a Claude turn in flight will never report its own end, so close
+    /// the card and end the turn with the exit as its error.
+    fn end_turn_after_bridge_exit(&mut self, message: &str) {
+        let card = match &self.pending {
+            Some(PendingInteraction::Approval { id, .. } | PendingInteraction::UserInput { id, .. })
+                if crate::claude::is_claude_request_id(id) =>
+            {
+                Some(id.clone())
+            }
+            _ => None,
+        };
+        if let Some(id) = card {
+            self.clear_resolved_server_request(&id);
+        }
+        let model = self
+            .pending_turn_model
+            .as_deref()
+            .unwrap_or_else(|| self.active_cost_model());
+        if !self.busy || ModelProvider::from_model(model) != ModelProvider::Claude {
+            return;
+        }
+        self.dispatch_notification(
+            "turn/completed",
+            &json!({ "turn": { "status": "failed", "error": { "message": message } } }),
+        );
+    }
+
     /// Whether this notice has to wait for the text still being revealed.
     fn should_hold_for_stream(&self, method: &str, params: &Value) -> bool {
         (matches!(
@@ -10316,6 +10376,11 @@ impl AppState {
             "claude/session/state" => {
                 self.runtime_children &= params.get("active") == Some(&json!(true));
             }
+            "claude/bridge/closed" => {
+                self.end_turn_after_bridge_exit(
+                    params.get("message").and_then(Value::as_str).unwrap_or_default(),
+                );
+            }
             "claude/ultracode/unavailable" => {
                 self.ultracode = false;
                 self.committed.push(Block::new(
@@ -10347,13 +10412,17 @@ impl AppState {
                     .and_then(|turn| turn.get("id"))
                     .and_then(Value::as_str)
                 {
+                    // A turn the host never prompted (an automatic follow-up) runs on
+                    // what the session last ran, not on whatever the picker holds now.
                     self.active_turn_model = self
                         .pending_turn_model
                         .take()
+                        .or_else(|| self.active_turn_model.take())
                         .or_else(|| Some(self.selected_model_name().to_owned()));
                     self.active_turn_effort = self
                         .pending_turn_effort
                         .take()
+                        .or_else(|| self.active_turn_effort.take())
                         .or_else(|| Some(self.selected_effort.clone()));
                     self.set_turn_started(turn_id.to_owned());
                 }
@@ -18233,6 +18302,22 @@ fn completed_item_block(cwd: &str, item: &Value) -> Option<Block> {
                 .and_then(Value::as_array)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
+            // A change that never landed must not read as an applied diff. It
+            // leaves the file-change grouping, like a failed shell leaves the
+            // tool one.
+            if matches!(
+                item.get("status").and_then(Value::as_str),
+                Some("failed" | "declined")
+            ) {
+                return Some(Block::new(
+                    BlockKind::Warning,
+                    format!("Failed · {}", file_changes_title(cwd, changes)),
+                    tr(
+                        "파일 변경이 적용되지 않았습니다.",
+                        "The file change wasn't applied.",
+                    ),
+                ));
+            }
             Some(Block::new(
                 BlockKind::FileChange,
                 file_changes_title(cwd, changes),
@@ -20343,6 +20428,132 @@ mod tests {
             "gpt-5.6-sol",
             Some("high"),
         )
+    }
+
+    fn claude_bridge_state() -> AppState {
+        AppState::new(
+            "claude:thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![test_model("claude:sonnet", "Sonnet", true)],
+            "claude:sonnet",
+            Some("high"),
+        )
+    }
+
+    fn claude_request_id() -> Value {
+        json!({ "backend": "claude", "id": "claude-host-1", "gen": 1 })
+    }
+
+    #[test]
+    fn a_closed_claude_bridge_ends_the_running_turn_and_closes_its_card() {
+        let mut state = claude_bridge_state();
+        state.note_pending_turn_model("claude:sonnet");
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "t1" } }));
+        state.begin_server_request(claude_request_id(), "item/fileChange/requestApproval", &json!({}));
+        assert!(state.busy && state.awaiting_input());
+
+        state.handle_notification("claude/bridge/closed", &json!({ "message": "bridge exited" }));
+
+        assert!(!state.busy, "작업 중 표시가 걷혀야 한다");
+        assert!(state.turn_id.is_none());
+        assert!(!state.awaiting_input(), "죽은 브리지의 카드는 닫는다");
+        assert!(state.committed.iter().any(|block| block.title == "Response generation failed"));
+    }
+
+    #[test]
+    fn a_closed_claude_bridge_leaves_a_codex_turn_alone() {
+        let mut state = test_state();
+        state.note_pending_turn_model("gpt-5.6-sol");
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "t1" } }));
+
+        state.handle_notification("claude/bridge/closed", &json!({ "message": "bridge exited" }));
+
+        assert!(state.busy);
+    }
+
+    #[test]
+    fn a_picker_gives_way_to_both_codex_and_claude_cards() {
+        let mut state = test_state();
+        state.pending = Some(PendingInteraction::AgentPicker { selected: 0 });
+        let action = state.begin_server_request(
+            json!("codex-1"),
+            "item/fileChange/requestApproval",
+            &json!({}),
+        );
+        assert!(matches!(action, Action::None));
+        assert!(matches!(state.pending, Some(PendingInteraction::Approval { .. })));
+
+        state.pending = Some(PendingInteraction::AgentPicker { selected: 0 });
+        let action = state.begin_server_request(
+            claude_request_id(),
+            "item/fileChange/requestApproval",
+            &json!({}),
+        );
+        assert!(matches!(action, Action::None));
+        assert!(matches!(state.pending, Some(PendingInteraction::Approval { .. })));
+    }
+
+    #[test]
+    fn a_resumed_session_still_running_shows_as_working() {
+        let mut state = claude_bridge_state();
+        state.prepare_resume();
+        assert!(!state.busy);
+
+        state.restore_running_turn("turn-9".to_owned());
+
+        assert!(state.busy);
+        assert_eq!(state.turn_id.as_deref(), Some("turn-9"));
+    }
+
+    #[test]
+    fn a_failed_file_change_does_not_read_as_an_applied_diff() {
+        let failed = json!({ "type": "fileChange", "status": "failed", "changes": [] });
+        let applied = json!({ "type": "fileChange", "status": "completed", "changes": [] });
+
+        let block = completed_item_block("cwd", &failed).unwrap();
+        assert!(matches!(block.kind, BlockKind::Warning));
+        assert!(block.title.starts_with("Failed · "));
+        let block = completed_item_block("cwd", &applied).unwrap();
+        assert!(matches!(block.kind, BlockKind::FileChange));
+    }
+
+    #[test]
+    fn an_automatic_turn_keeps_the_model_the_session_last_ran() {
+        let mut state = test_state();
+        state.active_turn_model = Some("gpt-5.6-terra".to_owned());
+        state.active_turn_effort = Some("low".to_owned());
+
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "auto" } }));
+
+        assert_eq!(state.active_turn_model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(state.active_turn_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn marketplace_and_provider_inputs_keep_their_refusal() {
+        let mut state = test_state();
+        state.pending = Some(PendingInteraction::ProviderLoading);
+        let action = state.begin_server_request(claude_request_id(), "item/fileChange/requestApproval", &json!({}));
+        assert!(matches!(action, Action::RpcError { .. }));
+    }
+
+    #[test]
+    fn a_picker_gives_way_but_inputs_and_confirmations_do_not() {
+        let mut state = test_state();
+        state.pending = Some(PendingInteraction::ThemePicker { theme_index: 0 });
+        state.begin_server_request(claude_request_id(), "item/fileChange/requestApproval", &json!({}));
+        assert!(state.awaiting_input());
+
+        let mut state = test_state();
+        state.pending = Some(PendingInteraction::ProviderOAuthWaiting { provider_name: String::new(), url: String::new(), instructions: String::new() });
+        let action = state.begin_server_request(
+            claude_request_id(),
+            "item/fileChange/requestApproval",
+            &json!({}),
+        );
+        assert!(matches!(action, Action::RpcError { .. }));
+        assert!(matches!(state.pending, Some(PendingInteraction::ProviderOAuthWaiting { .. })));
     }
 
     /// 패널에서 끌어낸 인용은 컴포저 글자가 아니라 배지로만 서 있다가, 보낼 때

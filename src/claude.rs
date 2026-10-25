@@ -38,6 +38,9 @@ pub struct ClaudeClient {
     next_id: Arc<AtomicU64>,
     process: Arc<Mutex<Option<ClaudeProcess>>>,
     start_lock: Arc<Mutex<()>>,
+    /// 브리지를 띄울 때마다 오른다. 요청 id에 실려 와서, 다시 뜬 브리지가 모르는
+    /// 예전 요청에 응답을 보내 조용히 버려지는 일을 막는다.
+    generation: Arc<AtomicU64>,
     events: mpsc::UnboundedSender<ServerEvent>,
     node_path: PathBuf,
     claude_path: PathBuf,
@@ -108,16 +111,32 @@ impl ClaudeClient {
     }
 
     pub fn respond(&self, id: Value, result: Value) -> Result<()> {
+        self.ensure_current_bridge(&id)?;
         let id = claude_request_id(&id)?;
         self.send(json!({ "id": id, "result": result }))
     }
 
     pub fn respond_error(&self, id: Value, code: i64, message: &str) -> Result<()> {
+        self.ensure_current_bridge(&id)?;
         let id = claude_request_id(&id)?;
         self.send(json!({
             "id": id,
             "error": { "code": code, "message": message }
         }))
+    }
+
+    /// A card from a bridge that has since exited and restarted can't be answered:
+    /// the new bridge has never heard of it and would drop the reply silently.
+    fn ensure_current_bridge(&self, id: &Value) -> Result<()> {
+        match id.get("gen").and_then(Value::as_u64) {
+            Some(generation) if generation != self.generation.load(Ordering::Relaxed) => {
+                bail!(tr(
+                    "Claude SDK 브리지가 다시 시작되어 이전 요청에는 응답할 수 없습니다.",
+                    "The Claude SDK bridge restarted, so the earlier request can't be answered.",
+                ))
+            }
+            _ => Ok(()),
+        }
     }
 
     async fn ensure_started(&self) -> Result<()> {
@@ -166,6 +185,7 @@ impl ClaudeClient {
         let stderr = child.stderr.take().context(tr("Claude SDK stderr 연결 실패", "Claude SDK stderr connection failed"))?;
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Value>();
         *self.outbound.lock().expect("Claude outbound mutex") = Some(outbound_tx);
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(20)));
 
         let writer_task = tokio::spawn(async move {
@@ -193,7 +213,8 @@ impl ClaudeClient {
                     Ok(Some(line)) if line.trim().is_empty() => continue,
                     Ok(Some(line)) => match serde_json::from_str::<Value>(&line) {
                         Ok(message) => {
-                            route_message(message, &reader_pending, &reader_events).await
+                            route_message(message, &reader_pending, &reader_events, generation)
+                                .await
                         }
                         Err(error) => {
                             let _ = reader_events.send(ServerEvent::ProtocolWarning(tr(
@@ -307,6 +328,7 @@ impl ClaudeServer {
             next_id: Arc::new(AtomicU64::new(1)),
             process: Arc::new(Mutex::new(None)),
             start_lock: Arc::new(Mutex::new(())),
+            generation: Arc::new(AtomicU64::new(0)),
             events: event_tx,
             node_path: resolve_command(node_path),
             claude_path: resolve_command(claude_path),
@@ -482,6 +504,7 @@ async fn route_message(
     message: Value,
     pending: &PendingMap,
     events: &mpsc::UnboundedSender<ServerEvent>,
+    generation: u64,
 ) {
     if let Some(id) = message.get("id").and_then(Value::as_u64)
         && (message.get("result").is_some() || message.get("error").is_some())
@@ -506,7 +529,7 @@ async fn route_message(
     match message.get("id") {
         Some(id) => {
             let _ = events.send(ServerEvent::Request {
-                id: json!({ "backend": "claude", "id": id }),
+                id: json!({ "backend": "claude", "id": id, "gen": generation }),
                 method: method.to_owned(),
                 params,
             });
@@ -803,6 +826,7 @@ mod tests {
             next_id: Arc::new(AtomicU64::new(1)),
             process: Arc::new(Mutex::new(None)),
             start_lock: Arc::new(Mutex::new(())),
+            generation: Arc::new(AtomicU64::new(0)),
             events: mpsc::unbounded_channel().0,
             node_path: PathBuf::from("devez-vibe-없는-node"),
             claude_path: PathBuf::from("claude"),
@@ -836,6 +860,7 @@ mod tests {
             next_id: Arc::new(AtomicU64::new(1)),
             process: Arc::new(Mutex::new(None)),
             start_lock: Arc::new(Mutex::new(())),
+            generation: Arc::new(AtomicU64::new(0)),
             events: mpsc::unbounded_channel().0,
             node_path: PathBuf::from("node"),
             claude_path: PathBuf::from("claude"),
@@ -854,6 +879,34 @@ mod tests {
             client.pending.lock().await.is_empty(),
             "끊은 요청은 대기 목록에 남기지 않는다"
         );
+    }
+
+    /// 브리지가 다시 뜬 뒤에는 예전 카드에 응답해도 새 브리지가 모르는 요청이라
+    /// 조용히 버려진다. 보내지 않고 오류로 알려야 한다.
+    #[test]
+    fn a_card_from_a_restarted_bridge_cannot_be_answered() {
+        let (outbound, mut inbox) = mpsc::unbounded_channel();
+        let client = ClaudeClient {
+            outbound: Arc::new(StdMutex::new(Some(outbound))),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+            process: Arc::new(Mutex::new(None)),
+            start_lock: Arc::new(Mutex::new(())),
+            generation: Arc::new(AtomicU64::new(2)),
+            events: mpsc::unbounded_channel().0,
+            node_path: PathBuf::from("node"),
+            claude_path: PathBuf::from("claude"),
+            bridge_path: PathBuf::from("bridge.mjs"),
+            cwd: env::temp_dir(),
+        };
+        let stale = json!({ "backend": "claude", "id": "claude-host-a-1", "gen": 1 });
+        let current = json!({ "backend": "claude", "id": "claude-host-b-1", "gen": 2 });
+
+        assert!(client.respond(stale.clone(), json!({})).is_err());
+        assert!(client.respond_error(stale, -1, "x").is_err());
+        assert!(inbox.try_recv().is_err(), "예전 요청 응답은 브리지로 나가지 않는다");
+        client.respond(current, json!({})).unwrap();
+        assert_eq!(inbox.try_recv().unwrap()["id"], "claude-host-b-1");
     }
 
     /// 계정·플러그인 조회가 CLI에서 멈추면 브리지 요청도 끝나지 않는다.
@@ -1114,7 +1167,7 @@ mod tests {
         assert!(bridge.contains("perTaskStopAffordance: true"));
         // A read-only role turn is enforced by a PreToolUse hook that reads the
         // policy the host sends with each prompt, whatever the permission mode.
-        assert!(bridge.contains("PreToolUse: [{ hooks: [(input) => toolPolicyHook(sessionId, input)] }]"));
+        assert!(bridge.contains("PreToolUse: [{ hooks: [(input) => toolPolicyHook(currentId(), input)] }]"));
         assert!(bridge.contains("session.toolPolicy = "));
         assert!(bridge.contains("permissionDecision: \"deny\""));
         assert!(bridge.contains("if (CLAUDE_TASK_TOOLS.includes(name))"));
