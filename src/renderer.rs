@@ -11605,11 +11605,7 @@ fn side_panel_integration_placeholder(text: &str, content_width: usize) -> Paint
 }
 
 fn format_plan_elapsed(elapsed: Duration) -> String {
-    let seconds = elapsed.as_secs();
-    match seconds / 60 {
-        0 => format!("{seconds}s"),
-        minutes => format!("{minutes}m {}s", seconds % 60),
-    }
+    format_elapsed(elapsed.as_secs())
 }
 
 fn reasoning_lines(block: &Block, width: u16) -> Vec<PaintLine> {
@@ -30435,6 +30431,7 @@ mod tests {
 
         assert!(painted(&lines[2]).contains("Done (1m 34s)"));
         assert!(elapsed_line.contains("⏱  1m 34s"));
+        assert_eq!(format_plan_elapsed(Duration::from_secs(7_685)), "2h 8m 5s");
         assert_eq!(
             UnicodeWidthStr::width(elapsed_line.as_str()),
             UnicodeWidthStr::width(bottom_border.as_str())
