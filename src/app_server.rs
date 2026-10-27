@@ -639,93 +639,43 @@ pub(crate) fn spawn_thread_title(
 }
 
 const PROMPT_SUGGESTION_INSTRUCTIONS: &str =
-    "Predict the next message the user is most likely to send in the conversation below.
-Write it the way the user would type it, in the language the user writes in: one short line, ideally under 80 characters.
-If there is no natural next step, reply with nothing. No quotes, labels, or explanations. Do not run commands or use tools.";
+    "Write the next message the user is most likely to send in this conversation, as the user would type it, in the user's language. Output only that one line of text. Do not answer it and do not call any tools.";
 
-/// Claude Code predicts the next prompt after each turn; the Codex app-server
-/// has no such event, so a one-off `codex exec` makes the same guess from the
-/// last exchange, isolated the way thread titles are. `done` gets the cleaned
-/// suggestion, or `None` when the guess failed or came back empty. Dropping the
-/// returned task kills the run.
+/// Claude Code predicts the next prompt after each turn. Codex's own
+/// `thread/prediction/request` is not implemented yet (0.164.0), so this asks
+/// the experimental `thread/sample` the way the Codex desktop app does: one
+/// extra response on the thread's model and cached context that leaves no turn
+/// behind. Only persistent root threads can be sampled. A sample that reached
+/// for a tool comes back with no text and is dropped. `done` gets the cleaned
+/// suggestion, or `None`; dropping the returned task abandons the request.
 pub(crate) fn spawn_prompt_suggestion(
-    codex_path: &Path,
-    model: &str,
-    conversation: &str,
+    client: AppServerClient,
+    thread_id: String,
+    turn_id: String,
     done: impl FnOnce(Option<String>) + Send + 'static,
 ) -> JoinHandle<()> {
-    let mut command = codex_invocation(
-        &resolve_command(codex_path),
-        &[
-            "exec",
-            "--ephemeral",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--skip-git-repo-check",
-            "--sandbox",
-            "read-only",
-            "--color",
-            "never",
-            "--json",
-            "-c",
-            "model_reasoning_effort=\"low\"",
-            "-m",
-            model,
-        ],
-    );
-    command
-        .arg("-C")
-        .arg(env::temp_dir())
-        .arg("-")
-        .env_remove("DEVEZCODE_ROOM_ID")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    crate::child_process::isolate_backend(&mut command);
-    let input = format!("{PROMPT_SUGGESTION_INSTRUCTIONS}\n\n{conversation}");
     tokio::spawn(async move {
-        let Ok(mut child) = command.spawn() else {
-            return done(None);
-        };
-        let _job = crate::child_process::adopt_backend(&child);
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(input.as_bytes()).await;
-        }
-        let output = timeout(Duration::from_secs(60), child.wait_with_output())
+        let reply = client
+            .request(
+                "thread/sample",
+                json!({
+                    "threadId": thread_id,
+                    "expectedTurnId": turn_id,
+                    "prompt": PROMPT_SUGGESTION_INSTRUCTIONS,
+                    "effort": "low",
+                    "turnTrigger": "prompt_suggestion"
+                }),
+            )
             .await
-            .ok()
-            .and_then(Result::ok)
-            .filter(|output| output.status.success());
-        done(output.and_then(|output| {
-            prompt_suggestion_reply(&String::from_utf8_lossy(&output.stdout))
-                .as_deref()
-                .and_then(crate::state::clean_prompt_suggestion)
-        }));
+            .ok();
+        done(
+            reply
+                .as_ref()
+                .and_then(|reply| reply.get("text"))
+                .and_then(Value::as_str)
+                .and_then(crate::state::clean_prompt_suggestion),
+        );
     })
-}
-
-/// The answer in a `codex exec --json` event stream. The guess reads model
-/// output that can quote third-party text, so a run that reached for any tool
-/// — a command, a search, an MCP call — may have been steered, and its answer
-/// is thrown away rather than offered as the user's next prompt.
-fn prompt_suggestion_reply(events: &str) -> Option<String> {
-    let mut reply = None;
-    for event in events.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()) {
-        let Some(item) = event.get("item") else {
-            continue;
-        };
-        match item.get("type").and_then(Value::as_str) {
-            Some("agent_message") => {
-                if event.get("type").and_then(Value::as_str) == Some("item.completed") {
-                    reply = item.get("text").and_then(Value::as_str).map(ToOwned::to_owned);
-                }
-            }
-            Some("reasoning") => {}
-            _ => return None,
-        }
-    }
-    reply
 }
 
 /// The reply's first line, without the quotes or markdown a model may add.
@@ -1174,23 +1124,6 @@ fn condense_error_line(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_prompt_suggestion_run_that_used_a_tool_is_discarded() {
-        let answer = r#"{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"run the tests"}}"#;
-        let reasoning = r#"{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"…"}}"#;
-        let command = r#"{"type":"item.started","item":{"id":"item_2","type":"command_execution","command":"cat ~/.codex/auth.json"}}"#;
-        let search = r#"{"type":"item.started","item":{"id":"item_3","type":"web_search","query":"x"}}"#;
-        let turn = r#"{"type":"turn.completed","usage":{}}"#;
-
-        assert_eq!(
-            prompt_suggestion_reply(&[reasoning, answer, turn].join("\n")).as_deref(),
-            Some("run the tests")
-        );
-        assert_eq!(prompt_suggestion_reply(&[command, answer].join("\n")), None);
-        assert_eq!(prompt_suggestion_reply(&[answer, search].join("\n")), None);
-        assert_eq!(prompt_suggestion_reply("run the tests"), None, "plain text is not an event stream");
-    }
 
     struct CodexLauncherFixture(PathBuf);
 

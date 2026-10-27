@@ -2524,7 +2524,7 @@ async fn event_loop(
         if let Some(request) = state.take_prompt_suggestion_request() {
             let sender = management_tx.clone();
             let seq = request.seq;
-            let run = server.suggest_codex_prompt(&request.model, &request.conversation, move |suggestion| {
+            let run = server.suggest_codex_prompt(&request.thread_id, &request.turn_id, move |suggestion| {
                 if let Some(suggestion) = suggestion {
                     let _ = sender.send(ManagementUpdate::PromptSuggestion { seq, suggestion });
                 }
