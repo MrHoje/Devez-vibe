@@ -14974,7 +14974,7 @@ fn model_tone(model: &str) -> Option<Tone> {
         Some(Tone::ModelAstra)
     } else if (model.contains("gpt-6") || model.contains("gpt-5.6")) && model.contains("sol") {
         Some(Tone::ModelSol)
-    } else if model.contains("gpt-5.6") && model.contains("terra") {
+    } else if (model.contains("gpt-6") || model.contains("gpt-5.6")) && model.contains("terra") {
         Some(Tone::ModelTerra)
     } else if (model.contains("gpt-6") || model.contains("gpt-5.6")) && model.contains("luna") {
         Some(Tone::ModelLuna)
@@ -28752,6 +28752,7 @@ mod tests {
         for (model, tone) in [
             ("GPT-6 Astra", Tone::ModelAstra),
             ("GPT-6 Sol", Tone::ModelSol),
+            ("GPT-6.1 Terra", Tone::ModelTerra),
             ("GPT-6 Luna", Tone::ModelLuna),
         ] {
             assert_eq!(model_tone(model), Some(tone));

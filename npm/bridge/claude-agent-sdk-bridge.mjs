@@ -227,13 +227,14 @@ function applyClaudeExecutable(options, params) {
 
 // The SDK model list carries no window size, so the status line would stay
 // blank until a turn reports one — and a fresh session has no turn yet. Claude
-// defaults here stay unchanged; Haiku 5.5 has a native 1M window.
+// defaults here stay unchanged. Fable 5.1 and the 5.5 models have a native 1M
+// window, so Claude Code 2.1.311 lists them without the `[1m]` suffix.
 function claudeContextWindow(...names) {
   if (["1", "true"].includes(String(process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT || "").toLowerCase())) {
     return 200_000;
   }
   const oneMillion = names.some((name) => String(name || "").includes("[1m]")
-    || /claude-haiku-5-5(?:$|[-\[])/i.test(String(name || "")));
+    || /claude-(?:(?:haiku|sonnet|opus)-5-5|fable-5-1)(?:$|[-\[])/i.test(String(name || "")));
   return oneMillion ? 1_000_000 : 200_000;
 }
 
@@ -6473,8 +6474,12 @@ async function runSelfTest() {
       catalogEntry({ value: "haiku", resolvedModel: "claude-haiku-5-5" }, "").contextWindow,
       catalogEntry({ value: "claude-haiku-5-5-20261007" }, "").contextWindow,
       catalogEntry({ value: "claude-haiku-4-5-20251001" }, "").contextWindow,
+      catalogEntry({ value: "opus", resolvedModel: "claude-opus-5-5" }, "").contextWindow,
+      catalogEntry({ value: "sonnet", resolvedModel: "claude-sonnet-5-5" }, "").contextWindow,
+      catalogEntry({ value: "fable", resolvedModel: "claude-fable-5-1" }, "").contextWindow,
+      catalogEntry({ value: "claude-opus-5", resolvedModel: "claude-opus-5" }, "").contextWindow,
     ];
-    if (windows.join(",") !== "1000000,200000,300000,1000000,1000000,200000") {
+    if (windows.join(",") !== "1000000,200000,300000,1000000,1000000,200000,1000000,1000000,1000000,200000") {
       throw new Error(`Claude context window self-test failed: ${windows.join(",")}`);
     }
     for (const disabled of ["1", "true"]) {

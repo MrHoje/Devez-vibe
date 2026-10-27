@@ -445,14 +445,18 @@ pub fn model_catalog() -> Value {
     haiku["supportsAutoMode"] = json!(true);
     let one_million_disabled = env::var("CLAUDE_CODE_DISABLE_1M_CONTEXT")
         .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true"));
-    haiku["contextWindow"] = json!(if one_million_disabled { 200_000 } else { 1_000_000 });
+    // Fable 5.1 and the 5.5 models have a native 1M window.
+    let native_1m = |mut model: Value| {
+        model["contextWindow"] = json!(if one_million_disabled { 200_000 } else { 1_000_000 });
+        model
+    };
     json!({
         "data": [
-            claude_model("claude:claude-fable-5-1", "Fable 5.1", efforts(), false),
-            claude_model("claude:opus", "Opus 5.5", efforts(), false),
+            native_1m(claude_model("claude:claude-fable-5-1", "Fable 5.1", efforts(), false)),
+            native_1m(claude_model("claude:opus", "Opus 5.5", efforts(), false)),
             previous_opus,
-            claude_model("claude:sonnet", "Sonnet 5.5", efforts(), true),
-            haiku,
+            native_1m(claude_model("claude:sonnet", "Sonnet 5.5", efforts(), true)),
+            native_1m(haiku),
             // Older versions follow every family's newest, like the bridge's order.
             // The `fable` alias now resolves to Fable 5.1, so Fable 5 needs its id.
             claude_model("claude:claude-fable-5", "Fable 5", efforts(), false)
@@ -1026,9 +1030,13 @@ mod tests {
         assert_eq!(haiku["supportsAutoMode"], json!(true));
         let one_million_disabled = env::var("CLAUDE_CODE_DISABLE_1M_CONTEXT")
             .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true"));
+        let window = json!(if one_million_disabled { 200_000 } else { 1_000_000 });
         assert_eq!(
-            haiku["contextWindow"],
-            json!(if one_million_disabled { 200_000 } else { 1_000_000 })
+            models
+                .iter()
+                .map(|model| &model["contextWindow"])
+                .collect::<Vec<_>>(),
+            [&window, &window, &json!(200_000), &window, &window, &json!(200_000)]
         );
     }
 
@@ -1153,12 +1161,12 @@ mod tests {
             package
                 .pointer("/dependencies/@anthropic-ai~1claude-agent-sdk")
                 .and_then(Value::as_str),
-            Some("0.3.309")
+            Some("0.3.311")
         );
         assert_eq!(
             lock.pointer("/packages//dependencies/@anthropic-ai~1claude-agent-sdk")
                 .and_then(Value::as_str),
-            Some("0.3.309")
+            Some("0.3.311")
         );
         assert!(bridge.contains(
             "const CLAUDE_TASK_TOOLS = [\"TaskCreate\", \"TaskGet\", \"TaskUpdate\", \"TaskList\"]"
