@@ -23,12 +23,18 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude·Codex 연동의 안정성을 개선했습니다.",
+    "Updated Plan 경과 시간이 1시간을 넘으면 128m 대신 2h 8m 5s처럼 시간 단위로 표시합니다.",
+    "Claude Code 2.1.311을 적용해, MCP 서버 응답을 기다릴 때 중단이 늦게 반영되던 문제와 하위 에이전트가 늦게 연결된 MCP 도구를 쓰지 못하던 문제를 고쳤습니다.",
+    "첫 응답 전 Opus 5.5·Sonnet 5.5·Fable 5.1의 컨텍스트 크기가 200K로 보이던 문제를 고쳤습니다.",
+    "GPT-6.1 Terra 모델에도 GPT-5.6 Terra와 같은 색을 표시합니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Improved the stability of the Claude and Codex integrations.",
+    "Updated Plan elapsed time past one hour now reads in hours, such as 2h 8m 5s instead of 128m.",
+    "Applied Claude Code 2.1.311, fixing interrupts that took effect late while an MCP server had not answered and subagents that could not use MCP tools from servers that connected after they started.",
+    "Fixed Opus 5.5, Sonnet 5.5 and Fable 5.1 showing a 200K context window before the first response.",
+    "GPT-6.1 Terra models now show the same color as GPT-5.6 Terra.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

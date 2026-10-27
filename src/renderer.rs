@@ -25808,7 +25808,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        for gone in ["Plan", "Resets", "Account", "2026-08-01"] {
+        // The plan's value, not the word "Plan": release notes may name the Updated Plan tool.
+        for gone in ["Pro Lite", "Resets", "Account", "2026-08-01"] {
             assert!(
                 !painted_card.contains(gone),
                 "{gone} still on the welcome card: {painted_card}"
