@@ -5084,8 +5084,9 @@ async function dispatch(method, params = {}) {
   if (method === "session/compact") {
     return startPrompt({ ...params, input: [{ type: "text", text: "/compact" }] });
   }
-  // The running CLI re-reads the transcript's last custom title before it
-  // re-stamps session metadata, so a rename from here survives a live session.
+  // A running CLI writes the title it holds back after later turns, and /clear
+  // hands it the previous one (2.1.311), so only that CLI can rename a live
+  // session. A closed session takes the rename in its transcript.
   if (method === "session/rename") {
     const id = liveSessionId(params.sessionId);
     const session = sessions.get(id);
@@ -5096,7 +5097,10 @@ async function dispatch(method, params = {}) {
       const title = (await getSessionInfo(id, { dir }))?.customTitle;
       if (title && title !== session?.inheritedTitle) return {};
     }
-    await renameSession(id, String(params.name ?? ""), { dir });
+    const name = String(params.name ?? "");
+    const renamedLive = session?.query && !session.closed && await withSessionQuery(session,
+      (query) => query.renameSession(name, id)).then(() => true, () => false);
+    if (!renamedLive) await renameSession(id, name, { dir });
     if (session) delete session.inheritedTitle;
     return {};
   }
@@ -5672,6 +5676,11 @@ async function runSelfTest() {
       async setPermissionMode() {},
       async accountInfo() { return {}; },
       async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET() { return pendingUsage ? await pendingUsage : {}; },
+      // 실제 CLI처럼 받은 제목을 전사에 기록한다.
+      async renameSession(title, sessionId) {
+        this.renamed = [...(this.renamed || []), sessionId];
+        await renameSession(sessionId, title, { dir: process.cwd() });
+      },
       close() { this.closeCalls += 1; if (this.finishOnClose) events.close(); },
       [Symbol.asyncIterator]() {
         const iterator = events[Symbol.asyncIterator]();
@@ -5817,7 +5826,10 @@ async function runSelfTest() {
       await dispatch("session/rename", { sessionId: nextId, cwd: process.cwd(), name: autoTitle, unnamedOnly: true });
       const listed = await claudeSessionList({ cwd: process.cwd() });
       const prompt = transcriptPreview(await sessionMessages(nextId, process.cwd()));
+      // 살아 있는 대화의 이름은 그 CLI가 바꿔야 다음 턴에 옛 제목으로 돌아가지 않는다.
+      const liveRenames = clearSession.query.renamed?.filter((id) => id === nextId).length ?? 0;
       if (listed.find((row) => row.id === visibleSession(nextId))?.name !== expectedTitle
+        || liveRenames !== (mode === "external" ? 0 : 1)
         || prompt !== nextPrompt || await readFile(previousPath, "utf8") !== previousTranscript) {
         throw new Error(`Claude clear title self-test failed: ${mode}`);
       }
