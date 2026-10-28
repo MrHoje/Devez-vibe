@@ -1588,7 +1588,9 @@ fn visible_cluster_count(text: &str) -> usize {
     count
 }
 
-/// Byte offset just past `clusters` visible characters.
+/// Byte offset just past `clusters` visible characters. Whitespace before each
+/// one rides along for free: paid for, code indentation and aligned comments
+/// took a third of a code answer's reveal time and read as stalls.
 fn visible_cluster_end(text: &str, clusters: usize) -> usize {
     let mut taken = 0;
     let mut prev_joiner = false;
@@ -1597,7 +1599,9 @@ fn visible_cluster_end(text: &str, clusters: usize) -> usize {
             if taken == clusters {
                 return index;
             }
-            taken += 1;
+            if !ch.is_whitespace() {
+                taken += 1;
+            }
         }
         prev_joiner = ch == '\u{200d}';
     }
@@ -30994,15 +30998,22 @@ mod tests {
             "item/completed",
             &json!({"item":{"id":"paced","type":"agentMessage","text":text}}),
         );
+        // Whitespace rides along for free, so the budget bounds visible text only.
+        let shown = |state: &AppState| {
+            state.active.get("paced").map_or(0, |active| {
+                visible_cluster_count(&active.block.body.split_whitespace().collect::<String>())
+            })
+        };
         for _ in 0..10000 {
             let budget = (STREAM_RATE * elapsed.min(STREAM_MAX_STEP).as_secs_f32())
                 .ceil()
                 .max(1.0) as usize;
-            let reveal = state.drain_stream_text(elapsed);
+            let before = shown(&state);
+            state.drain_stream_text(elapsed);
+            let revealed = shown(&state).saturating_sub(before);
             assert!(
-                reveal.clusters <= budget,
-                "{} clusters exceed {budget} for {elapsed:?}",
-                reveal.clusters,
+                revealed <= budget,
+                "{revealed} clusters exceed {budget} for {elapsed:?}",
             );
             if !state.stream_events_pending() {
                 assert!(state.committed.iter().any(|block| block.body == text));
@@ -31085,6 +31096,23 @@ mod tests {
         }
         assert!(backlog_max < 300, "reveal fell behind arrival: {backlog_max}");
         assert!(state.active.get("one").is_some_and(|active| active.pace.pending.is_empty()));
+    }
+
+    #[test]
+    fn whitespace_rides_along_with_the_next_visible_character() {
+        assert_eq!(visible_cluster_end("        x  # y", 1), "        x".len());
+        assert_eq!(visible_cluster_end("  # y", 1), "  #".len());
+        let mut state = test_state();
+        let code = "        return value  # 정렬된 주석\n";
+        state.handle_notification("item/agentMessage/delta", &json!({"itemId":"code", "delta":code}));
+        let mut elapsed = Duration::ZERO;
+        while !state.active["code"].pace.pending.is_empty() {
+            state.drain_stream_text(STREAM_FRAME_FOR_TESTS);
+            elapsed += STREAM_FRAME_FOR_TESTS;
+        }
+        // 17 visible characters and the line break take about 0.18 s; paying for
+        // the 13 spaces as well took about 0.31 s.
+        assert!(elapsed < Duration::from_millis(220), "{elapsed:?}");
     }
 
     #[test]

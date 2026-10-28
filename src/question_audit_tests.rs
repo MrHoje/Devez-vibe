@@ -107,9 +107,14 @@ fn queued_prompt_waits_for_normal_completion_behind_paced_text() {
     state.handle_notification("turn/completed", &json!({"turn": {"id": "live-turn", "status": "completed"}}));
     // 남은 글자를 한꺼번에 내보내지 않고, 다 보인 뒤 완료가 풀리면 보낸다.
     assert!(state.take_queued_prompt().is_none(), "남은 응답을 몰아서 내보내고 다음 요청을 보냄");
+    // 공백은 다음 글자와 함께 나가므로 보이는 글자만 센다.
+    let shown = |state: &AppState| {
+        state.active.get("answer").map_or(0, |active| active.block.body.chars().filter(|ch| !ch.is_whitespace()).count())
+    };
     for _ in 0..1000 {
+        let before = shown(&state);
         let reveal = state.drain_stream_text(std::time::Duration::from_millis(4));
-        assert!(reveal.clusters <= 1);
+        assert!(shown(&state).saturating_sub(before) <= 1);
         if reveal.released {
             let next = state.take_queued_prompt().expect("완료 알림이 보류돼 대기열이 멈춤");
             assert!(matches!(state.start_queued_prompt(next), Action::Submit(_)), "끝난 턴으로 추가 입력을 보냄");
