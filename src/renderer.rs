@@ -376,6 +376,10 @@ pub struct EffortSlider {
     pub efforts: Vec<String>,
     pub selected: usize,
     pub detail: Option<String>,
+    /// `/effort`'s ultracode line, centred under the track: `Some(None)` off,
+    /// `Some(Some(phase))` on with its shimmer at `phase`, `None` where the
+    /// model has no ultracode.
+    pub ultracode: Option<Option<f32>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -436,6 +440,8 @@ pub struct StatusLineView {
     pub shell_mode: bool,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Claude ultracode, shown as `· ultracode` right of the effort.
+    pub ultracode: bool,
     /// Codex priority service tier, shown beside the active effort.
     pub fast: bool,
     pub context: Option<String>,
@@ -8799,6 +8805,59 @@ fn effort_step_lines_in(slider: &EffortSlider, inner: usize) -> Vec<PaintLine> {
     ]
 }
 
+/// `/effort`'s ultracode line, centred under the track: off, a quiet label; on,
+/// a bold `━━ ULTRACODE ON ━━` running through the top effort colours while a
+/// wide light band sweeps across it at `phase` (0.0 holds still). The bars are
+/// box drawing, which terminal fonts draw one even cell wide.
+fn ultracode_line(phase: Option<f32>, inner: usize) -> PaintLine {
+    let tail = match phase {
+        Some(phase) => {
+            let badge = "━━ ULTRACODE ON ━━";
+            let label = if UnicodeWidthStr::width(badge) <= inner {
+                badge
+            } else {
+                "ULTRACODE ON"
+            };
+            let status = &theme::palette().status;
+            let stops = [status.effort_xhigh, status.effort_ultra, status.effort_max];
+            let last = label.chars().count() - 1;
+            shimmer_spans_with_band(label, phase, stops[0], SHIMMER_BAND * 2.0)
+                .into_iter()
+                .enumerate()
+                .map(|(index, mut span)| {
+                    let at = index as f32 / last as f32 * (stops.len() - 1) as f32;
+                    let stop = (at as usize).min(stops.len() - 2);
+                    let mix = ((at - stop as f32) * 255.0).round() as u8;
+                    if let Tone::Shimmer(_, level) = span.tone {
+                        span.tone = Tone::Shimmer(blend(stops[stop], stops[stop + 1], mix), level);
+                    }
+                    span.bold = true;
+                    span
+                })
+                .collect()
+        }
+        None => vec![PaintSpan {
+            text: "Ultracode off".to_owned(),
+            tone: Tone::Muted,
+            bold: false,
+        }],
+    };
+    let width = tail
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+        .sum::<usize>();
+    PaintLine {
+        prefix: " ".repeat(inner.saturating_sub(width) / 2),
+        prefix_tone: Tone::Muted,
+        text: String::new(),
+        tone: Tone::Muted,
+        bold: false,
+        tool_heading: None,
+        pick: None,
+        tail,
+    }
+}
+
 /// A painted piece of the effort track and the step it stands for. The
 /// separators between the steps stand for nothing, and the shrinking that fits
 /// the track into a narrow panel drops steps, so which piece is which step is
@@ -8871,7 +8930,7 @@ fn effort_step_label(effort: &str, selected: bool, compact: bool) -> String {
         "high" => "H",
         "xhigh" => "XH",
         "max" => "MAX",
-        "ultra" | "ultracode" => "U",
+        "ultra" => "U",
         unknown => unknown,
     }
     .to_owned()
@@ -9066,6 +9125,13 @@ fn overlay_frame_with_expansion(
                         .into_iter()
                         .map(|line| panelize_content_line(line, panel_width)),
                 );
+                if let Some(phase) = slider.ultracode {
+                    lines.push(panel_padding_row(panel_width));
+                    lines.push(panelize_content_line(
+                        ultracode_line(phase, inner_width),
+                        panel_width,
+                    ));
+                }
                 if let Some(detail) = slider.detail.as_deref() {
                     lines.push(panel_padding_row(panel_width));
                     lines.extend(
@@ -9611,6 +9677,15 @@ fn status_line_row(
             STATUS_SEPARATOR
         };
         let span = push_status_span_after(&mut spans, separator, effort, tone);
+        picks.push((span, Pick::EffortSetting));
+    }
+    if status.ultracode {
+        let span = push_status_span_after(
+            &mut spans,
+            STATUS_PAIR_SEPARATOR,
+            "ultracode",
+            Tone::StatusEffortUltra,
+        );
         picks.push((span, Pick::EffortSetting));
     }
     if status.fast {
@@ -14508,7 +14583,7 @@ fn effort_tone(effort: &str) -> Option<Tone> {
         "high" => Tone::EffortHigh,
         "xhigh" => Tone::EffortXHigh,
         "max" => Tone::EffortMax,
-        "ultra" | "ultracode" => Tone::EffortUltra,
+        "ultra" => Tone::EffortUltra,
         _ => return None,
     })
 }
@@ -15031,7 +15106,7 @@ fn status_effort_tone(effort: &str) -> Option<Tone> {
         "high" => Tone::StatusEffortHigh,
         "xhigh" => Tone::StatusEffortXHigh,
         "max" => Tone::StatusEffortMax,
-        "ultra" | "ultracode" => Tone::StatusEffortUltra,
+        "ultra" => Tone::StatusEffortUltra,
         _ => return None,
     })
 }
@@ -16528,6 +16603,7 @@ mod tests {
                     model: Some("GPT-5.6 Codex".to_owned()),
                     effort: Some("xhigh".to_owned()),
                     fast: false,
+                    ultracode: false,
                     context: Some("ctx: 38k/1000k (3%)".to_owned()),
                     five_hour_percent: Some(97),
                     five_hour_remaining: Some("25m".to_owned()),
@@ -18105,6 +18181,7 @@ mod tests {
                 model: None,
                 effort: Some("high".to_owned()),
                 fast: false,
+                ultracode: false,
                 context: None,
                 five_hour_percent: None,
                 five_hour_remaining: None,
@@ -20491,6 +20568,7 @@ mod tests {
                 model: None,
                 effort: None,
                 fast: false,
+                ultracode: false,
                 context: None,
                 five_hour_percent: None,
                 five_hour_remaining: None,
@@ -21078,6 +21156,7 @@ mod tests {
                     model: None,
                     effort: None,
                     fast: false,
+                    ultracode: false,
                     context: None,
                     five_hour_percent: None,
                     five_hour_remaining: None,
@@ -21662,6 +21741,7 @@ mod tests {
                 efforts: ["Off", "On", "Super Vibe"].map(ToOwned::to_owned).to_vec(),
                 selected,
                 detail: None,
+                ultracode: None,
             };
             let lines = effort_step_lines(&slider, 80);
             assert_eq!(lines[0].tone, tone);
@@ -25282,6 +25362,7 @@ mod tests {
                 model: Some("GPT-5.6 Codex".to_owned()),
                 effort: Some("xhigh".to_owned()),
                 fast: false,
+                ultracode: false,
                 context: Some("ctx: 45k/256k (18%)".to_owned()),
                 five_hour_percent: Some(12),
                 five_hour_remaining: None,
@@ -25308,6 +25389,7 @@ mod tests {
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 fast: false,
+                ultracode: false,
                 context: None,
                 five_hour_percent: None,
                 five_hour_remaining: None,
@@ -25336,6 +25418,7 @@ mod tests {
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 fast: false,
+                ultracode: false,
                 context: None,
                 five_hour_percent: None,
                 five_hour_remaining: None,
@@ -25362,6 +25445,7 @@ mod tests {
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("xhigh".to_owned()),
                 fast: true,
+                ultracode: false,
                 context: None,
                 five_hour_percent: None,
                 five_hour_remaining: None,
@@ -25380,6 +25464,33 @@ mod tests {
     }
 
     #[test]
+    fn claude_ultracode_is_shown_right_of_the_effort_on_the_status_line() {
+        let line = status_line_row(
+            Some(StatusLineView {
+                agent: AgentMode::Standard,
+                shell_mode: false,
+                model: Some("Opus 5.5".to_owned()),
+                effort: Some("high".to_owned()),
+                ultracode: true,
+                fast: false,
+                context: None,
+                five_hour_percent: None,
+                five_hour_remaining: None,
+                weekly_percent: None,
+                notice: None,
+                update_notice: None,
+                background_tasks: None,
+            }),
+            "",
+            100,
+            false,
+        );
+
+        assert!(painted(&line).contains("Opus 5.5 · high · ultracode"));
+        assert_eq!(pick_on(&line, "ultracode"), Some(Pick::EffortSetting));
+    }
+
+    #[test]
     fn opencode_status_uses_model_first_text_beige_and_no_model_shortcut() {
         theme::set_current(ThemeKind::Dark);
         let line = status_line_row(
@@ -25389,6 +25500,7 @@ mod tests {
                 model: Some("DeepSeek V4 Flash · OpenCode Go".to_owned()),
                 effort: Some("high".to_owned()),
                 fast: false,
+                ultracode: false,
                 context: None,
                 five_hour_percent: None,
                 five_hour_remaining: None,
@@ -25433,6 +25545,7 @@ mod tests {
                 model: Some("GPT-5.6 Codex".to_owned()),
                 effort: Some("xhigh".to_owned()),
                 fast: false,
+                ultracode: false,
                 context: Some("ctx: 45k/256k (18%)".to_owned()),
                 five_hour_percent: Some(12),
                 five_hour_remaining: None,
@@ -25460,6 +25573,7 @@ mod tests {
                 model: Some("GPT-5.6 Codex".to_owned()),
                 effort: Some("xhigh".to_owned()),
                 fast: false,
+                ultracode: false,
                 context: None,
                 five_hour_percent: None,
                 five_hour_remaining: None,
@@ -25491,6 +25605,7 @@ mod tests {
                 model: None,
                 effort: None,
                 fast: false,
+                ultracode: false,
                 context: None,
                 five_hour_percent: Some(3),
                 five_hour_remaining: Some("4h 38m".to_owned()),
@@ -25516,6 +25631,7 @@ mod tests {
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 fast: false,
+                ultracode: false,
                 context: None,
                 five_hour_percent: None,
                 five_hour_remaining: None,
@@ -25545,6 +25661,7 @@ mod tests {
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 fast: false,
+                ultracode: false,
                 context: Some("ctx: 45k/256k (18%)".to_owned()),
                 five_hour_percent: Some(12),
                 five_hour_remaining: None,
@@ -25593,6 +25710,7 @@ mod tests {
                 model: None,
                 effort: Some("high".to_owned()),
                 fast: false,
+                ultracode: false,
                 context: None,
                 five_hour_percent: None,
                 five_hour_remaining: None,
@@ -27932,6 +28050,7 @@ mod tests {
                             .to_vec(),
                         selected: 2,
                         detail: None,
+                        ultracode: None,
                     }),
                     hint: "Enter select".to_owned(),
                     style: OverlayStyle::Picker,
@@ -27963,6 +28082,108 @@ mod tests {
                 "width {width}: selected effort border disappeared"
             );
         }
+    }
+
+    #[test]
+    fn the_ultracode_line_sits_centred_under_the_track_and_glows_when_on() {
+        let frame = |on: Option<f32>, width: u16| {
+            overlay_frame(
+                &[],
+                OverlayView {
+                    closable: false,
+                    title: "Effort".to_owned(),
+                    lines: Vec::new(),
+                    slider: Some(EffortSlider {
+                        efforts: ["low", "medium", "high", "xhigh", "max"]
+                            .map(ToOwned::to_owned)
+                            .to_vec(),
+                        selected: 3,
+                        detail: None,
+                        ultracode: Some(on),
+                    }),
+                    hint: "Tab ultracode".to_owned(),
+                    style: OverlayStyle::Picker,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
+                },
+                None,
+                StatusArea {
+                    fallback: "status".to_owned(),
+                    line: None,
+                    diff_reference_lines: None,
+                    side_panel_open: false,
+                    composer_notice: None,
+                    composer_mode: None,
+                },
+                width,
+            )
+        };
+        for width in [20, 33, 80] {
+            let off = frame(None, width);
+            let on = frame(Some(0.5), width);
+            // Tab never moves the panel.
+            assert_eq!(off.lines.len(), on.lines.len(), "width {width}");
+            let panel = &on.lines[..on.lines.len() - 2];
+            assert!(
+                panel
+                    .iter()
+                    .all(|line| painted_width(line) == panel_span(width)),
+                "width {width}: Picker row escapes its closed panel"
+            );
+        }
+
+        let bold = |phase: f32| {
+            frame(Some(phase), 80)
+                .lines
+                .into_iter()
+                .find(|line| painted(line).contains("━━ ULTRACODE ON ━━"))
+                .expect("ultracode badge")
+                .tail
+                .into_iter()
+                .filter(|span| span.bold)
+                .collect::<Vec<_>>()
+        };
+        let lit = |spans: &[PaintSpan]| {
+            spans
+                .iter()
+                .filter(|span| matches!(span.tone, Tone::Shimmer(_, level) if level > 200))
+                .count()
+        };
+        let still = bold(0.0);
+        assert_eq!(still.len(), "━━ ULTRACODE ON ━━".chars().count());
+        // The colour runs from one end of the badge to the other, and holds
+        // still once the sweep is over.
+        assert_ne!(still[0].tone, still[still.len() - 1].tone);
+        assert_eq!(lit(&still), 0);
+        assert!(lit(&bold(0.5)) > 0, "the band lights the badge mid-sweep");
+        let off = frame(None, 80);
+        let hint = off
+            .lines
+            .iter()
+            .find(|line| painted(line).contains("Ultracode off"))
+            .expect("ultracode label");
+        // Centred on the same axis as the track above it.
+        let margins = |line: &PaintLine| {
+            let text = painted(line);
+            let inside = text.trim_matches('│');
+            (
+                inside.len() - inside.trim_start().len(),
+                inside.len() - inside.trim_end().len(),
+            )
+        };
+        let track = off
+            .lines
+            .iter()
+            .find(|line| painted(line).contains("XHIGH"))
+            .expect("effort track");
+        let (track_before, track_after) = margins(track);
+        let (before, after) = margins(hint);
+        assert!(
+            (before as isize - after as isize).abs_diff(track_before as isize - track_after as isize)
+                <= 1,
+            "{before}/{after} vs track {track_before}/{track_after}"
+        );
     }
 
     #[test]
@@ -28020,6 +28241,7 @@ mod tests {
                 .to_vec(),
             selected: 2,
             detail: None,
+            ultracode: None,
         };
 
         let lines = effort_step_lines(&slider, 100);
@@ -28069,6 +28291,7 @@ mod tests {
                 .to_vec(),
             selected: 2,
             detail: None,
+            ultracode: None,
         };
 
         for width in [100, 40] {
@@ -28097,6 +28320,7 @@ mod tests {
             efforts: ["low", "medium", "high"].map(ToOwned::to_owned).to_vec(),
             selected: 1,
             detail: None,
+            ultracode: None,
         };
         let steps = effort_step_lines(&slider, 80).remove(1);
         let selected = "│ MEDIUM │";
@@ -28117,6 +28341,7 @@ mod tests {
             efforts: ["low", "medium", "high"].map(ToOwned::to_owned).to_vec(),
             selected: 1,
             detail: None,
+            ultracode: None,
         };
         let steps = effort_step_lines(&slider, 80).remove(1);
         let painted_steps = painted(&steps);
@@ -28395,6 +28620,7 @@ mod tests {
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 fast: false,
+                ultracode: false,
                 context: None,
                 five_hour_percent: None,
                 five_hour_remaining: None,
@@ -28655,6 +28881,7 @@ mod tests {
                     efforts: ["low", "medium", "high"].map(ToOwned::to_owned).to_vec(),
                     selected: 1,
                     detail: None,
+                    ultracode: None,
                 }),
                 hint: "←→ to adjust".to_owned(),
                 style: OverlayStyle::Picker,
@@ -28694,6 +28921,7 @@ mod tests {
                 .to_vec(),
             selected: 2,
             detail: None,
+            ultracode: None,
         };
 
         let lines = effort_step_lines(&slider, 40);
@@ -28709,6 +28937,7 @@ mod tests {
                     efforts: Vec::new(),
                     selected: 0,
                     detail: None,
+                    ultracode: None,
                 },
                 80,
             )
@@ -28721,6 +28950,7 @@ mod tests {
                 .to_vec(),
             selected: 99,
             detail: None,
+            ultracode: None,
         };
         let lines = effort_step_lines(&slider, 80);
         let selected = lines[1]

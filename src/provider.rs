@@ -471,6 +471,7 @@ impl ProviderPicker {
                     .collect(),
                 selected: self.selected,
                 detail: None,
+                ultracode: None,
             }),
             hint: "←→ Move  Enter Select  Esc Close".to_owned(),
             closable: true,

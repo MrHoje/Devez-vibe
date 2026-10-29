@@ -51,6 +51,10 @@ const SHIMMER_PERIOD: Duration = Duration::from_millis(1_100);
 /// calmer pace than the ordinary response shimmer.
 const COMPACTION_ACTIVITY_PERIOD: Duration = Duration::from_secs(2);
 const PLAN_SHIMMER_DURATION: Duration = SHIMMER_PERIOD.saturating_mul(5);
+/// The ultracode badge sweeps a few unhurried times after it lights up, then
+/// holds still: an open picker must not repaint forever or wipe a selection.
+const ULTRACODE_SHIMMER_PERIOD: Duration = SHIMMER_PERIOD.saturating_mul(2);
+const ULTRACODE_SHIMMER_DURATION: Duration = ULTRACODE_SHIMMER_PERIOD.saturating_mul(3);
 const RESPONSE_COLLAPSE_DURATION: Duration = Duration::from_millis(120);
 
 /// One-off notices (copy, reroute, …) sit in the status line this long.
@@ -434,20 +438,22 @@ impl SlashCommand {
     }
 
     /// Whether the command reaches anything on `provider`. OpenCode manages
-    /// logout, MCP and plugins outside this UI, and Claude has no fast service tier,
-    /// so those commands stay out of suggestions and `/help` on that runtime.
+    /// logout, MCP and plugins outside this UI, Claude has no fast service tier,
+    /// and only Claude has ultracode, so those commands stay out of suggestions
+    /// and `/help` on the runtimes they cannot reach.
     fn supports(&self, provider: ModelProvider) -> bool {
         match self.name {
             "/logout" | "/mcp" | "/plugins" | "/reload-plugins" => {
                 provider != ModelProvider::OpenCode
             }
             "/fast" => provider != ModelProvider::Claude,
+            "/ultracode" => provider == ModelProvider::Claude,
             _ => true,
         }
     }
 }
 
-const SLASH_COMMANDS: [SlashCommand; 36] = [
+const SLASH_COMMANDS: [SlashCommand; 37] = [
     SlashCommand {
         name: "/provider",
         korean: "Claude·Codex provider 전환 또는 OpenCode 연결",
@@ -489,6 +495,12 @@ const SLASH_COMMANDS: [SlashCommand; 36] = [
         korean: "추론 수준 설정",
         english: "Set reasoning effort",
         takes_argument: true,
+    },
+    SlashCommand {
+        name: "/ultracode",
+        korean: "모든 작업에 동적 워크플로우 쓰기 켜기·끄기",
+        english: "Toggle dynamic workflows on every task",
+        takes_argument: false,
     },
     SlashCommand {
         name: "/theme",
@@ -1693,12 +1705,13 @@ enum PendingInteraction {
         /// to the Favorites/All tabs. Only ever true while `query` is `Some`.
         search_focused: bool,
     },
-    /// `effort_index` one past the model's last tier is ultracode.
     EffortPicker {
         effort_index: usize,
         /// Set when `/model` asks this for the model just picked: Enter then
         /// moves on to `ModelScope` instead of applying.
         model_index: Option<usize>,
+        /// `/effort`'s pending Tab choice; Enter applies it with the effort.
+        ultracode: bool,
     },
     /// `/provider`: which runtime the next prompt goes to, and which runtimes
     /// dvz may dial at all. A machine that cannot reach the Codex app-server
@@ -3957,7 +3970,7 @@ pub struct AppState {
     models: Vec<ModelInfo>,
     selected_model: usize,
     selected_effort: String,
-    /// Claude ultracode: xhigh plus dynamic workflows, for this run only.
+    /// Claude ultracode: dynamic workflows at the chosen effort, for this run only.
     ultracode: bool,
     committed: Vec<Block>,
     active_order: Vec<String>,
@@ -4031,6 +4044,7 @@ pub struct AppState {
     /// its completed final step while it is still waiting for its own plan.
     plan_turn_id: Option<String>,
     plan_shimmer_started_at: Option<Instant>,
+    ultracode_shimmer_started_at: Option<Instant>,
     subagents: Vec<RunningSubagent>,
     artifacts: Vec<ArtifactLink>,
     /// Artifact URLs the user already put away with the row's `✕`, loaded from
@@ -4379,6 +4393,7 @@ impl AppState {
             plan_summary: None,
             plan_turn_id: None,
             plan_shimmer_started_at: None,
+            ultracode_shimmer_started_at: None,
             subagents: Vec::new(),
             artifacts: Vec::new(),
             dismissed_artifacts: read_dismissed_artifacts(),
@@ -5059,7 +5074,6 @@ impl AppState {
             })
             .map_or_else(|| model.default_effort.clone(), |effort| effort.id.clone());
         self.selected_model = index;
-        self.ultracode &= effort == "xhigh";
         self.selected_effort = effort.clone();
         self.context_window = model.context_window;
         self.clear_provider_completions();
@@ -5231,7 +5245,6 @@ impl AppState {
         if !model.supports_effort(&self.selected_effort) {
             self.selected_effort = model.default_effort.clone();
         }
-        self.ultracode &= self.selected_effort == "xhigh";
     }
 
     /// Replaces Codex entries without disturbing the independently managed
@@ -6082,7 +6095,7 @@ impl AppState {
             label: self.permission_mode().label().to_owned(),
             accent: self.permission_mode().accent(),
             model: self.selected_model_name().to_owned(),
-            effort: self.status_effort().to_owned(),
+            effort: self.selected_effort.clone(),
             cost: self.estimated_cost(),
         }
     }
@@ -6129,15 +6142,7 @@ impl AppState {
     }
 
     pub fn ultracode_active(&self) -> bool {
-        self.ultracode && self.selected_effort == "xhigh" && self.ultracode_available()
-    }
-
-    fn status_effort(&self) -> &str {
-        if self.ultracode_active() {
-            "ultracode"
-        } else {
-            &self.selected_effort
-        }
+        self.ultracode && self.ultracode_available()
     }
 
     pub fn provider_handoff_plan(&self) -> Option<String> {
@@ -6637,7 +6642,6 @@ impl AppState {
             })
             .or_else(|| effort.map(ToOwned::to_owned))
             .unwrap_or_else(|| self.selected_effort.clone());
-        self.ultracode &= self.selected_effort == "xhigh";
         if self.selected_provider() != previous_provider {
             self.clear_provider_completions();
         }
@@ -8225,6 +8229,21 @@ impl AppState {
             self.response_collapse = None;
             full_redraw = true;
         }
+        // The ultracode badge shimmers inside the picker, which only a full frame
+        // paints; one more frame after the sweep ends leaves it still.
+        let ultracode_shimmer = self.ultracode_shimmer_phase().is_some()
+            && matches!(
+                self.pending,
+                Some(PendingInteraction::EffortPicker {
+                    model_index: None,
+                    ultracode: true,
+                    ..
+                })
+            );
+        let ultracode_shimmer_ended = self.ultracode_shimmer_started_at.is_some() && !ultracode_shimmer;
+        if ultracode_shimmer_ended {
+            self.ultracode_shimmer_started_at = None;
+        }
         if animating {
             self.spinner_frame = (self.spinner_frame + 1) % SPINNER.len();
         }
@@ -8288,10 +8307,14 @@ impl AppState {
                     || subagent_elapsed_changed
                     || plan_shimmer_active
                     || response_collapse_active
+                    || ultracode_shimmer
+                    || ultracode_shimmer_ended
                     || full_redraw),
             animation_only: !inline_answer_active
                 && (animating || plan_shimmer_active)
                 && !response_collapse_active
+                && !ultracode_shimmer
+                && !ultracode_shimmer_ended
                 && !subagent_elapsed_changed
                 && !full_redraw,
         }
@@ -10407,8 +10430,8 @@ impl AppState {
                     BlockKind::Warning,
                     "Ultracode unavailable",
                     tr(
-                        "이 계정이나 설정에서 동적 워크플로우가 꺼져 있어 xhigh로만 실행합니다. Claude Code의 /config에서 켤 수 있습니다.",
-                        "Dynamic workflows are off for this account or settings, so this runs at xhigh only. Turn them on in Claude Code's /config.",
+                        "이 계정이나 설정에서 동적 워크플로우가 꺼져 있어 ultracode 없이 실행합니다. Claude Code의 /config에서 켤 수 있습니다.",
+                        "Dynamic workflows are off for this account or settings, so this runs without ultracode. Turn them on in Claude Code's /config.",
                     ),
                 ));
             }
@@ -11649,14 +11672,14 @@ impl AppState {
                             .position(|effort| effort.id == self.selected_effort)
                     })
                     .unwrap_or(0);
-                let effort_index = if self.ultracode_active() {
-                    self.selected_model().map_or(0, |model| model.efforts.len())
-                } else {
-                    effort_index
-                };
+                let ultracode = self.ultracode_active();
+                if ultracode {
+                    self.ultracode_shimmer_started_at = Some(Instant::now());
+                }
                 self.pending = Some(PendingInteraction::EffortPicker {
                     effort_index,
                     model_index: None,
+                    ultracode,
                 });
                 Action::None
             }
@@ -11678,6 +11701,35 @@ impl AppState {
                     ));
                 }
                 Action::None
+            }
+            "/ultracode" if parts.len() <= 2 => {
+                let on = match parts.get(1).map(|arg| arg.to_ascii_lowercase()).as_deref() {
+                    None => !self.ultracode_active(),
+                    Some("on") => true,
+                    Some("off") => false,
+                    Some(_) => {
+                        self.committed.push(Block::new(
+                            BlockKind::Error,
+                            "Usage",
+                            "/ultracode [on|off]",
+                        ));
+                        return Action::None;
+                    }
+                };
+                if on && !self.ultracode_available() {
+                    self.committed.push(Block::new(
+                        BlockKind::Error,
+                        "Ultracode unavailable",
+                        tr(
+                            "현재 모델에서는 ultracode를 쓸 수 없습니다. xhigh를 지원하는 Claude 모델에서 켤 수 있습니다.",
+                            "Ultracode is not available on the current model. Turn it on with a Claude model that supports xhigh.",
+                        ),
+                    ));
+                    return Action::None;
+                }
+                self.commit_welcome_card();
+                self.ultracode = on;
+                self.notice_setting_applies_to_next_request()
             }
             "/Response" | "/response" if parts.len() == 1 => {
                 self.open_response_display_picker();
@@ -12345,19 +12397,28 @@ impl AppState {
             PendingInteraction::EffortPicker {
                 mut effort_index,
                 model_index,
+                mut ultracode,
             } => {
                 let count = self
                     .effort_picker_model(model_index)
-                    .map(effort_step_count)
+                    .map(|model| model.efforts.len())
                     .unwrap_or(1)
                     .max(1);
                 match key.code {
                     KeyCode::Esc => return Action::None,
+                    KeyCode::Tab if model_index.is_none() && self.ultracode_available() => {
+                        ultracode = !ultracode;
+                        if ultracode {
+                            self.ultracode_shimmer_started_at = Some(Instant::now());
+                        }
+                    }
                     KeyCode::Enter => {
                         match model_index {
                             Some(model_index) => self.open_model_scope(model_index, effort_index),
                             None => {
-                                self.apply_effort_step(effort_index);
+                                if self.apply_effort_step(effort_index) {
+                                    self.ultracode = ultracode;
+                                }
                             }
                         }
                         return Action::None;
@@ -12379,6 +12440,7 @@ impl AppState {
                 self.pending = Some(PendingInteraction::EffortPicker {
                     effort_index,
                     model_index,
+                    ultracode,
                 });
                 Action::None
             }
@@ -13594,7 +13656,6 @@ impl AppState {
                 let model = self.models.get(*model_index)?;
                 let effort = match model.efforts.get(*effort_index) {
                     Some(effort) => effort.id.as_str(),
-                    None if *effort_index < effort_step_count(model) => "ultracode",
                     None => &model.default_effort,
                 };
                 let summary = if effort.is_empty() {
@@ -13650,20 +13711,24 @@ impl AppState {
             PendingInteraction::EffortPicker {
                 effort_index,
                 model_index,
+                ultracode,
             } => {
                 let model = self.effort_picker_model(*model_index)?;
                 let mut slider = effort_slider(model, *effort_index);
-                // As on Claude's track, ultracode is the step past max.
-                if has_ultracode(model) {
-                    slider.efforts.push("ultracode".to_owned());
-                    slider.selected = (*effort_index).min(model.efforts.len());
+                let mut hint = "←→ to adjust  ·  Enter to confirm  ·  Esc to cancel";
+                if model_index.is_none() && has_ultracode(model) {
+                    // Phase 0 leaves the band off the badge, so a finished sweep holds still.
+                    slider.ultracode = Some(
+                        ultracode.then(|| self.ultracode_shimmer_phase().unwrap_or(0.0)),
+                    );
+                    hint = "←→ to adjust  ·  Tab ultracode  ·  Enter to confirm  ·  Esc to cancel";
                 }
                 Some(OverlayView {
                     closable: true,
                     title: "Effort".to_owned(),
                     lines: Vec::new(),
                     slider: Some(slider),
-                    hint: "←→ to adjust  ·  Enter to confirm  ·  Esc to cancel".to_owned(),
+                    hint: hint.to_owned(),
                     style: OverlayStyle::Picker,
                     input: None,
                     input_label: "",
@@ -13726,6 +13791,7 @@ impl AppState {
                         .collect(),
                     selected: *selected,
                     detail: setting.detail(*selected),
+                    ultracode: None,
                 }),
                 hint: "←→ to adjust  ·  Enter to confirm  ·  Esc to cancel".to_owned(),
                 style: OverlayStyle::Picker,
@@ -13826,6 +13892,7 @@ impl AppState {
                             .collect(),
                         selected: *selected,
                         detail: None,
+                        ultracode: None,
                     }),
                     hint: "←→ move  ·  Enter select  ·  Esc back".to_owned(),
                     style: OverlayStyle::Picker,
@@ -13869,6 +13936,7 @@ impl AppState {
                             .collect(),
                         selected: *selected,
                         detail: Some(vibe.picker_detail().to_owned()),
+                        ultracode: None,
                     }),
                     hint: "←→ Move  ·  Enter Apply  ·  Esc Cancel".to_owned(),
                     style: OverlayStyle::Picker,
@@ -15109,6 +15177,13 @@ impl AppState {
         position as f32 / COMPACTION_ACTIVITY_PERIOD.as_millis() as f32
     }
 
+    fn ultracode_shimmer_phase(&self) -> Option<f32> {
+        let elapsed = self.ultracode_shimmer_started_at?.elapsed();
+        let period = ULTRACODE_SHIMMER_PERIOD.as_millis();
+        (elapsed < ULTRACODE_SHIMMER_DURATION)
+            .then(|| (elapsed.as_millis() % period) as f32 / period as f32)
+    }
+
     fn plan_shimmer_phase(&self) -> Option<f32> {
         let started = self.plan_shimmer_started_at?;
         let elapsed = started.elapsed();
@@ -15168,7 +15243,9 @@ impl AppState {
                 && self
                     .selected_model()
                     .is_some_and(|model| !model.efforts.is_empty()))
-            .then(|| self.status_effort().to_owned()),
+            .then(|| self.selected_effort.clone()),
+            ultracode: self.status_line_settings.enabled(StatusLineField::Effort)
+                && self.ultracode_active(),
             fast: self.status_line_settings.enabled(StatusLineField::Model)
                 && self.selected_provider() == ModelProvider::Codex
                 && self.effective_fast_mode(),
@@ -15219,14 +15296,10 @@ impl AppState {
             self.open_model_scope(model_index, 0);
             return;
         }
-        let effort_index = if self.ultracode_active() && has_ultracode(model) {
-            model.efforts.len()
-        } else {
-            self.effort_index_for_model(model_index)
-        };
         self.pending = Some(PendingInteraction::EffortPicker {
-            effort_index,
+            effort_index: self.effort_index_for_model(model_index),
             model_index: Some(model_index),
+            ultracode: self.ultracode,
         });
     }
 
@@ -15247,21 +15320,12 @@ impl AppState {
         effort_index: usize,
         scope: ModelScope,
     ) -> Action {
-        let model = self.models.get(model_index);
-        let ultracode =
-            model.is_some_and(|model| has_ultracode(model) && effort_index == model.efforts.len());
-        let effort = if ultracode {
-            Some("xhigh".to_owned())
-        } else {
-            model
-                .and_then(|model| model.efforts.get(effort_index))
-                .map(|effort| effort.id.clone())
-        };
+        let effort = self
+            .models
+            .get(model_index)
+            .and_then(|model| model.efforts.get(effort_index))
+            .map(|effort| effort.id.clone());
         self.apply_model(model_index, effort.as_deref());
-        // The step was picked outright, so it sets ultracode either way.
-        if self.selected_model == model_index {
-            self.ultracode = ultracode;
-        }
         if scope == ModelScope::Session {
             return Action::None;
         }
@@ -15330,7 +15394,6 @@ impl AppState {
             .to_owned();
         let context_window = model.context_window;
         self.selected_model = index;
-        self.ultracode &= selected_effort == "xhigh";
         self.selected_effort = selected_effort.clone();
         self.context_window = context_window.or(self.context_window);
         if next_provider != previous_provider {
@@ -15373,36 +15436,21 @@ impl AppState {
         let Some(model) = self.selected_model() else {
             return Action::None;
         };
-        // As in Claude's cycle, ultracode is one step past the top tier.
-        let ultracode_step = self.ultracode_available().then_some(model.efforts.len());
-        let current_index = if self.ultracode_active() {
-            model.efforts.len()
-        } else {
-            model
-                .efforts
-                .iter()
-                .position(|effort| effort.id == self.selected_effort)
-                .unwrap_or(0)
-        };
-        let last_index = ultracode_step.unwrap_or(model.efforts.len().saturating_sub(1));
+        let current_index = model
+            .efforts
+            .iter()
+            .position(|effort| effort.id == self.selected_effort)
+            .unwrap_or(0);
+        let last_index = model.efforts.len().saturating_sub(1);
         let next_index = match direction {
             -1 => current_index.saturating_sub(1),
             1 => (current_index + 1).min(last_index),
             _ => return Action::None,
         };
-        let next = if Some(next_index) == ultracode_step {
-            Some(("xhigh".to_owned(), true))
-        } else {
-            model
-                .efforts
-                .get(next_index)
-                .map(|effort| (effort.id.clone(), false))
-        };
         if next_index != current_index
-            && let Some((effort, ultracode)) = next
+            && let Some(effort) = model.efforts.get(next_index)
         {
-            self.selected_effort = effort;
-            self.ultracode = ultracode;
+            self.selected_effort = effort.id.clone();
             return self.notice_setting_applies_to_next_request();
         }
         Action::None
@@ -16585,19 +16633,26 @@ impl AppState {
             Some(PendingInteraction::EffortPicker {
                 effort_index,
                 model_index,
+                ultracode,
             }) => {
                 let settled = match model_index {
                     Some(model_index) => {
                         let fits = self
                             .models
                             .get(model_index)
-                            .is_some_and(|model| step < effort_step_count(model));
+                            .is_some_and(|model| step < model.efforts.len());
                         if fits {
                             self.open_model_scope(model_index, step);
                         }
                         fits
                     }
-                    None => self.apply_effort_step(step),
+                    None => {
+                        let settled = self.apply_effort_step(step);
+                        if settled {
+                            self.ultracode = ultracode;
+                        }
+                        settled
+                    }
                 };
                 if settled {
                     Action::None
@@ -16605,6 +16660,7 @@ impl AppState {
                     self.pending = Some(PendingInteraction::EffortPicker {
                         effort_index,
                         model_index,
+                        ultracode,
                     });
                     Action::Tick(false)
                 }
@@ -16771,17 +16827,12 @@ impl AppState {
         }
     }
 
-    /// Settles the effort picker on one step of its track; the step past the
-    /// model's last tier is ultracode. `false` when the step names nothing.
+    /// Settles the effort picker on one step of its track. `false` when the
+    /// step names nothing.
     fn apply_effort_step(&mut self, step: usize) -> bool {
         let Some(model) = self.selected_model() else {
             return false;
         };
-        if step == model.efforts.len() && self.ultracode_available() {
-            self.apply_effort("xhigh");
-            self.ultracode = true;
-            return true;
-        }
         let Some(effort) = model.efforts.get(step).map(|effort| effort.id.clone()) else {
             return false;
         };
@@ -16797,10 +16848,8 @@ impl AppState {
         if !model.supports_effort(effort) {
             return;
         }
+        // Like Claude's `/effort <level>`, a new tier keeps ultracode as it is.
         self.selected_effort = effort.to_owned();
-        // Like Claude's `/effort <level>`, naming a tier leaves ultracode; the
-        // picker's ultracode step sets it again after this.
-        self.ultracode = false;
     }
 
     fn apply_theme(&mut self, selected: ThemeKind) -> Action {
@@ -19195,11 +19244,6 @@ fn has_ultracode(model: &ModelInfo) -> bool {
         && model.supports_effort("xhigh")
 }
 
-/// Steps on a model's effort track: its tiers, then ultracode past max.
-fn effort_step_count(model: &ModelInfo) -> usize {
-    model.efforts.len() + usize::from(has_ultracode(model))
-}
-
 fn effort_slider(model: &ModelInfo, selected: usize) -> EffortSlider {
     EffortSlider {
         efforts: model
@@ -19209,6 +19253,7 @@ fn effort_slider(model: &ModelInfo, selected: usize) -> EffortSlider {
             .collect(),
         selected: selected.min(model.efforts.len().saturating_sub(1)),
         detail: None,
+        ultracode: None,
     }
 }
 
@@ -22014,7 +22059,7 @@ mod tests {
     }
 
     #[test]
-    fn shifted_right_past_max_is_ultracode_and_left_comes_back_to_max() {
+    fn shifted_right_stops_at_max_and_keeps_ultracode() {
         let shift = KeyModifiers::SHIFT;
         let mut opus = test_model("claude:opus", "Claude Opus", true);
         // Claude's tiers top out at max.
@@ -22027,16 +22072,13 @@ mod tests {
             "claude:opus",
             Some("max"),
         );
+        state.run_slash_command("/ultracode");
 
         state.handle_key(KeyEvent::new(KeyCode::Right, shift));
-        assert!(state.ultracode_active());
-        assert_eq!(state.selected_effort(), "xhigh");
-        state.handle_key(KeyEvent::new(KeyCode::Right, shift));
-        assert!(state.ultracode_active());
-
-        state.handle_key(KeyEvent::new(KeyCode::Left, shift));
-        assert!(!state.ultracode_active());
         assert_eq!(state.selected_effort(), "max");
+        state.handle_key(KeyEvent::new(KeyCode::Left, shift));
+        assert_eq!(state.selected_effort(), "xhigh");
+        assert!(state.ultracode_active());
     }
 
     #[test]
@@ -28717,8 +28759,17 @@ mod tests {
     }
 
     #[test]
-    fn ultracode_is_the_effort_track_step_past_max() {
+    fn tab_toggles_ultracode_under_the_effort_track_and_keeps_the_effort() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let shown = |state: &AppState| {
+            state
+                .overlay_view()
+                .expect("effort picker")
+                .slider
+                .expect("effort track")
+                .ultracode
+                .map(|phase| phase.is_some())
+        };
         let mut opus = test_model("claude:opus", "Claude Opus", true);
         // Claude's tiers top out at max.
         opus.efforts.pop();
@@ -28728,59 +28779,91 @@ mod tests {
             "account".to_owned(),
             vec![opus],
             "claude:opus",
-            Some("max"),
+            Some("high"),
         );
 
+        // The track keeps the tiers alone; the state sits on the line below.
         state.run_slash_command("/effort");
-        state.handle_key(key(KeyCode::Right));
         let slider = state.overlay_view().expect("effort picker").slider.expect("effort track");
-        assert_eq!(slider.efforts.last().map(String::as_str), Some("ultracode"));
-        assert_eq!(slider.selected, 5);
-        assert!(slider.detail.is_none());
-        // Tab toggles nothing any more, and nothing lies past ultracode.
+        assert_eq!(slider.efforts.last().map(String::as_str), Some("max"));
+        assert_eq!(shown(&state), Some(false));
+        assert!(
+            state
+                .overlay_view()
+                .expect("effort picker")
+                .hint
+                .contains("Tab ultracode")
+        );
         state.handle_key(key(KeyCode::Tab));
-        state.handle_key(key(KeyCode::Right));
-        state.handle_key(key(KeyCode::Enter));
-        assert_eq!(state.selected_effort(), "xhigh");
-        assert!(state.ultracode_active());
-        assert_eq!(state.status_line().effort.as_deref(), Some("ultracode"));
+        assert_eq!(shown(&state), Some(true));
+        // The badge shimmers while nothing else moves, then settles after a few sweeps.
+        assert!(state.render_tick().redraw);
+        state.ultracode_shimmer_started_at = Some(Instant::now() - ULTRACODE_SHIMMER_DURATION);
+        assert!(state.render_tick().redraw);
+        assert!(!state.render_tick().redraw);
+        let settled = state.overlay_view().expect("effort picker").slider.expect("track");
+        assert_eq!(settled.ultracode, Some(Some(0.0)));
+        // Esc drops the pending toggle.
+        state.handle_key(key(KeyCode::Esc));
+        assert!(!state.ultracode_active());
 
-        // Reopening lands on ultracode, and ← steps back to max.
         state.run_slash_command("/effort");
+        state.handle_key(key(KeyCode::Tab));
         state.handle_key(key(KeyCode::Left));
         state.handle_key(key(KeyCode::Enter));
-        assert_eq!(state.selected_effort(), "max");
-        assert!(!state.ultracode_active());
+        assert_eq!(state.selected_effort(), "medium");
+        assert!(state.ultracode_active());
+        let status = state.status_line();
+        assert_eq!(status.effort.as_deref(), Some("medium"));
+        assert!(status.ultracode);
 
-        // A tier left through another path does not bring ultracode back later.
+        // A tier named outright, or picked with the model, keeps it.
+        state.run_slash_command("/effort low");
+        state.select_model_and_effort("claude:opus", Some("max"));
+        assert!(state.ultracode_active());
+
+        // Reopening shows it on; Tab and Enter turn it off and keep the tier.
         state.run_slash_command("/effort");
-        state.handle_key(key(KeyCode::Right));
+        assert_eq!(shown(&state), Some(true));
+        state.handle_key(key(KeyCode::Tab));
         state.handle_key(key(KeyCode::Enter));
-        state.select_model_and_effort("claude:opus", Some("high"));
-        state.select_model_and_effort("claude:opus", Some("xhigh"));
         assert!(!state.ultracode_active());
+        assert_eq!(state.selected_effort(), "max");
+        assert!(!state.status_line().ultracode);
+
+        // `/ultracode` toggles, and on|off set it outright.
+        state.run_slash_command("/ultracode");
+        assert!(state.ultracode_active());
+        state.run_slash_command("/ultracode on");
+        assert!(state.ultracode_active());
+        state.run_slash_command("/ultracode OFF");
+        assert!(!state.ultracode_active());
+        let blocks = state.committed.len();
+        state.run_slash_command("/ultracode maybe");
+        assert!(!state.ultracode_active());
+        assert_eq!(state.committed.len(), blocks + 1);
 
         // Where the CLI has workflows off, the bridge says so and the flag drops.
-        state.run_slash_command("/effort");
-        state.handle_key(key(KeyCode::Right));
-        state.handle_key(key(KeyCode::Right));
-        state.handle_key(key(KeyCode::Enter));
-        assert!(state.ultracode_active());
+        state.run_slash_command("/ultracode");
         state.handle_notification("claude/ultracode/unavailable", &json!({}));
         assert!(!state.ultracode_active());
-        assert_eq!(state.selected_effort(), "xhigh");
+        assert_eq!(state.selected_effort(), "max");
 
-        // Codex has no ultracode step; its own top tier stays last.
+        // Codex has no ultracode: no line under the track, and nothing turns it on.
         let mut codex = test_state();
         codex.run_slash_command("/effort");
-        for _ in 0..5 {
-            codex.handle_key(key(KeyCode::Right));
-        }
-        let slider = codex.overlay_view().expect("effort picker").slider.expect("track");
-        assert_eq!(slider.efforts.last().map(String::as_str), Some("ultra"));
+        assert_eq!(shown(&codex), None);
+        codex.handle_key(key(KeyCode::Tab));
         codex.handle_key(key(KeyCode::Enter));
-        assert_eq!(codex.selected_effort(), "ultra");
         assert!(!codex.ultracode_active());
+        codex.run_slash_command("/ultracode on");
+        assert!(!codex.ultracode_active());
+        assert!(
+            codex
+                .committed
+                .last()
+                .is_some_and(|block| block.title == "Ultracode unavailable")
+        );
     }
 
     #[test]
@@ -28918,7 +29001,7 @@ mod tests {
     }
 
     #[test]
-    fn the_model_effort_step_ends_on_ultracode_for_claude() {
+    fn the_model_effort_step_keeps_ultracode_without_a_step_for_it() {
         let mut state = AppState::new(
             "thread".to_owned(),
             "cwd".to_owned(),
@@ -28927,31 +29010,28 @@ mod tests {
             "claude:claude-opus-5-5",
             Some("high"),
         );
+        state.run_slash_command("/ultracode");
         state.run_slash_command("/model");
         state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         {
             let effort = state.overlay_view().expect("effort picker");
             let slider = effort.slider.expect("effort track");
-            assert_eq!(slider.efforts.last().map(String::as_str), Some("ultracode"));
+            assert_eq!(slider.efforts.last().map(String::as_str), Some("ultra"));
+            assert!(slider.ultracode.is_none());
         }
-
+        // Past the last tier there is nothing to settle on.
         state.click_effort_step(6);
+        assert!(state.overlay_view().is_some_and(|view| view.title == "Effort"));
+
+        state.click_effort_step(1);
         assert!(
             state.overlay_view().expect("scope picker").lines[0]
                 .text
-                .ends_with("ultracode")
+                .ends_with("medium")
         );
         state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(state.selected_effort, "medium");
         assert!(state.ultracode_active());
-
-        // Picking a plain tier the same way leaves ultracode.
-        state.run_slash_command("/model");
-        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(!state.ultracode_active());
-        assert_eq!(state.selected_effort, "ultra");
     }
 
     #[test]

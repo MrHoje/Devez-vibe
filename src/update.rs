@@ -23,12 +23,14 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude에서 이름 있는 세션을 `/clear`·`/new`로 이어 쓰면 새 대화의 자동 이름이 이전 이름으로 돌아가 세션 목록이 같은 이름으로 채워지던 문제를 고쳤습니다.",
+    "Claude ultracode가 xhigh로 고정되지 않고 지금 고른 노력 수준 그대로 켜집니다.",
+    "`/effort`에서 Tab이나 `/ultracode` 명령으로 ultracode를 켜고 끌 수 있고, 켜면 상태줄에 `· ultracode`가 표시됩니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Fixed new Claude conversations started with `/clear` or `/new` from a named session reverting to the previous name, which filled the session list with the same name.",
+    "Claude ultracode no longer pins xhigh; it turns on at the effort you have picked.",
+    "Turn ultracode on or off with Tab in `/effort` or the `/ultracode` command; while it is on, the status line shows `· ultracode`.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");
