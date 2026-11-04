@@ -2745,6 +2745,11 @@ impl Renderer {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_markdown_screen_for_test(&mut self, source: &str, width: u16) {
+        self.previous_lines = markdown_line("  ", Tone::Plain, source, Tone::Plain, false, width, false);
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_composer_navigation_layout_for_test(&mut self, editor: &Editor, width: u16) {
         let (_, _, _, layout) = input_lines(editor, &[], width, "", "", None, None);
         self.composer_navigation_layout = Some(layout);

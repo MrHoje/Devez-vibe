@@ -2719,7 +2719,7 @@ fn renderer_mouse_action(
         MouseRequest::SelectionUpdate(column, row) => {
             Action::Tick(renderer.update_selection(column, row))
         }
-        MouseRequest::SelectionEnd(column, row) => match renderer.finish_selection(column, row) {
+        MouseRequest::SelectionEnd(released, row) => match renderer.finish_selection(released, row) {
             SelectionResult::Copy(text) => Action::Copy(text),
             // The quote is set aside first; the text still reaches the
             // clipboard the way any other selection does.
@@ -2735,7 +2735,8 @@ fn renderer_mouse_action(
                 }
                 // The down event painted a one-cell selection, so whatever the
                 // click turns out to mean, the row has to be repainted.
-                match renderer.pick_at(column, row) {
+                // 선택 좌표는 줄 끝 글자로 당겨지므로, 클릭 대상은 실제로 누른 칸에서 찾는다.
+                match renderer.pick_at(released, row) {
                     Some(Pick::History(group_id)) => {
                         renderer.toggle_tool(group_id);
                         Action::Tick(true)
@@ -11099,6 +11100,28 @@ mod tests {
             )),
             MouseRequest::ContextClick(4, 7)
         );
+    }
+
+    #[test]
+    fn clicking_blank_cells_after_a_link_does_not_open_it() {
+        let click = |renderer: &mut Renderer, column| {
+            let mut opened = None;
+            for kind in [MouseEventKind::Down(MouseButton::Left), MouseEventKind::Up(MouseButton::Left)] {
+                let event = MouseEvent { kind, column, row: 0, modifiers: KeyModifiers::NONE };
+                renderer_mouse_action(renderer, &event, |click| {
+                    if let MouseClick::Pick(Pick::OpenLink(target)) = click {
+                        opened = Some(target);
+                    }
+                    Action::Tick(true)
+                });
+            }
+            opened
+        };
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.set_markdown_screen_for_test("[절차](https://example.com)", 80);
+
+        assert_eq!(click(&mut renderer, 3).as_deref(), Some("https://example.com"));
+        assert_eq!(click(&mut renderer, 40), None);
     }
 
 }
