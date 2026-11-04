@@ -23,14 +23,14 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude ultracode가 xhigh로 고정되지 않고 지금 고른 노력 수준 그대로 켜집니다.",
-    "`/effort`에서 Tab이나 `/ultracode` 명령으로 ultracode를 켜고 끌 수 있고, 켜면 상태줄에 `· ultracode`가 표시됩니다.",
+    "최신 Claude Code를 적용하고 실행·설정·대화 저장 오류 안내를 보완했습니다.",
+    "모델 검색어 terra가 최신 GPT-6.1 Terra를 선택하도록 수정했습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Claude ultracode no longer pins xhigh; it turns on at the effort you have picked.",
-    "Turn ultracode on or off with Tab in `/effort` or the `/ultracode` command; while it is on, the status line shows `· ultracode`.",
+    "Updated to the latest Claude Code and improved guidance for startup, configuration, and conversation-saving errors.",
+    "The terra model search now selects the latest GPT-6.1 Terra.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

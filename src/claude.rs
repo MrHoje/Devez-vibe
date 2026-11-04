@@ -1161,12 +1161,12 @@ mod tests {
             package
                 .pointer("/dependencies/@anthropic-ai~1claude-agent-sdk")
                 .and_then(Value::as_str),
-            Some("0.3.311")
+            Some("0.3.318")
         );
         assert_eq!(
             lock.pointer("/packages//dependencies/@anthropic-ai~1claude-agent-sdk")
                 .and_then(Value::as_str),
-            Some("0.3.311")
+            Some("0.3.318")
         );
         assert!(bridge.contains(
             "const CLAUDE_TASK_TOOLS = [\"TaskCreate\", \"TaskGet\", \"TaskUpdate\", \"TaskList\"]"
@@ -1175,7 +1175,7 @@ mod tests {
         assert!(bridge.contains("perTaskStopAffordance: true"));
         // A read-only role turn is enforced by a PreToolUse hook that reads the
         // policy the host sends with each prompt, whatever the permission mode.
-        assert!(bridge.contains("PreToolUse: [{ hooks: [(input) => toolPolicyHook(currentId(), input)] }]"));
+        assert!(bridge.contains("PreToolUse: [{ onFailure: \"block\", hooks: [(input) => toolPolicyHook(currentId(), input)] }]"));
         assert!(bridge.contains("session.toolPolicy = "));
         assert!(bridge.contains("permissionDecision: \"deny\""));
         assert!(bridge.contains("if (CLAUDE_TASK_TOOLS.includes(name))"));

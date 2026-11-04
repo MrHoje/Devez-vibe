@@ -110,6 +110,7 @@ const PRICES: &[(&str, f64, f64)] = &[
     // GPT (Codex)
     ("gpt-6-astra", 10.0, 50.0),
     ("gpt-6.1-sol", 2.0, 10.0),
+    ("gpt-6.1-terra", 1.0, 5.0),
     ("gpt-6-sol", 2.0, 10.0),
     ("gpt-6-luna", 0.1, 0.5),
     ("gpt-5.6-sol", 4.0, 20.0),
@@ -146,7 +147,7 @@ pub fn estimate_usd(model: &str, totals: TokenTotals) -> Option<f64> {
         .find(|(slug, _, _)| model.contains(slug))
         .copied()?;
     // Fable 5.1 and Mythos 5.1 cut cache reads to $0.25/MTok — 0.025x their
-    // input rate — and Opus 5.5, Sonnet 5.5 and GPT-6.1 Sol to 0.05x, against
+    // input rate — and Opus 5.5, Sonnet 5.5 and GPT-6.1 Sol/Terra to 0.05x, against
     // the 0.1x every other model on either vendor still charges.
     let cache_read_multiplier =
         if model.contains("claude-fable-5-1") || model.contains("claude-mythos-5-1") {
@@ -154,6 +155,7 @@ pub fn estimate_usd(model: &str, totals: TokenTotals) -> Option<f64> {
         } else if model.contains("claude-opus-5-5")
             || model.contains("claude-sonnet-5-5")
             || model.contains("gpt-6.1-sol")
+            || model.contains("gpt-6.1-terra")
         {
             0.05
         } else {
@@ -248,6 +250,7 @@ mod tests {
         assert_eq!(estimate_usd("gpt-5.6-luna", totals), Some(1.4));
         assert_eq!(estimate_usd("gpt-6-astra", totals), Some(60.0));
         assert_eq!(estimate_usd("gpt-6.1-sol", totals), Some(12.0));
+        assert_eq!(estimate_usd("gpt-6.1-terra", totals), Some(6.0));
         assert_eq!(estimate_usd("gpt-6-sol", totals), Some(12.0));
         assert_eq!(estimate_usd("gpt-6-luna", totals), Some(0.6));
         assert_eq!(estimate_usd("gpt-5.6-terra", totals), Some(14.0));
@@ -276,6 +279,8 @@ mod tests {
 
         // gpt-5.6-sol input is $4/M: write ×1.25 = 5.00, read ×0.1 = 0.40.
         assert!((estimate_usd("gpt-5.6-sol", totals).unwrap() - 5.40).abs() < 1e-9);
+        // GPT-6.1 Terra: $1.25/M cache writes and $0.05/M cache reads.
+        assert!((estimate_usd("gpt-6.1-terra", totals).unwrap() - 1.30).abs() < 1e-9);
     }
 
     #[test]

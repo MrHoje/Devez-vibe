@@ -1,6 +1,6 @@
 {
   "name": "devez-vibe",
-  "version": "1.11.5",
+  "version": "1.11.6",
   "type": "module",
   "description": "Stable terminal UI for Codex and Claude Agent SDK",
   "keywords": [
@@ -39,12 +39,12 @@
     "x64"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=18.14.0"
   },
   "scripts": {
     "postinstall": "node install-skills.mjs && node prepare-search-deps.mjs"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "0.3.311"
+    "@anthropic-ai/claude-agent-sdk": "0.3.318"
   }
 }

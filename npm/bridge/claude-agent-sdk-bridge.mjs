@@ -856,7 +856,7 @@ function makeOptions(params, sessionId, resume, currentId = () => sessionId) {
   // Hooks run whatever the permission mode, so a read-only role turn holds even
   // under bypass. The policy itself arrives with each prompt.
   options.hooks = {
-    PreToolUse: [{ hooks: [(input) => toolPolicyHook(currentId(), input)] }],
+    PreToolUse: [{ onFailure: "block", hooks: [(input) => toolPolicyHook(currentId(), input)] }],
   };
   if (process.platform === "win32" && z) {
     options.mcpServers = { [COMPUTER_SERVER]: computerServer(currentId) };
@@ -3737,6 +3737,9 @@ const STARTUP_FAILURE_GUIDES = {
   org_verify_failed: "로그인 계정의 조직을 확인하지 못했습니다. 네트워크를 확인하고 다시 로그인하세요.",
   org_pin_mismatch: "조직 설정이 허용하지 않는 계정으로 로그인되어 있습니다. 허용된 조직 계정으로 다시 로그인하세요.",
   managed_settings_invalid: "조직 관리 설정을 읽지 못했습니다. 관리자에게 설정 확인을 요청하세요.",
+  sandbox_required_unavailable: "필수 샌드박스를 사용할 수 없어 시작하지 못했습니다. 샌드박스 설치·설정을 확인하세요.",
+  initialize_not_first: "Claude SDK 초기화 순서가 올바르지 않습니다. 세션을 다시 시작하세요.",
+  config_file_invalid: "Claude 설정 파일이 올바른 JSON이 아닙니다. 아래 원문에 표시된 파일을 수정하거나 백업에서 복원하세요.",
   remote_settings_required_unavailable: "조직이 요구하는 관리 설정을 불러오지 못했습니다. 네트워크를 확인한 뒤 다시 시작하세요.",
   org_config_required_unavailable: "조직이 요구하는 정책 한도와 관리 설정을 불러오지 못했습니다. 네트워크·프록시를 확인한 뒤 다시 시작하세요.",
   org_config_refused: "조직이 요구하는 정책 한도와 관리 설정의 조회가 거부되었습니다. 다시 로그인하거나 관리자에게 Claude Code 사용 권한을 문의하세요.",
@@ -4037,6 +4040,17 @@ async function consumeMessage(session, message) {
     notify("claude/account/updated", { threadId: session.id, rateLimitInfo: message.rate_limit_info });
   } else if (message.type === "system" && message.subtype === "api_retry") {
     notify("warning", { threadId: session.id, provider: "Claude", message: `Claude API 재시도 ${message.attempt}/${message.max_retries}` });
+  } else if (message.type === "system" && message.subtype === "session_writes_lost") {
+    const lost = [];
+    if (message.lost?.includes("transcript")) lost.push("대화 기록");
+    if (message.lost?.includes("global_config")) lost.push("전역 설정");
+    notify("warning", {
+      threadId: session.id,
+      provider: "Claude",
+      message: `Claude가 ${lost.join("·") || "대화 기록 또는 전역 설정"}을 저장하지 못했습니다 (${message.error_code}). 디스크 여유 공간·할당량을 확보하세요. 재개 시 기록·설정이 누락될 수 있습니다.`,
+    });
+  } else if (message.type === "system" && message.subtype === "informational" && message.level === "warning" && message.content) {
+    notify("warning", { threadId: session.id, provider: "Claude", message: message.content });
   }
 }
 
@@ -5523,11 +5537,41 @@ function startupFailureGuideGaps() {
   return reasons.filter((reason) => !STARTUP_FAILURE_GUIDES[reason]);
 }
 
+async function runSystemWarningSelfTest() {
+  const captured = [];
+  const originalWrite = process.stdout.write;
+  const session = { id: "system-warning-self-test", subagents: new Map() };
+  const losses = [
+    [["transcript"], "ENOSPC", "대화 기록"],
+    [["global_config"], "EDQUOT", "전역 설정"],
+    [["transcript", "global_config"], "ENOSPC", "대화 기록·전역 설정"],
+    [["future_target"], "EIO", "대화 기록 또는 전역 설정"],
+  ];
+  process.stdout.write = (chunk) => { captured.push(JSON.parse(String(chunk))); return true; };
+  try {
+    for (const [lost, error_code] of losses) {
+      await consumeMessage(session, { type: "system", subtype: "session_writes_lost", lost, error_code });
+    }
+    await consumeMessage(session, { type: "system", subtype: "informational", level: "warning", content: "hook callback failed" });
+    await consumeMessage(session, { type: "system", subtype: "informational", level: "warning", content: "" });
+    await consumeMessage(session, { type: "system", subtype: "informational", level: "info", content: "ordinary status" });
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  if (session.turn || captured.length !== losses.length + 1
+    || captured.some((event) => event.method !== "warning" || event.params.threadId !== session.id || event.params.provider !== "Claude")
+    || losses.some(([, code, target], index) => !captured[index].params.message.includes(`${target}을 저장하지 못했습니다 (${code})`))
+    || captured.at(-1).params.message !== "hook callback failed") {
+    throw new Error(`Claude system warning self-test failed: ${JSON.stringify(captured)}`);
+  }
+}
+
 async function runSelfTest() {
   const startupGaps = startupFailureGuideGaps();
   if (startupGaps.length) {
     throw new Error(`Claude 기동 실패 안내 누락: ${startupGaps.join(", ")}`);
   }
+  await runSystemWarningSelfTest();
   await runPermissionModeSelfTest();
   await runGuardedPermissionSelfTest();
   await runPromptSuggestionSelfTest();

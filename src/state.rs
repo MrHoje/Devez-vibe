@@ -1120,7 +1120,7 @@ impl ModelInfo {
             "opus" => identity.contains("claude") && identity.contains("opus"),
             "fable" => identity.contains("claude") && identity.contains("fable"),
             "sol" => self.model.starts_with("gpt-") && identity.contains("sol"),
-            "terra" => identity.contains("5.6") && identity.contains("terra"),
+            "terra" => self.model.starts_with("gpt-") && identity.contains("terra"),
             "luna" => self.model.starts_with("gpt-") && identity.contains("luna"),
             "astra" => identity.contains("astra"),
             "5.5" => identity.contains("5.5"),
@@ -4772,7 +4772,7 @@ impl AppState {
             .filter(|index| self.models[*index].matches_query(query));
         let family = query.trim().to_ascii_lowercase();
         if (provider == ModelProvider::Claude && matches!(family.as_str(), "fable" | "opus"))
-            || (provider == ModelProvider::Codex && matches!(family.as_str(), "sol" | "luna"))
+            || (provider == ModelProvider::Codex && matches!(family.as_str(), "sol" | "terra" | "luna"))
         {
             let version_prefix = if provider == ModelProvider::Codex {
                 "gpt-"
@@ -35547,6 +35547,7 @@ mod tests {
         let models = vec![
             test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
             test_model("gpt-5.6-terra", "GPT-5.6 Terra", false),
+            test_model("gpt-6.1-terra", "GPT-6.1 Terra", false),
             test_model("gpt-5.6-luna", "GPT-5.6 Luna", false),
             test_model("gpt-6-astra", "GPT-6 Astra", false),
             test_model("gpt-6-sol", "GPT-6 Sol", false),
@@ -35583,7 +35584,7 @@ mod tests {
         assert_eq!(state.selected_model_name(), "gpt-6-astra");
         for (alias, expected) in [
             ("sol", "gpt-6-sol"),
-            ("terra", "gpt-5.6-terra"),
+            ("terra", "gpt-6.1-terra"),
             ("luna", "gpt-6-luna"),
             ("astra", "gpt-6-astra"),
         ] {
@@ -35598,6 +35599,10 @@ mod tests {
         assert_eq!(state.selected_model_name(), "gpt-6-sol");
         state.run_slash_command("/model luna");
         assert_eq!(state.selected_model_name(), "gpt-6-luna");
+        state.run_slash_command("/model terra");
+        assert_eq!(state.selected_model_name(), "gpt-6.1-terra");
+        state.run_slash_command("/model gpt-5.6-terra");
+        assert_eq!(state.selected_model_name(), "gpt-5.6-terra");
 
         state.run_slash_command("/provider claude Sonnet");
         assert_eq!(state.selected_model_name(), "claude:sonnet");
