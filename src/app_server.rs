@@ -333,7 +333,7 @@ impl AppServer {
         Ok(response)
     }
 
-    pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+    pub async fn request(&self, method: &str, mut params: Value) -> Result<Value> {
         if matches!(method, "thread/start" | "thread/resume" | "thread/fork" | "turn/start") {
             if let Some(path) = &self.config_path {
                 refresh_computer_use(&self.client, path, &self.computer_use_pipe).await?;
@@ -345,6 +345,30 @@ impl AppServer {
             let cwd = params.get("cwd").and_then(Value::as_str).map(str::to_owned);
             if method == "turn/start" {
                 self.computer_use.observer().begin_turn_request(thread.as_ref().and_then(Value::as_str), cwd.as_deref());
+            }
+            if cfg!(windows) && matches!(method, "thread/start" | "thread/resume" | "thread/fork") {
+                let saved = if let Some(thread) = params.get("threadId") {
+                    Some(self.client.request("thread/read", json!({"threadId": thread, "includeTurns": false})).await?["thread"].clone())
+                } else { None };
+                let mut config_cwd = params.get("cwd").cloned().filter(|cwd| !cwd.is_null());
+                if config_cwd.is_none() && let Some(saved) = &saved {
+                    config_cwd = saved.get("cwd").cloned();
+                }
+                let configured = self.client.request("config/read", json!({
+                    "cwd": config_cwd, "includeLayers": false
+                })).await?;
+                // A resume config override otherwise replaces the recorded model/effort.
+                if saved.as_ref().is_none_or(|thread| thread["model"].is_string())
+                    && add_chrome_mcp(&mut params, &configured["config"])
+                    && let Some(saved) = saved
+                {
+                    if params["model"].is_null() { params["model"] = saved["model"].clone(); }
+                    let effort = params.get("effort").filter(|effort| !effort.is_null())
+                        .or_else(|| saved.get("reasoningEffort").filter(|effort| !effort.is_null())).cloned();
+                    if let Some(effort) = effort {
+                        params["config"].as_object_mut().unwrap().entry("model_reasoning_effort").or_insert(effort);
+                    }
+                }
             }
             let response = request_with_permissions(&self.client, method, params).await;
             if method == "turn/start" {
@@ -468,19 +492,13 @@ async fn write_messages(
     let _ = stdin.shutdown().await;
 }
 
-/// The desktop supplies this pipe address through the Codex configuration.
-/// Running MCP children retain the previous environment until they reload.
+/// MCP children keep both the old pipe and executable until they reload.
 fn computer_use_pipe_config(config: &str) -> Option<String> {
-    config.lines().find_map(|line| {
-        let line = line.split('#').next()?.trim();
-        let (key, value) = line.split_once('=')?;
-        let key = key.trim().trim_matches(['"', '\'']);
-        matches!(
-            key,
-            "SKY_CUA_NATIVE_PIPE_DIRECTORY"
-                | "mcp_servers.node_repl.env.SKY_CUA_NATIVE_PIPE_DIRECTORY"
-        ).then(|| value.trim().to_owned())
-    })
+    let config: toml::Value = config.trim_start_matches('\u{feff}').parse().ok()?;
+    let server = config.get("mcp_servers")?.get("node_repl")?;
+    let pipe = server.get("env")?.get("SKY_CUA_NATIVE_PIPE_DIRECTORY")?.as_str()?;
+    if pipe.trim().is_empty() { return None; }
+    Some(format!("{pipe:?}\n{:?}\n{:?}", server.get("command"), server.get("args")))
 }
 
 async fn refresh_computer_use(
@@ -491,6 +509,9 @@ async fn refresh_computer_use(
     let Ok(config) = std::fs::read_to_string(config_path) else {
         return Ok(());
     };
+    if config.trim_start_matches('\u{feff}').parse::<toml::Value>().is_err() {
+        return Ok(());
+    }
     let pipe = computer_use_pipe_config(&config);
     let mut cached = cached_pipe.lock().await;
     if *cached != pipe {
@@ -519,6 +540,30 @@ fn initialize_params() -> Value {
             }
         }
     })
+}
+
+fn add_chrome_mcp(params: &mut Value, configured: &Value) -> bool {
+    // Respect user/project Chrome servers, including an explicitly disabled one.
+    let has_chrome = configured.get("mcp_servers").and_then(Value::as_object)
+        .is_some_and(|servers| servers.iter().any(|(name, server)|
+            name.to_ascii_lowercase().contains("chrome")
+                || server.to_string().contains("chrome-devtools-mcp")));
+    let overrides = params["config"].as_object();
+    if has_chrome || overrides.is_some_and(|config| config.iter().any(|(key, value)|
+        key.starts_with("mcp_servers") && (key.to_ascii_lowercase().contains("chrome") || value.to_string().to_ascii_lowercase().contains("chrome")))) {
+        return false;
+    }
+    if params["config"].is_null() { params["config"] = json!({}); }
+    if let Some(config) = params["config"].as_object_mut() {
+        config.insert("mcp_servers.devez-chrome".to_owned(), json!({
+            "command": "cmd.exe",
+            "args": ["/d", "/s", "/c", "npx", "--yes", "chrome-devtools-mcp@1.12.0",
+                "--channel=stable", "--isolated", "--no-usage-statistics", "--no-performance-crux"],
+            "startup_timeout_sec": 120
+        }));
+        return true;
+    }
+    false
 }
 
 fn codex_command(resolved: &Path) -> Command {
@@ -1545,7 +1590,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("dvz-computer-use-{}-{}.toml",
             std::process::id(), std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        let original = "[mcp_servers.node_repl.env]\nSKY_CUA_NATIVE_PIPE_DIRECTORY = 'old'\n";
+        let original = "[mcp_servers.node_repl]\ncommand = 'runtime-old'\n[mcp_servers.node_repl.env]\nSKY_CUA_NATIVE_PIPE_DIRECTORY = 'old'\n";
         std::fs::write(&path, original).unwrap();
         let (outbound, mut messages) = mpsc::unbounded_channel();
         let pending = Arc::new(StdMutex::new(HashMap::new()));
@@ -1559,9 +1604,17 @@ mod tests {
         std::fs::write(&path, format!("{original}model = 'unrelated'\n")).unwrap();
         refresh_computer_use(&client, &path, &cached).await.unwrap();
         assert!(messages.try_recv().is_err(), "unchanged pipes must not restart MCP servers");
+        std::fs::write(&path, format!("{original}[invalid")).unwrap();
+        timeout(Duration::from_secs(1), refresh_computer_use(&client, &path, &cached))
+            .await.expect("invalid settings must not request a reload").unwrap();
+        assert!(messages.try_recv().is_err());
+        assert_eq!(*cached.lock().await, computer_use_pipe_config(original));
 
         let (events, _) = mpsc::unbounded_channel();
         for (config, fail) in [
+            ("[mcp_servers.node_repl]\ncommand = 'runtime-new'\n[mcp_servers.node_repl.env]\nSKY_CUA_NATIVE_PIPE_DIRECTORY = 'old'\n", true),
+            ("[mcp_servers.node_repl]\ncommand = 'runtime-new'\n[mcp_servers.node_repl.env]\nSKY_CUA_NATIVE_PIPE_DIRECTORY = 'old'\n", false),
+            ("[mcp_servers.node_repl]\ncommand = 'runtime-new'\nargs = ['--stdio']\n[mcp_servers.node_repl.env]\nSKY_CUA_NATIVE_PIPE_DIRECTORY = 'old'\n", false),
             ("mcp_servers.node_repl.env.SKY_CUA_NATIVE_PIPE_DIRECTORY = 'new'\n", true),
             ("mcp_servers.node_repl.env.SKY_CUA_NATIVE_PIPE_DIRECTORY = 'new'\n", false),
             ("# SKY_CUA_NATIVE_PIPE_DIRECTORY = 'ignored'\n", false),
@@ -1758,6 +1811,138 @@ mod tests {
         assert_eq!(resumed["activePermissionProfile"]["id"], ":danger-full-access");
         println!("새 대화와 재개에서 전체 접근·승인 요청 없음 확인");
         server.shutdown().await;
+    }
+
+    #[test]
+    fn chrome_mcp_preserves_user_servers_and_thread_options() {
+        let mut params = json!({"config": {"model_reasoning_effort": "high"}});
+        add_chrome_mcp(&mut params, &json!({}));
+        let chrome = &params["config"]["mcp_servers.devez-chrome"];
+        assert_eq!(chrome["command"], "cmd.exe");
+        let args = chrome["args"].as_array().unwrap();
+        assert!(args.contains(&json!("--isolated")));
+        assert!(args.contains(&json!("--channel=stable")));
+        assert!(!args.contains(&json!("--autoConnect")));
+        assert_eq!(params["config"]["model_reasoning_effort"], "high");
+        for servers in [
+            json!({"chrome-devtools": {"enabled": false}}),
+            json!({"custom": {"command": "npx", "args": ["chrome-devtools-mcp@custom"]}}),
+        ] {
+            let mut original = json!({"config": {"model_reasoning_effort": "high"}});
+            let before = original.clone();
+            add_chrome_mcp(&mut original, &json!({"mcp_servers": servers}));
+            assert_eq!(original, before);
+        }
+        let mut explicit = json!({"config": {"mcp_servers.chrome-devtools.enabled": false}});
+        let before = explicit.clone();
+        add_chrome_mcp(&mut explicit, &json!({}));
+        assert_eq!(explicit, before);
+        let mut nested = json!({"config": {"mcp_servers": {"devez-chrome": {"enabled": false}}}});
+        let before = nested.clone();
+        assert!(!add_chrome_mcp(&mut nested, &json!({})));
+        assert_eq!(nested, before);
+    }
+
+    #[tokio::test]
+    #[ignore = "실제 Codex app-server와 별도 Chrome 창의 입력·클릭 검증"]
+    async fn live_codex_chrome_control() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let submitted = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let saved = Arc::clone(&submitted);
+        let finished = Arc::clone(&stop);
+        let http = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(240);
+            while !finished.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                    let mut bytes = [0; 8192];
+                    let count = stream.read(&mut bytes).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&bytes[..count]);
+                    if request.starts_with("GET /done?value=devez-chrome-ok ") {
+                        assert!(request.contains("Chrome/") && !request.contains("Edg/") && !request.contains("HeadlessChrome"));
+                        saved.store(true, Ordering::Release);
+                    }
+                    let body = "<!doctype html><meta charset=utf-8><title>DevezVibe Chrome test</title><label>Test value<input id=value></label><button onclick=\"fetch('/done?value='+encodeURIComponent(document.querySelector('input').value)).then(()=>document.querySelector('output').textContent='Saved')\">Save</button><output></output>";
+                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                } else { std::thread::sleep(Duration::from_millis(20)); }
+            }
+        });
+        let mut server = AppServer::spawn(Path::new("codex"), None).await.unwrap();
+        server.initialize().await.unwrap();
+        let thread = server.request("thread/start", json!({
+            "model": "gpt-6.1-sol", "ephemeral": false, "cwd": std::env::temp_dir(),
+            "config": {"model_reasoning_effort": "low"},
+            "developerInstructions": "Use only devez-chrome MCP tools for this browser test. Do not use Computer Use, shell, or another browser. If a tool denies access, stop and report it."
+        })).await.unwrap();
+        server.request("turn/start", json!({"threadId": thread["thread"]["id"], "effort": "low",
+            "input": [{"type": "text", "text": format!("Open http://{address}/ in Google Chrome using devez-chrome. Fill Test value with devez-chrome-ok, click Save and check Saved appears using take_snapshot. Do not access other URLs. Reply in Korean.")}]
+        })).await.unwrap();
+        let mut calls = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+        loop {
+            match tokio::time::timeout_at(deadline, server.next_event()).await.unwrap().unwrap() {
+                ServerEvent::Notification { method, params } if method == "item/completed" => {
+                    let item = &params["item"];
+                    if item["server"] == "devez-chrome" {
+                        println!("Chrome 도구 결과: {} {}", item["tool"], item["status"]);
+                        assert!(item["error"].is_null(), "{item}");
+                        calls.push(item["tool"].as_str().unwrap().to_owned());
+                    }
+                }
+                ServerEvent::Notification { method, params } if method == "turn/completed" => {
+                    println!("Chrome 턴 상태: {}", params["turn"]["status"]);
+                    assert_eq!(params["turn"]["status"], "completed");
+                    break;
+                }
+                ServerEvent::Request { method, .. } => panic!("예상하지 않은 요청: {method}"),
+                ServerEvent::Closed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        for method in ["thread/resume", "thread/fork"] {
+            let recorded = server.client.request("thread/read", json!({"threadId": thread["thread"]["id"], "includeTurns": false})).await.unwrap();
+            assert!(recorded["thread"]["model"].is_string(), "Chrome 주입에 필요한 저장 모델");
+            let restored = server.request(method, json!({"threadId": thread["thread"]["id"]})).await.unwrap();
+            assert_eq!(restored["model"], thread["model"], "{method}: 기록된 모델 유지");
+            assert_eq!(restored["reasoningEffort"], thread["reasoningEffort"], "{method}: 기록된 추론 강도 유지");
+            assert_eq!(restored["cwd"], thread["cwd"], "{method}: 기록된 작업 폴더 유지");
+            println!("Chrome {method} 선택 보존 확인: {} {}", restored["model"], restored["reasoningEffort"]);
+            server.request("turn/start", json!({"threadId": restored["thread"]["id"], "effort": "low",
+                "input": [{"type": "text", "text": "devez-chrome의 list_pages 도구를 한 번 호출하고 결과를 한국어로 답하세요. 다른 도구는 쓰지 마세요."}]
+            })).await.unwrap();
+            let mut listed = false;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                match tokio::time::timeout_at(deadline, server.next_event()).await.unwrap().unwrap() {
+                    ServerEvent::Notification { method, params } if method == "item/completed"
+                        && params["item"]["server"] == "devez-chrome" && params["item"]["tool"] == "list_pages" => {
+                        assert_eq!(params["item"]["status"], "completed", "{}", params["item"]);
+                        listed = true;
+                    }
+                    ServerEvent::Notification { method, params } if method == "turn/completed" => {
+                        assert_eq!(params["turn"]["status"], "completed");
+                        break;
+                    }
+                    ServerEvent::Request { method, .. } => panic!("예상하지 않은 요청: {method}"),
+                    ServerEvent::Closed(error) => panic!("{error}"),
+                    _ => {}
+                }
+            }
+            assert!(listed, "{method}: Chrome 도구가 재개되지 않았습니다.");
+            println!("Chrome {method} 실제 list_pages 호출 통과");
+        }
+        server.shutdown().await;
+        stop.store(true, Ordering::Release);
+        http.join().unwrap();
+        assert!(submitted.load(Ordering::Acquire), "Chrome에서 실제 입력·클릭 요청이 도착하지 않았습니다. {calls:?}");
+        for tool in ["new_page", "fill", "click", "take_snapshot"] {
+            assert!(calls.iter().any(|name| name == tool), "실제 Chrome 도구 호출 누락: {tool}: {calls:?}");
+        }
+        println!("실제 Codex app-server → Google Chrome 입력·클릭·저장 확인");
     }
 
 
