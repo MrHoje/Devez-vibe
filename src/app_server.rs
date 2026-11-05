@@ -558,8 +558,9 @@ fn add_chrome_mcp(params: &mut Value, configured: &Value) -> bool {
         config.insert("mcp_servers.devez-chrome".to_owned(), json!({
             "command": "cmd.exe",
             "args": ["/d", "/s", "/c", "npx", "--yes", "chrome-devtools-mcp@1.12.0",
-                "--channel=stable", "--isolated", "--no-usage-statistics", "--no-performance-crux"],
-            "startup_timeout_sec": 120
+                "--channel=stable", "--autoConnect", "--no-usage-statistics", "--no-performance-crux"],
+            "startup_timeout_sec": 120,
+            "tool_timeout_sec": 180
         }));
         return true;
     }
@@ -1820,9 +1821,10 @@ mod tests {
         let chrome = &params["config"]["mcp_servers.devez-chrome"];
         assert_eq!(chrome["command"], "cmd.exe");
         let args = chrome["args"].as_array().unwrap();
-        assert!(args.contains(&json!("--isolated")));
+        assert!(!args.contains(&json!("--isolated")));
         assert!(args.contains(&json!("--channel=stable")));
-        assert!(!args.contains(&json!("--autoConnect")));
+        assert!(args.contains(&json!("--autoConnect")));
+        assert_eq!(chrome["tool_timeout_sec"], 180);
         assert_eq!(params["config"]["model_reasoning_effort"], "high");
         for servers in [
             json!({"chrome-devtools": {"enabled": false}}),
@@ -1846,22 +1848,36 @@ mod tests {
     #[tokio::test]
     #[ignore = "실제 Codex app-server와 별도 Chrome 창의 입력·클릭 검증"]
     async fn live_codex_chrome_control() {
+        check_live_chrome_control(false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "사용자가 연 기존 Chrome 테스트 탭과 Chrome 자체 연결 허용 필요"]
+    async fn live_codex_existing_chrome_control() {
+        check_live_chrome_control(true).await;
+    }
+
+    async fn check_live_chrome_control(existing: bool) {
         use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let reuse_address = if existing { std::env::var("DEVEZ_TEST_EXISTING_CHROME_ADDRESS").ok() } else { None };
+        let listener = std::net::TcpListener::bind(reuse_address.as_deref().unwrap_or("127.0.0.1:0")).unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let submitted = Arc::new(AtomicBool::new(false));
+        let opened = Arc::new(AtomicBool::new(reuse_address.is_some()));
         let stop = Arc::new(AtomicBool::new(false));
         let saved = Arc::clone(&submitted);
         let finished = Arc::clone(&stop);
+        let loaded = Arc::clone(&opened);
         let http = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(240);
+            let deadline = std::time::Instant::now() + Duration::from_secs(600);
             while !finished.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
                 if let Ok((mut stream, _)) = listener.accept() {
                     stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                     let mut bytes = [0; 8192];
                     let count = stream.read(&mut bytes).unwrap_or(0);
                     let request = String::from_utf8_lossy(&bytes[..count]);
+                    if request.starts_with("GET / ") { loaded.store(true, Ordering::Release); }
                     if request.starts_with("GET /done?value=devez-chrome-ok ") {
                         assert!(request.contains("Chrome/") && !request.contains("Edg/") && !request.contains("HeadlessChrome"));
                         saved.store(true, Ordering::Release);
@@ -1871,24 +1887,50 @@ mod tests {
                 } else { std::thread::sleep(Duration::from_millis(20)); }
             }
         });
+        if existing {
+            println!("기존 Chrome에서 먼저 열어 주세요: http://{address}/");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+            while !opened.load(Ordering::Acquire) {
+                assert!(tokio::time::Instant::now() < deadline, "기존 Chrome 테스트 탭 열기 대기 시간 초과");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            println!("연결 전에 열린 테스트 탭 확인. Chrome 연결 허용을 기다립니다.");
+        }
         let mut server = AppServer::spawn(Path::new("codex"), None).await.unwrap();
         server.initialize().await.unwrap();
-        let thread = server.request("thread/start", json!({
+        let mut thread_params = json!({
             "model": "gpt-6.1-sol", "ephemeral": false, "cwd": std::env::temp_dir(),
             "config": {"model_reasoning_effort": "low"},
             "developerInstructions": "Use only devez-chrome MCP tools for this browser test. Do not use Computer Use, shell, or another browser. If a tool denies access, stop and report it."
-        })).await.unwrap();
+        });
+        add_chrome_mcp(&mut thread_params, &json!({}));
+        let args = thread_params["config"]["mcp_servers.devez-chrome"]["args"].as_array_mut().unwrap();
+        if existing {
+            // Test access is limited to the owned page; other personal tabs are detached.
+            args.push(json!(format!("--allowed-url-pattern=http://{address}/*")));
+        } else {
+            args.retain(|arg| arg != "--autoConnect");
+            args.push(json!("--isolated"));
+        }
+        let thread = server.request("thread/start", thread_params).await.unwrap();
+        let open = if existing {
+            format!("Use list_pages and select_page to select the ALREADY OPEN tab at http://{address}/. Do not open, reload or navigate any tab.")
+        } else { format!("Open http://{address}/ in Google Chrome using devez-chrome.") };
         server.request("turn/start", json!({"threadId": thread["thread"]["id"], "effort": "low",
-            "input": [{"type": "text", "text": format!("Open http://{address}/ in Google Chrome using devez-chrome. Fill Test value with devez-chrome-ok, click Save and check Saved appears using take_snapshot. Do not access other URLs. Reply in Korean.")}]
+            "input": [{"type": "text", "text": format!("{open} Fill Test value with devez-chrome-ok, click Save and check Saved appears using take_snapshot. Do not access other URLs. Reply in Korean.")}]
         })).await.unwrap();
         let mut calls = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(360);
         loop {
             match tokio::time::timeout_at(deadline, server.next_event()).await.unwrap().unwrap() {
                 ServerEvent::Notification { method, params } if method == "item/completed" => {
                     let item = &params["item"];
+                    if item["type"] == "agentMessage" {
+                        println!("Chrome 검사 응답: {}", item["text"]);
+                    }
                     if item["server"] == "devez-chrome" {
                         println!("Chrome 도구 결과: {} {}", item["tool"], item["status"]);
+                        assert_eq!(item["status"], "completed", "{item}");
                         assert!(item["error"].is_null(), "{item}");
                         calls.push(item["tool"].as_str().unwrap().to_owned());
                     }
@@ -1903,7 +1945,7 @@ mod tests {
                 _ => {}
             }
         }
-        for method in ["thread/resume", "thread/fork"] {
+        for method in if existing { &[][..] } else { &["thread/resume", "thread/fork"][..] } {
             let recorded = server.client.request("thread/read", json!({"threadId": thread["thread"]["id"], "includeTurns": false})).await.unwrap();
             assert!(recorded["thread"]["model"].is_string(), "Chrome 주입에 필요한 저장 모델");
             let restored = server.request(method, json!({"threadId": thread["thread"]["id"]})).await.unwrap();
@@ -1939,8 +1981,12 @@ mod tests {
         stop.store(true, Ordering::Release);
         http.join().unwrap();
         assert!(submitted.load(Ordering::Acquire), "Chrome에서 실제 입력·클릭 요청이 도착하지 않았습니다. {calls:?}");
-        for tool in ["new_page", "fill", "click", "take_snapshot"] {
+        for tool in [if existing { "select_page" } else { "new_page" }, "fill", "click", "take_snapshot"] {
             assert!(calls.iter().any(|name| name == tool), "실제 Chrome 도구 호출 누락: {tool}: {calls:?}");
+        }
+        if existing {
+            assert!(calls.iter().any(|name| name == "list_pages"));
+            assert!(!calls.iter().any(|name| matches!(name.as_str(), "new_page" | "navigate_page")));
         }
         println!("실제 Codex app-server → Google Chrome 입력·클릭·저장 확인");
     }
