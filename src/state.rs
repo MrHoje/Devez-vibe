@@ -19046,7 +19046,8 @@ fn approval_is_allow(choice: &ApprovalChoice) -> bool {
 }
 
 fn command_approval_choices(params: &Value) -> Vec<ApprovalChoice> {
-    if params
+    let human_command = params.get("kind").and_then(Value::as_str) == Some("humanCommand");
+    if !human_command && params
         .get("claudePermission")
         .and_then(Value::as_bool)
         .unwrap_or(false)
@@ -19063,7 +19064,7 @@ fn command_approval_choices(params: &Value) -> Vec<ApprovalChoice> {
     let Some(decisions) = params.get("availableDecisions").and_then(Value::as_array) else {
         return approval_choices(
             json!({ "decision": "accept" }),
-            Some((
+            (!human_command).then(|| (
                 "Allow for session".to_owned(),
                 json!({ "decision": "acceptForSession" }),
             )),
@@ -19074,6 +19075,9 @@ fn command_approval_choices(params: &Value) -> Vec<ApprovalChoice> {
     decisions
         .iter()
         .filter_map(|decision| {
+            if human_command && !matches!(decision.as_str(), Some("accept" | "decline" | "cancel")) {
+                return None;
+            }
             let label = match decision.as_str() {
                 Some("accept") => "Allow once".to_owned(),
                 Some("acceptForSession") => "Allow for session".to_owned(),
@@ -33159,6 +33163,38 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn human_command_approval_requires_a_fresh_one_time_decision() {
+        for advertised in [
+            None,
+            Some(json!(["accept", "acceptForSession", "decline", "cancel",
+                {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["cargo"]}},
+                {"applyNetworkPolicyAmendment": {"network_policy_amendment": {"host": "example.com", "action": "allow"}}}
+            ])),
+        ] {
+            let mut state = test_state();
+            let mut params = json!({"kind": "humanCommand", "approvalId": "checkpoint-1", "command": "cargo publish"});
+            if let Some(decisions) = advertised { params["availableDecisions"] = decisions; }
+            for id in [31, 32] {
+                assert!(matches!(state.begin_server_request(json!(id), "item/commandExecution/requestApproval", &params), Action::None));
+                let Some(PendingInteraction::Approval { choices, .. }) = &state.pending else { panic!("승인 창이 필요합니다"); };
+                assert!(choices.iter().all(|choice| matches!(choice.result["decision"].as_str(), Some("accept" | "decline" | "cancel"))));
+                assert!(state.overlay_view().unwrap().lines.iter().any(|line| line.text == "cargo publish"));
+                for _ in 0..3 { state.render_tick(); }
+                assert!(state.awaiting_input());
+                let Action::RpcResponse { id: response_id, result } = state.handle_key(KeyEvent::from(KeyCode::Enter)) else { panic!("사용자 선택으로 승인해야 합니다"); };
+                assert_eq!(response_id, json!(id));
+                assert_eq!(result, json!({"decision": "accept"}));
+                assert!(!state.awaiting_input());
+                params["approvalId"] = json!("checkpoint-2");
+            }
+        }
+        for decisions in [json!([]), json!(["acceptForSession"]), json!([{"acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["cargo"]}}])] {
+            assert!(command_approval_choices(&json!({"kind": "humanCommand", "availableDecisions": decisions})).is_empty());
+        }
+        assert_eq!(command_approval_choices(&json!({"kind": "humanCommand", "availableDecisions": ["decline"]}))[0].result, json!({"decision": "decline"}));
     }
 
     #[test]

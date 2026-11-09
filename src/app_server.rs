@@ -530,6 +530,7 @@ fn initialize_params() -> Value {
         },
         "capabilities": {
             "experimentalApi": true,
+            "requiredHumanApproval": true,
             "requestAttestation": false,
             // `mcpServerOpenaiFormElicitation` is the legacy alias an older
             // app-server still understands; `extensions` is how 0.147 wants the
@@ -1996,6 +1997,7 @@ mod tests {
     fn initialize_enables_interactive_mcp_forms() {
         let params = initialize_params();
 
+        assert_eq!(params.pointer("/capabilities/requiredHumanApproval"), Some(&json!(true)));
         assert_eq!(
             params
                 .pointer("/capabilities/mcpServerOpenaiFormElicitation")
