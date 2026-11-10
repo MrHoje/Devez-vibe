@@ -23,14 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "최신 Claude Code를 적용하고 실행·설정·대화 저장 오류 안내를 보완했습니다.",
-    "모델 검색어 terra가 최신 GPT-6.1 Terra를 선택하도록 수정했습니다.",
+    "관리자 권한으로 실행한 Vibe에서 Codex Computer Use 커서가 관리자 창에서도 마우스를 따라가도록 수정했습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Updated to the latest Claude Code and improved guidance for startup, configuration, and conversation-saving errors.",
-    "The terra model search now selects the latest GPT-6.1 Terra.",
+    "Fixed the Codex Computer Use cursor to follow the mouse over administrator windows when Vibe is run as administrator.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

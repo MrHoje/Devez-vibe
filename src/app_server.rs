@@ -193,6 +193,14 @@ impl AppServer {
         }
         let resolved_codex = resolve_command(codex_path);
         let mut command = codex_command(&resolved_codex);
+        if current_process_is_elevated()
+            && let Some(path) = &config_path
+            && let (Some(home), Ok(config)) = (path.parent(), std::fs::read_to_string(path))
+        {
+            for override_value in elevated_computer_use_overrides(&config, home) {
+                command.arg("-c").arg(override_value);
+            }
+        }
         apply_originator_override(&mut command);
         apply_mcp_2026_protocol_override(&mut command);
         apply_update_plan_tool_override(&mut command);
@@ -499,6 +507,81 @@ fn computer_use_pipe_config(config: &str) -> Option<String> {
     let pipe = server.get("env")?.get("SKY_CUA_NATIVE_PIPE_DIRECTORY")?.as_str()?;
     if pipe.trim().is_empty() { return None; }
     Some(format!("{pipe:?}\n{:?}\n{:?}", server.get("command"), server.get("args")))
+}
+
+#[cfg(windows)]
+fn current_process_is_elevated() -> bool {
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation},
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut length = 0;
+        let read = GetTokenInformation(
+            token, TokenElevation, std::ptr::from_mut(&mut elevation).cast(),
+            size_of::<TOKEN_ELEVATION>() as u32, &mut length,
+        );
+        CloseHandle(token);
+        read != 0 && elevation.TokenIsElevated != 0
+    }
+}
+
+#[cfg(not(windows))]
+fn current_process_is_elevated() -> bool { false }
+
+/// The Desktop pipe's helper keeps the Desktop's medium-integrity token even
+/// when Vibe is elevated. SDK direct transport inherits Vibe's existing token;
+/// it does not request elevation or alter the user's shared Codex config.
+fn elevated_computer_use_overrides(config: &str, home: &Path) -> Vec<String> {
+    let Some(config) = config.trim_start_matches('\u{feff}').parse::<toml::Value>().ok() else {
+        return Vec::new();
+    };
+    let Some(servers) = config.get("mcp_servers") else { return Vec::new(); };
+    let Some(node) = servers.get("node_repl") else { return Vec::new(); };
+    if node.get("enabled").and_then(toml::Value::as_bool) == Some(false)
+        || node.get("env").and_then(|env| env.get("SKY_CUA_NATIVE_PIPE"))
+            .and_then(toml::Value::as_str) != Some("1")
+    {
+        return Vec::new();
+    }
+    let mut overrides = vec!["mcp_servers.node_repl.env.SKY_CUA_NATIVE_PIPE=\"0\"".to_owned()];
+    if let Some(cua) = servers.get("cua_repl") {
+        if cua.get("enabled").and_then(toml::Value::as_bool) != Some(false)
+            && cua.get("env").and_then(|env| env.get("SKY_CUA_NATIVE_PIPE"))
+                .and_then(toml::Value::as_str) == Some("1")
+        {
+            overrides.push("mcp_servers.cua_repl.env.SKY_CUA_NATIVE_PIPE=\"0\"".to_owned());
+        }
+    } else if config.get("plugins")
+        .and_then(|plugins| plugins.get("unified-computer-use@openai-bundled"))
+        .and_then(|plugin| plugin.get("enabled")).and_then(toml::Value::as_bool) == Some(true)
+    {
+        // Clone the exact installed bundle selected by the Desktop's node_repl
+        // config. An env-only override is an invalid new MCP server. Retain its
+        // browser access check, command, allowed tools and all other settings.
+        let Some(version) = node.get("env").and_then(|env| env.get("BROWSER_USE_CODEX_APP_VERSION"))
+            .and_then(toml::Value::as_str)
+            .filter(|version| version.split('.').all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit())))
+        else { return Vec::new(); };
+        let path = home.join("plugins/cache/openai-bundled/unified-computer-use")
+            .join(version).join(".mcp.json");
+        let Some(mut cua) = std::fs::read_to_string(path).ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|config| config.pointer("/mcpServers/cua_repl").cloned())
+            .filter(|server| server.get("command").and_then(Value::as_str).is_some()
+                && server.pointer("/env/SKY_CUA_NATIVE_PIPE").and_then(Value::as_str) == Some("1"))
+        else { return Vec::new(); };
+        cua["env"]["SKY_CUA_NATIVE_PIPE"] = json!("0");
+        let Ok(cua) = toml::Value::try_from(cua) else { return Vec::new(); };
+        overrides.push(format!("mcp_servers.cua_repl={cua}"));
+    }
+    overrides
 }
 
 async fn refresh_computer_use(
@@ -1992,6 +2075,98 @@ mod tests {
         println!("실제 Codex app-server → Google Chrome 입력·클릭·저장 확인");
     }
 
+
+    #[test]
+    fn elevated_computer_use_preserves_disabled_and_direct_servers() {
+        let home = Path::new("unused");
+        assert!(elevated_computer_use_overrides("broken = [", home).is_empty());
+        assert!(elevated_computer_use_overrides("", home).is_empty());
+        for setting in ["enabled = false\n", ""] {
+            let config = format!("[mcp_servers.node_repl]\n{setting}[mcp_servers.node_repl.env]\nSKY_CUA_NATIVE_PIPE = '0'\n");
+            assert!(elevated_computer_use_overrides(&config, home).is_empty());
+        }
+        let config = "[mcp_servers.node_repl]\nenabled = false\n[mcp_servers.node_repl.env]\nSKY_CUA_NATIVE_PIPE = '1'\n";
+        assert!(elevated_computer_use_overrides(config, home).is_empty());
+        let config = "[mcp_servers.node_repl.env]\nSKY_CUA_NATIVE_PIPE = '1'\n[mcp_servers.cua_repl]\nenabled = false\n[mcp_servers.cua_repl.env]\nSKY_CUA_NATIVE_PIPE = '1'\n";
+        assert_eq!(elevated_computer_use_overrides(config, home),
+            ["mcp_servers.node_repl.env.SKY_CUA_NATIVE_PIPE=\"0\""]);
+        let config = config.replace("enabled = false", "enabled = true");
+        assert_eq!(elevated_computer_use_overrides(&config, home), [
+            "mcp_servers.node_repl.env.SKY_CUA_NATIVE_PIPE=\"0\"",
+            "mcp_servers.cua_repl.env.SKY_CUA_NATIVE_PIPE=\"0\"",
+        ]);
+    }
+
+    #[test]
+    fn elevated_computer_use_preserves_unified_access_controls() {
+        let home = std::env::temp_dir().join(format!("dvz-cursor-override-{}-{}",
+            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let plugin = home.join("plugins/cache/openai-bundled/unified-computer-use/26.1103.60933");
+        std::fs::create_dir_all(&plugin).unwrap();
+        let original = json!({
+            "command": "node.exe", "args": ["--import", "require-browser-access.mjs", "cua-repl.mjs"],
+            "enabled": true, "enabled_tools": ["js", "js_reset", "turn_ended"],
+            "env_vars": ["BROWSER_USE_ACCESS_PIPE_PATH", "CODEX_WINDOWS_REGISTERED_CORE"],
+            "env": {"SKY_CUA_NATIVE_PIPE": "1", "SKY_CUA_NATIVE_PIPE_DIRECTORY": "desktop-pipe",
+                "BROWSER_USE_AVAILABLE_BACKENDS": "chrome,iab,mcpapps", "CUA_REPL_ENABLED_SURFACES": "browser,computer"}
+        });
+        let file = plugin.join(".mcp.json");
+        std::fs::write(&file, json!({"mcpServers": {"cua_repl": original}}).to_string()).unwrap();
+        let config = "[mcp_servers.node_repl.env]\nSKY_CUA_NATIVE_PIPE = '1'\nBROWSER_USE_CODEX_APP_VERSION = '26.1103.60933'\n[plugins.'unified-computer-use@openai-bundled']\nenabled = true\n";
+        let overrides = elevated_computer_use_overrides(config, &home);
+        assert_eq!(overrides.len(), 2);
+        let (key, table) = overrides[1].split_once('=').unwrap();
+        assert_eq!(key, "mcp_servers.cua_repl");
+        let table: toml::Value = format!("value={table}").parse().expect("Codex -c requires a TOML value");
+        let mut expected = original;
+        expected["env"]["SKY_CUA_NATIVE_PIPE"] = json!("0");
+        assert_eq!(serde_json::to_value(&table["value"]).unwrap(), expected);
+        for version in ["..", "../26.1103.60933", "26..60933", "", "26.1103.7773"] {
+            assert!(elevated_computer_use_overrides(&config.replace("26.1103.60933", version), &home).is_empty());
+        }
+        std::fs::write(&file, "invalid JSON").unwrap();
+        assert!(elevated_computer_use_overrides(config, &home).is_empty());
+        assert!(home.starts_with(std::env::temp_dir()));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "실제 Codex와 Computer Use로 계산기 연결만 확인하며 관리자 권한 실행 필요"]
+    async fn live_elevated_unified_computer_use() {
+        assert!(current_process_is_elevated(), "기존 관리자 권한으로 실행해야 합니다");
+        let mut server = AppServer::spawn(Path::new("codex"), None).await.unwrap();
+        server.initialize().await.unwrap();
+        let thread = server.request("thread/start", json!({
+            "model": "gpt-6.1-sol", "ephemeral": true, "cwd": std::env::temp_dir(),
+            "approvalPolicy": "never", "permissions": ":danger-full-access",
+            "config": {"model_reasoning_effort": "low"},
+            "developerInstructions": "컴퓨터 연결 검사입니다. cua_repl 첫 호출은 await cua.getState()만 실행하세요. 반환된 문서와 창 목록에서 이미 열린 계산기의 windowId를 확인한 뒤 cua.getApp({windowId})로 해당 창만 조회하세요. 성공 후 completion_summary로 정리하세요. 셸, 브라우저 조작, 클릭, 키 입력, 앱 종료는 금지합니다. 오류이면 재시도하지 말고 한국어로 보고하세요."
+        })).await.unwrap();
+        server.request("turn/start", json!({"threadId": thread["thread"]["id"], "effort": "low",
+            "input": [{"type": "text", "text": "cua_repl로 이미 열린 계산기 앱의 연결 상태만 확인하세요."}]
+        })).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+        let mut checked = false;
+        loop {
+            let Some(event) = timeout(deadline.saturating_duration_since(tokio::time::Instant::now()), server.next_event()).await.unwrap() else { panic!("검사 중 연결 종료") };
+            if let ServerEvent::Notification { method, params } = event {
+                if method == "item/completed" && params["item"]["server"] == "cua_repl" {
+                    let item = &params["item"];
+                    assert_eq!(item["status"], "completed", "{}", item.pointer("/result/content/0/text").unwrap_or(&Value::Null));
+                    assert!(item["error"].is_null(), "Computer Use 연결 오류: {item}");
+                    assert_ne!(item.pointer("/result/isError"), Some(&json!(true)), "{item}");
+                    if item["arguments"]["code"].as_str().is_some_and(|code| code.contains("getApp")) {
+                        println!("실제 cua_repl 계산기 연결 성공");
+                        checked = true;
+                    }
+                }
+                if method == "turn/completed" { break; }
+            }
+        }
+        server.shutdown().await;
+        assert!(checked, "실제 cua_repl 호출이 없었습니다");
+    }
 
     #[test]
     fn initialize_enables_interactive_mcp_forms() {
