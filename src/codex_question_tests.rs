@@ -242,7 +242,7 @@ async fn live_codex_carries_a_diff_selection_beside_the_prompt() {
         let mut params = json!({
             "threadId": state.thread_id, "model": model, "effort": "low",
             "permissions": ":read-only",
-            "additionalContext": crate::turn_additional_context(state.agent_mode(), false),
+            "additionalContext": crate::turn_additional_context(state.agent_mode(), None),
             "input": input
         });
         super::prepare_codex_turn_context(&mut params);
@@ -509,7 +509,7 @@ async fn start_with_effort(
     let mut params = json!({
         "threadId": state.thread_id, "model": model, "effort": effort,
         "permissions": ":danger-full-access",
-        "additionalContext": crate::turn_additional_context(state.agent_mode(), state.auto_knowledge()),
+        "additionalContext": crate::turn_additional_context(state.agent_mode(), state.knowledge_context()),
         "input": state.turn_input(prompt.to_owned())
     });
     super::prepare_codex_turn_context(&mut params);

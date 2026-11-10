@@ -4099,6 +4099,9 @@ pub struct AppState {
     five_hour_remaining: Option<String>,
     fast_mode: bool,
     auto_knowledge: bool,
+    /// Threads that were sent the On knowledge instruction; only they need the
+    /// Off line that lifts it.
+    knowledge_on_threads: HashSet<String>,
     prompt_suggestions: bool,
     /// The runtime's guess at the next prompt, shown dimmed in the empty
     /// composer until → takes it or the next turn starts.
@@ -4419,6 +4422,7 @@ impl AppState {
             five_hour_remaining: remaining_label(five_hour_reset_at, unix_now()),
             fast_mode: read_fast_mode(),
             auto_knowledge,
+            knowledge_on_threads: HashSet::new(),
             prompt_suggestions: prompt_suggestions_enabled(),
             prompt_suggestion: None,
             prompt_suggestion_seq: 0,
@@ -6325,6 +6329,17 @@ impl AppState {
 
     pub fn auto_knowledge(&self) -> bool {
         self.auto_knowledge
+    }
+
+    /// The knowledge state to send with this thread's next input: On, Off only
+    /// where On was sent before, otherwise nothing.
+    pub fn knowledge_context(&mut self) -> Option<bool> {
+        if self.auto_knowledge {
+            self.knowledge_on_threads.insert(self.thread_id.clone());
+            Some(true)
+        } else {
+            self.knowledge_on_threads.contains(&self.thread_id).then_some(false)
+        }
     }
 
     pub fn set_copy_notice(&mut self) {
@@ -27421,6 +27436,19 @@ mod tests {
         }
         assert!(matches!(state.run_slash_command("/auto-knowledge off"), Action::PersistAutoKnowledge(false)));
         assert!(!state.auto_knowledge());
+    }
+
+    #[test]
+    fn auto_knowledge_off_is_sent_only_where_on_was_sent() {
+        let mut state = test_state();
+        state.thread_id = "a".to_owned();
+        assert_eq!(state.knowledge_context(), None);
+        state.run_slash_command("/auto-knowledge on");
+        assert_eq!(state.knowledge_context(), Some(true));
+        state.run_slash_command("/auto-knowledge off");
+        assert_eq!(state.knowledge_context(), Some(false));
+        state.thread_id = "b".to_owned();
+        assert_eq!(state.knowledge_context(), None);
     }
 
     #[test]

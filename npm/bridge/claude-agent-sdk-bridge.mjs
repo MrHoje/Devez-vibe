@@ -2290,12 +2290,12 @@ function releaseHeldProgress(session, dropped) {
   emitItem(session, "completed", { id: held.id, type: "agentMessage", text: held.text, provider: "Claude" });
 }
 
-// Claude Opus 5.5 and Fable 5.1 send the notes they write between tool calls as
+// Claude Opus 5.5 and Fable 5.1/5.2 send the notes they write between tool calls as
 // progress-update thinking blocks, and the CLI asks for their short summaries.
 // They are the reply's own words rather than reasoning, so they go out as text:
 // shown as reasoning, Super Vibe dropped them and the turn went silent before a
 // question.
-const PROGRESS_UPDATE_MODEL = /claude-(?:opus-5-5|fable-5-1|mythos-5-1)/;
+const PROGRESS_UPDATE_MODEL = /claude-(?:opus-5-5|(?:fable|mythos)-5-[12])/;
 
 function isProgressUpdateModel(model) {
   return PROGRESS_UPDATE_MODEL.test(String(model || ""));
@@ -6065,6 +6065,10 @@ async function runSelfTest() {
     || familyCapabilities(successorModels, "claude-opus-4-7")?.value !== "opus[1m]"
     || familyCapabilities(successorModels, "gpt-5.6") !== undefined) {
     throw new Error("Claude model successor self-test failed");
+  }
+  if (!isProgressUpdateModel("claude-fable-5-2[1m]") || !isProgressUpdateModel("claude-mythos-5-2")
+    || isProgressUpdateModel("claude-fable-5")) {
+    throw new Error("Claude progress update model self-test failed");
   }
   // Only a real, strictly newer installed CLI replaces the SDK bundle.
   if (!prefersInstalledCli("C:/Users/me/.local/bin/claude.exe", "2.1.260 (Claude Code)", "2.1.258")

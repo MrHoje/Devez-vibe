@@ -4182,7 +4182,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
                 let mut params = crate::new_thread_params(
                     ".", None, None, "startup", "low", "default", "high",
                 );
-                params["additionalContext"] = crate::turn_additional_context(role, false);
+                params["additionalContext"] = crate::turn_additional_context(role, None);
                 for runtime in [RuntimeKind::Codex, RuntimeKind::Claude, RuntimeKind::OpenCode] {
                     let outgoing = match runtime {
                         RuntimeKind::Codex => {
@@ -4227,7 +4227,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     fn the_response_language_entry_reaches_all_three_runtimes() {
         for english in [false, true] {
             crate::language::set_english(english);
-            let context = crate::turn_additional_context(crate::agent::AgentMode::Standard, false);
+            let context = crate::turn_additional_context(crate::agent::AgentMode::Standard, None);
             let rule = context["devez-vibe-language"]["value"].as_str().unwrap().to_owned();
             let mut params = json!({"additionalContext": context});
             for runtime in [RuntimeKind::Claude, RuntimeKind::OpenCode] {
@@ -4236,7 +4236,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
             prepare_codex_turn_context(&mut params);
             assert_eq!(params["additionalContext"]["devez-vibe-language"]["value"], rule);
             // 응답 중 추가 입력도 같은 묶음을 싣고, Claude 시스템 지침은 한국어일 때만 한 줄 늘어난다.
-            let steering = json!({"additionalContext": crate::steer_additional_context(false)});
+            let steering = json!({"additionalContext": crate::steer_additional_context(None)});
             assert!(combined_turn_instructions(&steering, RuntimeKind::Claude).unwrap().ends_with(&rule));
             let opening = json!({"claudeDeveloperInstructions": crate::CLAUDE_DEVEZ_INSTRUCTIONS});
             let system = claude_session_params(&opening, Path::new("."), None)["systemPrompt"].as_str().unwrap().to_owned();
@@ -4252,7 +4252,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
             let entry = crate::auto_knowledge_context(enabled);
             let instruction = entry["value"].as_str().unwrap();
             let steering = json!({"devez-vibe-knowledge": entry});
-            let starting = crate::turn_additional_context(crate::agent::AgentMode::Standard, enabled);
+            let starting = crate::turn_additional_context(crate::agent::AgentMode::Standard, Some(enabled));
             for context in [starting, steering] {
                 let mut params = json!({"additionalContext": context});
                 for runtime in [RuntimeKind::Claude, RuntimeKind::OpenCode] {

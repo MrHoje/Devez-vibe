@@ -1654,7 +1654,7 @@ async fn start_split_turn(
         "model": model,
         "serviceTier": state.service_tier(),
         "permissions": state.permission_profile(),
-        "additionalContext": turn_additional_context(agent_mode, state.auto_knowledge())
+        "additionalContext": turn_additional_context(agent_mode, state.knowledge_context())
     });
     if !effort.is_empty() {
         params["effort"] = json!(effort);
@@ -5798,8 +5798,8 @@ fn resume_thread_params(thread_id: &str, claude: &ClaudeSessionSettings) -> Valu
 /// every runtime gets the response-language entry each turn.
 /// The full rules stay here for the one runtime with no
 /// standing instructions of its own.
-fn turn_additional_context(agent: agent::AgentMode, auto_knowledge: bool) -> Value {
-    json!({
+fn turn_additional_context(agent: agent::AgentMode, auto_knowledge: Option<bool>) -> Value {
+    let mut context = json!({
         "devez-vibe-rules": {
             "value": DEVEZ_INSTRUCTIONS,
             "kind": "application"
@@ -5816,20 +5816,25 @@ fn turn_additional_context(agent: agent::AgentMode, auto_knowledge: bool) -> Val
             "value": agent.render_turn_block(),
             "kind": "application"
         },
-        "devez-vibe-knowledge": auto_knowledge_context(auto_knowledge),
         "devez-vibe-language": response_language_context()
-    })
+    });
+    if let Some(enabled) = auto_knowledge {
+        context["devez-vibe-knowledge"] = auto_knowledge_context(enabled);
+    }
+    context
 }
 
 /// Steering keeps the active turn's role but restates the knowledge state and
 /// the response language, which a steered message would otherwise lack.
-fn steer_additional_context(auto_knowledge: bool) -> Value {
-    json!({
-        "devez-vibe-knowledge": auto_knowledge_context(auto_knowledge),
-        "devez-vibe-language": response_language_context()
-    })
+fn steer_additional_context(auto_knowledge: Option<bool>) -> Value {
+    let mut context = json!({ "devez-vibe-language": response_language_context() });
+    if let Some(enabled) = auto_knowledge {
+        context["devez-vibe-knowledge"] = auto_knowledge_context(enabled);
+    }
+    context
 }
 
+/// Off is sent only to a thread that saw On, to lift it.
 fn auto_knowledge_context(auto_knowledge: bool) -> Value {
     let knowledge = if auto_knowledge {
         concat!(
@@ -5839,7 +5844,7 @@ fn auto_knowledge_context(auto_knowledge: bool) -> Value {
             "Do not record test or build results, anything recoverable from code or git history, or progress only this task uses. If nothing is worth keeping, create no document. Follow the current role's write limits and the user's instructions."
         )
     } else {
-        "auto-knowledge is now Off. This replaces any earlier auto-knowledge state instruction. Do not create or update .knowledge documents or the index automatically. Record only when the user explicitly asks."
+        "auto-knowledge is now Off. This replaces any earlier auto-knowledge state instruction; earlier auto-knowledge recording instructions no longer apply."
     };
     json!({
         "value": knowledge,
@@ -6836,7 +6841,7 @@ async fn start_turn(
         "model": model,
         "serviceTier": state.service_tier(),
         "permissions": state.permission_profile(),
-        "additionalContext": turn_additional_context(agent_mode, state.auto_knowledge())
+        "additionalContext": turn_additional_context(agent_mode, state.knowledge_context())
     });
     if !effort.is_empty() {
         params["effort"] = json!(effort);
@@ -6897,7 +6902,7 @@ async fn steer_turn(
 }
 
 fn steer_turn_params(
-    state: &AppState,
+    state: &mut AppState,
     turn_id: &str,
     input: Vec<Value>,
     with_role_policy: bool,
@@ -6906,7 +6911,7 @@ fn steer_turn_params(
         "threadId": state.thread_id,
         "expectedTurnId": turn_id,
         "input": input,
-        "additionalContext": steer_additional_context(state.auto_knowledge())
+        "additionalContext": steer_additional_context(state.knowledge_context())
     });
     // The running turn keeps its own role, but the turn this input lands
     // in may be a fresh one the backend had to reopen. Carrying the role's
@@ -9309,7 +9314,7 @@ mod tests {
 
     #[test]
     fn turn_context_omits_mode_notice_and_numeric_caps() {
-        let context = turn_additional_context(agent::AgentMode::Standard, false);
+        let context = turn_additional_context(agent::AgentMode::Standard, None);
         assert!(context.get("devez-vibe-mode").is_none());
         // Shared rules and provider reminders must not reintroduce numeric caps.
         for rules in [
@@ -9332,7 +9337,7 @@ mod tests {
     fn korean_response_rules_follow_the_screen_language() {
         let language = |english| {
             language::set_english(english);
-            let context = turn_additional_context(agent::AgentMode::Standard, false);
+            let context = turn_additional_context(agent::AgentMode::Standard, None);
             context["devez-vibe-language"]["value"].as_str().unwrap().to_owned()
         };
         let korean = language(false);
@@ -9362,7 +9367,7 @@ mod tests {
     /// Builder included.
     #[test]
     fn the_turn_carries_the_selected_role() {
-        let planner = turn_additional_context(agent::AgentMode::Planner, false);
+        let planner = turn_additional_context(agent::AgentMode::Planner, None);
         let block = planner
             .pointer("/devez-vibe-agent/value")
             .and_then(Value::as_str)
@@ -9375,7 +9380,7 @@ mod tests {
             Some("application")
         );
 
-        let builder = turn_additional_context(agent::AgentMode::Standard, false);
+        let builder = turn_additional_context(agent::AgentMode::Standard, None);
         assert!(
             builder
                 .pointer("/devez-vibe-agent/value")
@@ -9397,12 +9402,12 @@ mod tests {
     #[test]
     fn auto_knowledge_context_replaces_on_with_off_and_always_reads_the_index() {
         for enabled in [true, false, true] {
-            let context = turn_additional_context(agent::AgentMode::Standard, enabled);
+            let context = turn_additional_context(agent::AgentMode::Standard, Some(enabled));
             let instruction = context["devez-vibe-knowledge"]["value"].as_str().unwrap();
             assert!(instruction.contains(if enabled { "auto-knowledge is now On" } else { "auto-knowledge is now Off" }));
             assert!(instruction.contains("replaces any earlier auto-knowledge state instruction"));
             assert_eq!(instruction.contains("recurring mistakes"), enabled);
-            assert_eq!(instruction.contains("Do not create or update .knowledge documents"), !enabled);
+            assert_eq!(instruction.contains("recording instructions no longer apply"), !enabled);
             for key in ["devez-vibe-rules", "claude-devez-vibe-rules"] {
                 assert!(context[key]["value"].as_str().unwrap().contains("read .knowledge/knowledge-index.md first"));
             }
@@ -9411,7 +9416,7 @@ mod tests {
 
     #[test]
     fn every_turn_restates_the_rules() {
-        let context = turn_additional_context(agent::AgentMode::Standard, false);
+        let context = turn_additional_context(agent::AgentMode::Standard, None);
 
         assert_eq!(
             context

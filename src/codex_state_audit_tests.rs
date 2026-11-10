@@ -4,12 +4,12 @@ fn codex_audit_queued_and_direct_steers_preserve_read_only_roles() {
     let input = vec![json!({"type": "text", "text": "추가 요청"})];
     for mode in [AgentMode::Reviewer, AgentMode::Planner, AgentMode::Standard] {
         state.set_agent_mode(mode);
-        let params = crate::steer_turn_params(&state, "live-turn", input.clone(), true);
+        let params = crate::steer_turn_params(&mut state, "live-turn", input.clone(), true);
         assert_eq!(params["threadId"], state.thread_id);
         assert_eq!(params["expectedTurnId"], "live-turn");
         assert_eq!(params["input"], json!(input));
         assert_eq!(params.get("toolPolicy"), mode.tool_policy().as_ref());
-        assert!(crate::steer_turn_params(&state, "live-turn", input.clone(), false).get("toolPolicy").is_none());
+        assert!(crate::steer_turn_params(&mut state, "live-turn", input.clone(), false).get("toolPolicy").is_none());
     }
 }
 
