@@ -227,14 +227,14 @@ function applyClaudeExecutable(options, params) {
 
 // The SDK model list carries no window size, so the status line would stay
 // blank until a turn reports one — and a fresh session has no turn yet. Claude
-// defaults here stay unchanged. Fable 5.1 and the 5.5 models have a native 1M
+// defaults here stay unchanged. Fable 5.1/5.2 and the 5.5 models have a native 1M
 // window, so Claude Code 2.1.311 lists them without the `[1m]` suffix.
 function claudeContextWindow(...names) {
   if (["1", "true"].includes(String(process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT || "").toLowerCase())) {
     return 200_000;
   }
   const oneMillion = names.some((name) => String(name || "").includes("[1m]")
-    || /claude-(?:(?:haiku|sonnet|opus)-5-5|fable-5-1)(?:$|[-\[])/i.test(String(name || "")));
+    || /claude-(?:(?:haiku|sonnet|opus)-5-5|fable-5-[12])(?:$|[-\[])/i.test(String(name || "")));
   return oneMillion ? 1_000_000 : 200_000;
 }
 
@@ -3737,6 +3737,7 @@ const STARTUP_FAILURE_GUIDES = {
   org_verify_failed: "로그인 계정의 조직을 확인하지 못했습니다. 네트워크를 확인하고 다시 로그인하세요.",
   org_pin_mismatch: "조직 설정이 허용하지 않는 계정으로 로그인되어 있습니다. 허용된 조직 계정으로 다시 로그인하세요.",
   managed_settings_invalid: "조직 관리 설정을 읽지 못했습니다. 관리자에게 설정 확인을 요청하세요.",
+  managed_settings_not_delivered: "Claude Code가 시작 요청에서 조직 관리 설정을 받지 못했습니다. 실행을 감싼 스크립트가 있으면 확인하세요. 원인은 아래 원문에 나옵니다.",
   sandbox_required_unavailable: "필수 샌드박스를 사용할 수 없어 시작하지 못했습니다. 샌드박스 설치·설정을 확인하세요.",
   initialize_not_first: "Claude SDK 초기화 순서가 올바르지 않습니다. 세션을 다시 시작하세요.",
   config_file_invalid: "Claude 설정 파일이 올바른 JSON이 아닙니다. 아래 원문에 표시된 파일을 수정하거나 백업에서 복원하세요.",
@@ -6538,8 +6539,10 @@ async function runSelfTest() {
       catalogEntry({ value: "sonnet", resolvedModel: "claude-sonnet-5-5" }, "").contextWindow,
       catalogEntry({ value: "fable", resolvedModel: "claude-fable-5-1" }, "").contextWindow,
       catalogEntry({ value: "claude-opus-5", resolvedModel: "claude-opus-5" }, "").contextWindow,
+      catalogEntry({ value: "claude-fable-5-2" }, "").contextWindow,
+      catalogEntry({ value: "claude-fable-5" }, "").contextWindow,
     ];
-    if (windows.join(",") !== "1000000,200000,300000,1000000,1000000,200000,1000000,1000000,1000000,200000") {
+    if (windows.join(",") !== "1000000,200000,300000,1000000,1000000,200000,1000000,1000000,1000000,200000,1000000,200000") {
       throw new Error(`Claude context window self-test failed: ${windows.join(",")}`);
     }
     for (const disabled of ["1", "true"]) {

@@ -138,6 +138,14 @@ TUI를 띄우지 않고 실제 에이전트 동작을 확인할 때는 브리지
 
 ## 확인 기록
 
+### 2026-11-16 SDK 0.3.325(Claude Code 2.1.325) 상향 — 미배포
+
+- 0.3.319→0.3.325 `sdk.d.ts` 차이는 세션 보관(`archiveSession`·`archived`), `matchDeniedModels`, `reloadPlugins({ refuseIfBusy })`, 결과 오류의 `invalid_config_file`, 시작 실패 사유 `managed_settings_not_delivered` 추가와 주석 변경이다. 브리지가 쓰는 메서드·메시지 형태는 그대로다.
+- 시작 실패 사유는 자체 검사가 모든 값의 안내를 요구하므로 `managed_settings_not_delivered` 안내를 추가했다. 브리지는 `managedSettings`를 넘기지 않아 실제로 나올 경로는 없다.
+- 2.1.325부터 `applyFlagSettings`가 설정 층을 버릴 값이면 거부한다. 브리지는 추론 수준·ultracode만 넘기고 `await`하므로 거부되면 턴 오류로 보인다.
+- Fable 5.2(`claude-fable-5-2`, 1M 기본, $8/$40, 캐시 읽기 $0.20)의 선택·진행 알림·예비 목록은 1.11.11에 이미 들어갔다. 그래도 실시간 목록이 200K로 보이고 단가 표가 `claude-fable-5`의 $10/$50으로 계산해, 브리지 1M 판정과 단가 표에 5.2를 넣었다. 수정 후 실시간 목록에서 1M을 확인했다.
+- 검증: 브리지 자체 검사, Rust 전체 1,678개 통과·26개 기본 제외, `git diff --check` 통과. 실제 Fable 5.2 대화와 진행 알림 출력은 확인하지 않았다.
+
 ### 2026-09-10 사용량 한도 자동 재개 — 1.8.22 배포
 
 - 대화형 CLI의 자동 재개는 SDK 실행에는 적용되지 않아 브리지에서 처리한다. 설치된 SDK 0.3.267의 `SDKRateLimitInfo`와 `SDKAssistantMessageError`를 대조했다. 현재 턴의 주 에이전트가 `rate_limit` 오류로 실패하고, 구독 한도 `rejected`와 앞으로 24시간 이내인 `resetsAt`이 함께 확인될 때만 대기한다. 일반 API 오류·사용량 경고·추가 과금 사용 중·초기화 시각 누락에는 예약하지 않는다.

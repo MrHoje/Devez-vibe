@@ -122,6 +122,8 @@ const PRICES: &[(&str, f64, f64)] = &[
     ("codex", 1.25, 10.0),
     ("gpt-5", 1.25, 10.0),
     // Claude — list prices.
+    ("claude-fable-5-2", 8.0, 40.0),
+    ("claude-mythos-5-2", 8.0, 40.0),
     ("claude-fable-5", 10.0, 50.0),
     ("claude-mythos", 10.0, 50.0),
     ("claude-opus-5-5", 4.0, 20.0),
@@ -146,21 +148,24 @@ pub fn estimate_usd(model: &str, totals: TokenTotals) -> Option<f64> {
         .iter()
         .find(|(slug, _, _)| model.contains(slug))
         .copied()?;
-    // Fable 5.1 and Mythos 5.1 cut cache reads to $0.25/MTok — 0.025x their
-    // input rate — and Opus 5.5, Sonnet 5.5 and GPT-6.1 Sol/Terra to 0.05x, against
-    // the 0.1x every other model on either vendor still charges.
-    let cache_read_multiplier =
-        if model.contains("claude-fable-5-1") || model.contains("claude-mythos-5-1") {
-            0.025
-        } else if model.contains("claude-opus-5-5")
-            || model.contains("claude-sonnet-5-5")
-            || model.contains("gpt-6.1-sol")
-            || model.contains("gpt-6.1-terra")
-        {
-            0.05
-        } else {
-            CACHE_READ_MULTIPLIER
-        };
+    // Fable/Mythos 5.1 and 5.2 cut cache reads to 0.025x their input rate
+    // ($0.25 and $0.20/MTok) — and Opus 5.5, Sonnet 5.5 and GPT-6.1 Sol/Terra to
+    // 0.05x, against the 0.1x every other model on either vendor still charges.
+    let cache_read_multiplier = if model.contains("claude-fable-5-1")
+        || model.contains("claude-mythos-5-1")
+        || model.contains("claude-fable-5-2")
+        || model.contains("claude-mythos-5-2")
+    {
+        0.025
+    } else if model.contains("claude-opus-5-5")
+        || model.contains("claude-sonnet-5-5")
+        || model.contains("gpt-6.1-sol")
+        || model.contains("gpt-6.1-terra")
+    {
+        0.05
+    } else {
+        CACHE_READ_MULTIPLIER
+    };
     let input_rate = input_rate / 1_000_000.0;
     let output_rate = output_rate / 1_000_000.0;
     Some(
@@ -197,6 +202,17 @@ mod tests {
         assert!((estimate_usd("claude-fable-5-1[1m]", totals).unwrap() - 0.25).abs() < 1e-9);
         assert!((estimate_usd("claude-fable-5", totals).unwrap() - 1.0).abs() < 1e-9);
         assert!((estimate_usd("claude-mythos-5-1", totals).unwrap() - 0.25).abs() < 1e-9);
+        // $0.20/MTok on Fable 5.2 and Mythos 5.2.
+        assert!((estimate_usd("claude-fable-5-2", totals).unwrap() - 0.20).abs() < 1e-9);
+        assert!((estimate_usd("claude-mythos-5-2", totals).unwrap() - 0.20).abs() < 1e-9);
+        // Fable 5.2 lists at $8/$40, below Fable 5.1's $10/$50.
+        let io = TokenTotals {
+            input_new: 1_000_000,
+            output: 1_000_000,
+            ..Default::default()
+        };
+        assert!((estimate_usd("claude-fable-5-2", io).unwrap() - 48.0).abs() < 1e-9);
+        assert!((estimate_usd("claude-fable-5-1", io).unwrap() - 60.0).abs() < 1e-9);
         // $0.20/MTok on Opus 5.5; Opus 5 stays at 0.1x of $5 = $0.50.
         assert!((estimate_usd("claude-opus-5-5[1m]", totals).unwrap() - 0.20).abs() < 1e-9);
         assert!((estimate_usd("claude-opus-5", totals).unwrap() - 0.50).abs() < 1e-9);

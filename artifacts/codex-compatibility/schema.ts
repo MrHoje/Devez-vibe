@@ -144,6 +144,8 @@ import type { FsRemoveParams } from "./v2/FsRemoveParams";
 import type { FsUnwatchParams } from "./v2/FsUnwatchParams";
 import type { FsWatchParams } from "./v2/FsWatchParams";
 import type { FsWriteFileParams } from "./v2/FsWriteFileParams";
+import type { GatewayOAuthLoginParams } from "./v2/GatewayOAuthLoginParams";
+import type { GatewayOAuthReadParams } from "./v2/GatewayOAuthReadParams";
 import type { GcpSetupParams } from "./v2/GcpSetupParams";
 import type { GetAccountParams } from "./v2/GetAccountParams";
 import type { GetAccountRateLimitsParams } from "./v2/GetAccountRateLimitsParams";
@@ -163,6 +165,8 @@ import type { MemoryStatusParams } from "./v2/MemoryStatusParams";
 import type { MockExperimentalMethodParams } from "./v2/MockExperimentalMethodParams";
 import type { ModelListParams } from "./v2/ModelListParams";
 import type { ModelProviderCapabilitiesReadParams } from "./v2/ModelProviderCapabilitiesReadParams";
+import type { ModelProviderConfigWriteParams } from "./v2/ModelProviderConfigWriteParams";
+import type { ModelProviderListParams } from "./v2/ModelProviderListParams";
 import type { PermissionProfileListParams } from "./v2/PermissionProfileListParams";
 import type { PluginInstallParams } from "./v2/PluginInstallParams";
 import type { PluginInstalledParams } from "./v2/PluginInstalledParams";
@@ -227,6 +231,7 @@ import type { ThreadMemoryModeSetParams } from "./v2/ThreadMemoryModeSetParams";
 import type { ThreadMemoryReadParams } from "./v2/ThreadMemoryReadParams";
 import type { ThreadMetadataUpdateParams } from "./v2/ThreadMetadataUpdateParams";
 import type { ThreadPredictionRequestParams } from "./v2/ThreadPredictionRequestParams";
+import type { ThreadPrepareApprovedPlanParams } from "./v2/ThreadPrepareApprovedPlanParams";
 import type { ThreadQueueAddParams } from "./v2/ThreadQueueAddParams";
 import type { ThreadQueueDeleteParams } from "./v2/ThreadQueueDeleteParams";
 import type { ThreadQueueListParams } from "./v2/ThreadQueueListParams";
@@ -274,7 +279,7 @@ import type { WindowsSandboxSetupStartParams } from "./v2/WindowsSandboxSetupSta
 /**
  * Request from the client to the server.
  */
-export type ClientRequest = { "method": "initialize", id: RequestId, params: InitializeParams, } | { "method": "server/diagnostics", id: RequestId, params: ServerDiagnosticsParams, } | { "method": "userVerification/status", id: RequestId, params: UserVerificationStatusParams, } | { "method": "userVerification/enroll", id: RequestId, params: UserVerificationEnrollParams, } | { "method": "userVerification/delete", id: RequestId, params: UserVerificationDeleteParams, } | { "method": "userVerification/verify", id: RequestId, params: UserVerificationVerifyParams, } | { "method": "userVerification/cancel", id: RequestId, params: UserVerificationCancelParams, } | { "method": "thread/start", id: RequestId, params: ThreadStartParams, } | { "method": "thread/resume", id: RequestId, params: ThreadResumeParams, } | { "method": "thread/fork", id: RequestId, params: ThreadForkParams, } | { "method": "thread/sample", id: RequestId, params: ThreadSampleParams, } | { "method": "thread/sample/cancel", id: RequestId, params: ThreadSampleCancelParams, } | { "method": "thread/archive", id: RequestId, params: ThreadArchiveParams, } | { "method": "thread/delete", id: RequestId, params: ThreadDeleteParams, } | { "method": "thread/unsubscribe", id: RequestId, params: ThreadUnsubscribeParams, } | { "method": "thread/increment_elicitation", id: RequestId, params: ThreadIncrementElicitationParams, } | { "method": "thread/decrement_elicitation", id: RequestId, params: ThreadDecrementElicitationParams, } | { "method": "thread/name/set", id: RequestId, params: ThreadSetNameParams, } | { "method": "thread/prediction/request", id: RequestId, params: ThreadPredictionRequestParams, } | { "method": "thread/goal/set", id: RequestId, params: ThreadGoalSetParams, } | { "method": "thread/goal/get", id: RequestId, params: ThreadGoalGetParams, } | { "method": "thread/goal/clear", id: RequestId, params: ThreadGoalClearParams, } | { "method": "thread/queue/add", id: RequestId, params: ThreadQueueAddParams, } | { "method": "thread/queue/list", id: RequestId, params: ThreadQueueListParams, } | { "method": "thread/queue/update", id: RequestId, params: ThreadQueueUpdateParams, } | { "method": "thread/queue/delete", id: RequestId, params: ThreadQueueDeleteParams, } | { "method": "thread/queue/reorder", id: RequestId, params: ThreadQueueReorderParams, } | { "method": "thread/queue/start", id: RequestId, params: ThreadQueueStartParams, } | { "method": "thread/metadata/update", id: RequestId, params: ThreadMetadataUpdateParams, } | { "method": "thread/attachment/add", id: RequestId, params: ThreadAttachmentAddParams, } | { "method": "thread/attachment/list", id: RequestId, params: ThreadAttachmentListParams, } | { "method": "thread/attachmentOwner/list", id: RequestId, params: ThreadAttachmentOwnerListParams, } | { "method": "thread/attachment/remove", id: RequestId, params: ThreadAttachmentRemoveParams, } | { "method": "thread/section/move", id: RequestId, params: ThreadSectionMoveParams, } | { "method": "thread/settings/update", id: RequestId, params: ThreadSettingsUpdateParams, } | { "method": "thread/memoryMode/set", id: RequestId, params: ThreadMemoryModeSetParams, } | { "method": "thread/memory/read", id: RequestId, params: ThreadMemoryReadParams, } | { "method": "memory/status", id: RequestId, params: MemoryStatusParams, } | { "method": "memory/reset", id: RequestId, params: undefined, } | { "method": "rollout/compress", id: RequestId, params: undefined, } | { "method": "thread/unarchive", id: RequestId, params: ThreadUnarchiveParams, } | { "method": "thread/compact/start", id: RequestId, params: ThreadCompactStartParams, } | { "method": "thread/shellCommand", id: RequestId, params: ThreadShellCommandParams, } | { "method": "thread/approveGuardianDeniedAction", id: RequestId, params: ThreadApproveGuardianDeniedActionParams, } | { "method": "thread/backgroundTerminals/clean", id: RequestId, params: ThreadBackgroundTerminalsCleanParams, } | { "method": "thread/backgroundTerminals/list", id: RequestId, params: ThreadBackgroundTerminalsListParams, } | { "method": "thread/backgroundTerminals/terminate", id: RequestId, params: ThreadBackgroundTerminalsTerminateParams, } | { "method": "thread/revert", id: RequestId, params: ThreadRevertParams, } | { "method": "thread/list", id: RequestId, params: ThreadListParams, } | { "method": "project/list", id: RequestId, params: ProjectListParams, } | { "method": "project/read", id: RequestId, params: ProjectReadParams, } | { "method": "project/create", id: RequestId, params: ProjectCreateParams, } | { "method": "project/import", id: RequestId, params: ProjectImportParams, } | { "method": "project/update", id: RequestId, params: ProjectUpdateParams, } | { "method": "project/move", id: RequestId, params: ProjectMoveParams, } | { "method": "project/delete", id: RequestId, params: ProjectDeleteParams, } | { "method": "threadSection/list", id: RequestId, params: ThreadSectionListParams, } | { "method": "threadSection/create", id: RequestId, params: ThreadSectionCreateParams, } | { "method": "threadSection/update", id: RequestId, params: ThreadSectionUpdateParams, } | { "method": "threadSection/delete", id: RequestId, params: ThreadSectionDeleteParams, } | { "method": "thread/search", id: RequestId, params: ThreadSearchParams, } | { "method": "thread/searchOccurrences", id: RequestId, params: ThreadSearchOccurrencesParams, } | { "method": "thread/loaded/list", id: RequestId, params: ThreadLoadedListParams, } | { "method": "thread/read", id: RequestId, params: ThreadReadParams, } | { "method": "thread/readState/update", id: RequestId, params: ThreadReadStateUpdateParams, } | { "method": "thread/turns/list", id: RequestId, params: ThreadTurnsListParams, } | { "method": "thread/items/list", id: RequestId, params: ThreadItemsListParams, } | { "method": "thread/items/read", id: RequestId, params: ThreadItemsReadParams, } | { "method": "thread/guardianReview", id: RequestId, params: ThreadGuardianReviewParams, } | { "method": "thread/inject_items", id: RequestId, params: ThreadInjectItemsParams, } | { "method": "skills/list", id: RequestId, params: SkillsListParams, } | { "method": "skills/extraRoots/set", id: RequestId, params: SkillsExtraRootsSetParams, } | { "method": "hooks/list", id: RequestId, params: HooksListParams, } | { "method": "marketplace/add", id: RequestId, params: MarketplaceAddParams, } | { "method": "marketplace/remove", id: RequestId, params: MarketplaceRemoveParams, } | { "method": "marketplace/upgrade", id: RequestId, params: MarketplaceUpgradeParams, } | { "method": "plugin/list", id: RequestId, params: PluginListParams, } | { "method": "plugin/search", id: RequestId, params: PluginSearchParams, } | { "method": "plugin/installed", id: RequestId, params: PluginInstalledParams, } | { "method": "plugin/reconcile", id: RequestId, params: PluginReconcileParams, } | { "method": "plugin/read", id: RequestId, params: PluginReadParams, } | { "method": "plugin/skill/read", id: RequestId, params: PluginSkillReadParams, } | { "method": "plugin/share/save", id: RequestId, params: PluginShareSaveParams, } | { "method": "plugin/share/updateTargets", id: RequestId, params: PluginShareUpdateTargetsParams, } | { "method": "plugin/share/list", id: RequestId, params: PluginShareListParams, } | { "method": "plugin/share/checkout", id: RequestId, params: PluginShareCheckoutParams, } | { "method": "plugin/share/delete", id: RequestId, params: PluginShareDeleteParams, } | { "method": "app/read", id: RequestId, params: AppsReadParams, } | { "method": "app/list", id: RequestId, params: AppsListParams, } | { "method": "app/installed", id: RequestId, params: AppsInstalledParams, } | { "method": "fs/readFile", id: RequestId, params: FsReadFileParams, } | { "method": "fs/writeFile", id: RequestId, params: FsWriteFileParams, } | { "method": "fs/createDirectory", id: RequestId, params: FsCreateDirectoryParams, } | { "method": "fs/getMetadata", id: RequestId, params: FsGetMetadataParams, } | { "method": "fs/readDirectory", id: RequestId, params: FsReadDirectoryParams, } | { "method": "fs/remove", id: RequestId, params: FsRemoveParams, } | { "method": "fs/copy", id: RequestId, params: FsCopyParams, } | { "method": "fs/watch", id: RequestId, params: FsWatchParams, } | { "method": "fs/unwatch", id: RequestId, params: FsUnwatchParams, } | { "method": "skills/config/write", id: RequestId, params: SkillsConfigWriteParams, } | { "method": "plugin/install", id: RequestId, params: PluginInstallParams, } | { "method": "plugin/uninstall", id: RequestId, params: PluginUninstallParams, } | { "method": "turn/start", id: RequestId, params: TurnStartParams, } | { "method": "turn/settings/update", id: RequestId, params: TurnSettingsUpdateParams, } | { "method": "turn/steer", id: RequestId, params: TurnSteerParams, } | { "method": "turn/interrupt", id: RequestId, params: TurnInterruptParams, } | { "method": "thread/realtime/start", id: RequestId, params: ThreadRealtimeStartParams, } | { "method": "thread/realtime/appendAudio", id: RequestId, params: ThreadRealtimeAppendAudioParams, } | { "method": "thread/realtime/appendText", id: RequestId, params: ThreadRealtimeAppendTextParams, } | { "method": "thread/realtime/appendSpeech", id: RequestId, params: ThreadRealtimeAppendSpeechParams, } | { "method": "thread/realtime/stop", id: RequestId, params: ThreadRealtimeStopParams, } | { "method": "thread/timeline/list", id: RequestId, params: ThreadTimelineListParams, } | { "method": "thread/realtime/listVoices", id: RequestId, params: ThreadRealtimeListVoicesParams, } | { "method": "review/start", id: RequestId, params: ReviewStartParams, } | { "method": "model/list", id: RequestId, params: ModelListParams, } | { "method": "account/gatewayOAuth/read", id: RequestId, params: undefined, } | { "method": "account/gatewayOAuth/login", id: RequestId, params: undefined, } | { "method": "account/gatewayOAuth/cancel", id: RequestId, params: undefined, } | { "method": "modelProvider/capabilities/read", id: RequestId, params: ModelProviderCapabilitiesReadParams, } | { "method": "experimentalFeature/list", id: RequestId, params: ExperimentalFeatureListParams, } | { "method": "permissionProfile/list", id: RequestId, params: PermissionProfileListParams, } | { "method": "experimentalFeature/enablement/set", id: RequestId, params: ExperimentalFeatureEnablementSetParams, } | { "method": "remoteControl/enable", id: RequestId, params: RemoteControlEnableParams | null, } | { "method": "remoteControl/disable", id: RequestId, params: RemoteControlDisableParams | null, } | { "method": "remoteControl/status/read", id: RequestId, params: undefined, } | { "method": "remoteControl/pairing/start", id: RequestId, params: RemoteControlPairingStartParams, } | { "method": "remoteControl/pairing/status", id: RequestId, params: RemoteControlPairingStatusParams, } | { "method": "remoteControl/client/list", id: RequestId, params: RemoteControlClientsListParams, } | { "method": "remoteControl/client/revoke", id: RequestId, params: RemoteControlClientsRevokeParams, } | { "method": "collaborationMode/list", id: RequestId, params: CollaborationModeListParams, } | { "method": "mock/experimentalMethod", id: RequestId, params: MockExperimentalMethodParams, } | { "method": "environment/add", id: RequestId, params: EnvironmentAddParams, } | { "method": "environment/info", id: RequestId, params: EnvironmentInfoParams, } | { "method": "environment/status", id: RequestId, params: EnvironmentStatusParams, } | { "method": "mcpServer/oauth/login", id: RequestId, params: McpServerOauthLoginParams, } | { "method": "config/mcpServer/reload", id: RequestId, params: undefined, } | { "method": "mcpServerStatus/list", id: RequestId, params: ListMcpServerStatusParams, } | { "method": "mcpServer/resource/read", id: RequestId, params: McpResourceReadParams, } | { "method": "mcpServer/event/stream/start", id: RequestId, params: McpServerEventStreamStartParams, } | { "method": "mcpServer/event/stream/stop", id: RequestId, params: McpServerEventStreamStopParams, } | { "method": "mcpServer/tool/call", id: RequestId, params: McpServerToolCallParams, } | { "method": "windowsSandbox/setupStart", id: RequestId, params: WindowsSandboxSetupStartParams, } | { "method": "windowsSandbox/readiness", id: RequestId, params: undefined, } | { "method": "account/login/start", id: RequestId, params: LoginAccountParams, } | { "method": "account/bedrock/discover", id: RequestId, params: BedrockDiscoverParams, } | { "method": "account/bedrock/setup", id: RequestId, params: BedrockSetupParams, } | { "method": "account/gcp/setup", id: RequestId, params: GcpSetupParams, } | { "method": "account/bedrock/checkGovCloudRequirements", id: RequestId, params: BedrockCheckGovCloudRequirementsParams, } | { "method": "account/login/cancel", id: RequestId, params: CancelLoginAccountParams, } | { "method": "accountSession/list", id: RequestId, params: AccountSessionsListParams, } | { "method": "accountSession/switch", id: RequestId, params: AccountSessionsSwitchParams, } | { "method": "account/logout", id: RequestId, params: undefined, } | { "method": "account/rateLimits/read", id: RequestId, params?: GetAccountRateLimitsParams | undefined, } | { "method": "account/rateLimitResetCredit/consume", id: RequestId, params: ConsumeAccountRateLimitResetCreditParams, } | { "method": "account/usage/read", id: RequestId, params?: GetAccountTokenUsageParams | undefined, } | { "method": "account/workspaceMessages/read", id: RequestId, params: undefined, } | { "method": "account/sendAddCreditsNudgeEmail", id: RequestId, params: SendAddCreditsNudgeEmailParams, } | { "method": "feedback/upload", id: RequestId, params: FeedbackUploadParams, } | { "method": "feedback/save", id: RequestId, params: FeedbackSaveParams, } | { "method": "command/exec", id: RequestId, params: CommandExecParams, } | { "method": "command/exec/write", id: RequestId, params: CommandExecWriteParams, } | { "method": "command/exec/terminate", id: RequestId, params: CommandExecTerminateParams, } | { "method": "command/exec/resize", id: RequestId, params: CommandExecResizeParams, } | { "method": "process/spawn", id: RequestId, params: ProcessSpawnParams, } | { "method": "process/writeStdin", id: RequestId, params: ProcessWriteStdinParams, } | { "method": "process/kill", id: RequestId, params: ProcessKillParams, } | { "method": "process/resizePty", id: RequestId, params: ProcessResizePtyParams, } | { "method": "config/read", id: RequestId, params: ConfigReadParams, } | { "method": "externalAgentConfig/detect", id: RequestId, params: ExternalAgentConfigDetectParams, } | { "method": "externalAgentConfig/import", id: RequestId, params: ExternalAgentConfigImportParams, } | { "method": "externalAgentConfig/import/recordHistory", id: RequestId, params: ExternalAgentConfigImportHistoryRecordParams, } | { "method": "externalAgentConfig/import/readHistories", id: RequestId, params: undefined, } | { "method": "config/value/write", id: RequestId, params: ConfigValueWriteParams, } | { "method": "config/batchWrite", id: RequestId, params: ConfigBatchWriteParams, } | { "method": "configRequirements/read", id: RequestId, params: undefined, } | { "method": "account/read", id: RequestId, params: GetAccountParams, } | { "method": "getConversationSummary", id: RequestId, params: GetConversationSummaryParams, } | { "method": "gitDiffToRemote", id: RequestId, params: GitDiffToRemoteParams, } | { "method": "getAuthStatus", id: RequestId, params: GetAuthStatusParams, } | { "method": "fuzzyFileSearch", id: RequestId, params: FuzzyFileSearchParams, } | { "method": "fuzzyFileSearch/sessionStart", id: RequestId, params: FuzzyFileSearchSessionStartParams, } | { "method": "fuzzyFileSearch/sessionUpdate", id: RequestId, params: FuzzyFileSearchSessionUpdateParams, } | { "method": "fuzzyFileSearch/sessionStop", id: RequestId, params: FuzzyFileSearchSessionStopParams, };
+export type ClientRequest = { "method": "initialize", id: RequestId, params: InitializeParams, } | { "method": "server/diagnostics", id: RequestId, params: ServerDiagnosticsParams, } | { "method": "userVerification/status", id: RequestId, params: UserVerificationStatusParams, } | { "method": "userVerification/enroll", id: RequestId, params: UserVerificationEnrollParams, } | { "method": "userVerification/delete", id: RequestId, params: UserVerificationDeleteParams, } | { "method": "userVerification/verify", id: RequestId, params: UserVerificationVerifyParams, } | { "method": "userVerification/cancel", id: RequestId, params: UserVerificationCancelParams, } | { "method": "thread/start", id: RequestId, params: ThreadStartParams, } | { "method": "thread/resume", id: RequestId, params: ThreadResumeParams, } | { "method": "thread/fork", id: RequestId, params: ThreadForkParams, } | { "method": "thread/sample", id: RequestId, params: ThreadSampleParams, } | { "method": "thread/sample/cancel", id: RequestId, params: ThreadSampleCancelParams, } | { "method": "thread/archive", id: RequestId, params: ThreadArchiveParams, } | { "method": "thread/delete", id: RequestId, params: ThreadDeleteParams, } | { "method": "thread/unsubscribe", id: RequestId, params: ThreadUnsubscribeParams, } | { "method": "thread/increment_elicitation", id: RequestId, params: ThreadIncrementElicitationParams, } | { "method": "thread/decrement_elicitation", id: RequestId, params: ThreadDecrementElicitationParams, } | { "method": "thread/name/set", id: RequestId, params: ThreadSetNameParams, } | { "method": "thread/prediction/request", id: RequestId, params: ThreadPredictionRequestParams, } | { "method": "thread/goal/set", id: RequestId, params: ThreadGoalSetParams, } | { "method": "thread/goal/get", id: RequestId, params: ThreadGoalGetParams, } | { "method": "thread/goal/clear", id: RequestId, params: ThreadGoalClearParams, } | { "method": "thread/queue/add", id: RequestId, params: ThreadQueueAddParams, } | { "method": "thread/queue/list", id: RequestId, params: ThreadQueueListParams, } | { "method": "thread/queue/update", id: RequestId, params: ThreadQueueUpdateParams, } | { "method": "thread/queue/delete", id: RequestId, params: ThreadQueueDeleteParams, } | { "method": "thread/queue/reorder", id: RequestId, params: ThreadQueueReorderParams, } | { "method": "thread/queue/start", id: RequestId, params: ThreadQueueStartParams, } | { "method": "thread/metadata/update", id: RequestId, params: ThreadMetadataUpdateParams, } | { "method": "thread/attachment/add", id: RequestId, params: ThreadAttachmentAddParams, } | { "method": "thread/attachment/list", id: RequestId, params: ThreadAttachmentListParams, } | { "method": "thread/attachmentOwner/list", id: RequestId, params: ThreadAttachmentOwnerListParams, } | { "method": "thread/attachment/remove", id: RequestId, params: ThreadAttachmentRemoveParams, } | { "method": "thread/section/move", id: RequestId, params: ThreadSectionMoveParams, } | { "method": "thread/settings/update", id: RequestId, params: ThreadSettingsUpdateParams, } | { "method": "thread/memoryMode/set", id: RequestId, params: ThreadMemoryModeSetParams, } | { "method": "thread/memory/read", id: RequestId, params: ThreadMemoryReadParams, } | { "method": "memory/status", id: RequestId, params: MemoryStatusParams, } | { "method": "memory/reset", id: RequestId, params: undefined, } | { "method": "rollout/compress", id: RequestId, params: undefined, } | { "method": "thread/unarchive", id: RequestId, params: ThreadUnarchiveParams, } | { "method": "thread/compact/start", id: RequestId, params: ThreadCompactStartParams, } | { "method": "thread/shellCommand", id: RequestId, params: ThreadShellCommandParams, } | { "method": "thread/approveGuardianDeniedAction", id: RequestId, params: ThreadApproveGuardianDeniedActionParams, } | { "method": "thread/backgroundTerminals/clean", id: RequestId, params: ThreadBackgroundTerminalsCleanParams, } | { "method": "thread/backgroundTerminals/list", id: RequestId, params: ThreadBackgroundTerminalsListParams, } | { "method": "thread/backgroundTerminals/terminate", id: RequestId, params: ThreadBackgroundTerminalsTerminateParams, } | { "method": "thread/revert", id: RequestId, params: ThreadRevertParams, } | { "method": "thread/list", id: RequestId, params: ThreadListParams, } | { "method": "project/list", id: RequestId, params: ProjectListParams, } | { "method": "project/read", id: RequestId, params: ProjectReadParams, } | { "method": "project/create", id: RequestId, params: ProjectCreateParams, } | { "method": "project/import", id: RequestId, params: ProjectImportParams, } | { "method": "project/update", id: RequestId, params: ProjectUpdateParams, } | { "method": "project/move", id: RequestId, params: ProjectMoveParams, } | { "method": "project/delete", id: RequestId, params: ProjectDeleteParams, } | { "method": "threadSection/list", id: RequestId, params: ThreadSectionListParams, } | { "method": "threadSection/create", id: RequestId, params: ThreadSectionCreateParams, } | { "method": "threadSection/update", id: RequestId, params: ThreadSectionUpdateParams, } | { "method": "threadSection/delete", id: RequestId, params: ThreadSectionDeleteParams, } | { "method": "thread/search", id: RequestId, params: ThreadSearchParams, } | { "method": "thread/searchOccurrences", id: RequestId, params: ThreadSearchOccurrencesParams, } | { "method": "thread/loaded/list", id: RequestId, params: ThreadLoadedListParams, } | { "method": "thread/read", id: RequestId, params: ThreadReadParams, } | { "method": "thread/readState/update", id: RequestId, params: ThreadReadStateUpdateParams, } | { "method": "thread/turns/list", id: RequestId, params: ThreadTurnsListParams, } | { "method": "thread/items/list", id: RequestId, params: ThreadItemsListParams, } | { "method": "thread/items/read", id: RequestId, params: ThreadItemsReadParams, } | { "method": "thread/guardianReview", id: RequestId, params: ThreadGuardianReviewParams, } | { "method": "thread/inject_items", id: RequestId, params: ThreadInjectItemsParams, } | { "method": "thread/prepareApprovedPlan", id: RequestId, params: ThreadPrepareApprovedPlanParams, } | { "method": "skills/list", id: RequestId, params: SkillsListParams, } | { "method": "skills/extraRoots/set", id: RequestId, params: SkillsExtraRootsSetParams, } | { "method": "hooks/list", id: RequestId, params: HooksListParams, } | { "method": "marketplace/add", id: RequestId, params: MarketplaceAddParams, } | { "method": "marketplace/remove", id: RequestId, params: MarketplaceRemoveParams, } | { "method": "marketplace/upgrade", id: RequestId, params: MarketplaceUpgradeParams, } | { "method": "plugin/list", id: RequestId, params: PluginListParams, } | { "method": "plugin/search", id: RequestId, params: PluginSearchParams, } | { "method": "plugin/installed", id: RequestId, params: PluginInstalledParams, } | { "method": "plugin/reconcile", id: RequestId, params: PluginReconcileParams, } | { "method": "plugin/read", id: RequestId, params: PluginReadParams, } | { "method": "plugin/skill/read", id: RequestId, params: PluginSkillReadParams, } | { "method": "plugin/share/save", id: RequestId, params: PluginShareSaveParams, } | { "method": "plugin/share/updateTargets", id: RequestId, params: PluginShareUpdateTargetsParams, } | { "method": "plugin/share/list", id: RequestId, params: PluginShareListParams, } | { "method": "plugin/share/checkout", id: RequestId, params: PluginShareCheckoutParams, } | { "method": "plugin/share/delete", id: RequestId, params: PluginShareDeleteParams, } | { "method": "app/read", id: RequestId, params: AppsReadParams, } | { "method": "app/list", id: RequestId, params: AppsListParams, } | { "method": "app/installed", id: RequestId, params: AppsInstalledParams, } | { "method": "fs/readFile", id: RequestId, params: FsReadFileParams, } | { "method": "fs/writeFile", id: RequestId, params: FsWriteFileParams, } | { "method": "fs/createDirectory", id: RequestId, params: FsCreateDirectoryParams, } | { "method": "fs/getMetadata", id: RequestId, params: FsGetMetadataParams, } | { "method": "fs/readDirectory", id: RequestId, params: FsReadDirectoryParams, } | { "method": "fs/remove", id: RequestId, params: FsRemoveParams, } | { "method": "fs/copy", id: RequestId, params: FsCopyParams, } | { "method": "fs/watch", id: RequestId, params: FsWatchParams, } | { "method": "fs/unwatch", id: RequestId, params: FsUnwatchParams, } | { "method": "skills/config/write", id: RequestId, params: SkillsConfigWriteParams, } | { "method": "plugin/install", id: RequestId, params: PluginInstallParams, } | { "method": "plugin/uninstall", id: RequestId, params: PluginUninstallParams, } | { "method": "turn/start", id: RequestId, params: TurnStartParams, } | { "method": "turn/settings/update", id: RequestId, params: TurnSettingsUpdateParams, } | { "method": "turn/steer", id: RequestId, params: TurnSteerParams, } | { "method": "turn/interrupt", id: RequestId, params: TurnInterruptParams, } | { "method": "thread/realtime/start", id: RequestId, params: ThreadRealtimeStartParams, } | { "method": "thread/realtime/appendAudio", id: RequestId, params: ThreadRealtimeAppendAudioParams, } | { "method": "thread/realtime/appendText", id: RequestId, params: ThreadRealtimeAppendTextParams, } | { "method": "thread/realtime/appendSpeech", id: RequestId, params: ThreadRealtimeAppendSpeechParams, } | { "method": "thread/realtime/stop", id: RequestId, params: ThreadRealtimeStopParams, } | { "method": "thread/timeline/list", id: RequestId, params: ThreadTimelineListParams, } | { "method": "thread/realtime/listVoices", id: RequestId, params: ThreadRealtimeListVoicesParams, } | { "method": "review/start", id: RequestId, params: ReviewStartParams, } | { "method": "model/list", id: RequestId, params: ModelListParams, } | { "method": "account/gatewayOAuth/read", id: RequestId, params?: GatewayOAuthReadParams | null | undefined, } | { "method": "account/gatewayOAuth/login", id: RequestId, params?: GatewayOAuthLoginParams | null | undefined, } | { "method": "account/gatewayOAuth/cancel", id: RequestId, params: undefined, } | { "method": "modelProvider/list", id: RequestId, params: ModelProviderListParams, } | { "method": "modelProvider/config/write", id: RequestId, params: ModelProviderConfigWriteParams, } | { "method": "modelProvider/capabilities/read", id: RequestId, params: ModelProviderCapabilitiesReadParams, } | { "method": "experimentalFeature/list", id: RequestId, params: ExperimentalFeatureListParams, } | { "method": "permissionProfile/list", id: RequestId, params: PermissionProfileListParams, } | { "method": "experimentalFeature/enablement/set", id: RequestId, params: ExperimentalFeatureEnablementSetParams, } | { "method": "remoteControl/enable", id: RequestId, params: RemoteControlEnableParams | null, } | { "method": "remoteControl/disable", id: RequestId, params: RemoteControlDisableParams | null, } | { "method": "remoteControl/status/read", id: RequestId, params: undefined, } | { "method": "remoteControl/pairing/start", id: RequestId, params: RemoteControlPairingStartParams, } | { "method": "remoteControl/pairing/status", id: RequestId, params: RemoteControlPairingStatusParams, } | { "method": "remoteControl/client/list", id: RequestId, params: RemoteControlClientsListParams, } | { "method": "remoteControl/client/revoke", id: RequestId, params: RemoteControlClientsRevokeParams, } | { "method": "collaborationMode/list", id: RequestId, params: CollaborationModeListParams, } | { "method": "mock/experimentalMethod", id: RequestId, params: MockExperimentalMethodParams, } | { "method": "environment/add", id: RequestId, params: EnvironmentAddParams, } | { "method": "environment/info", id: RequestId, params: EnvironmentInfoParams, } | { "method": "environment/status", id: RequestId, params: EnvironmentStatusParams, } | { "method": "mcpServer/oauth/login", id: RequestId, params: McpServerOauthLoginParams, } | { "method": "config/mcpServer/reload", id: RequestId, params: undefined, } | { "method": "mcpServerStatus/list", id: RequestId, params: ListMcpServerStatusParams, } | { "method": "mcpServer/resource/read", id: RequestId, params: McpResourceReadParams, } | { "method": "mcpServer/event/stream/start", id: RequestId, params: McpServerEventStreamStartParams, } | { "method": "mcpServer/event/stream/stop", id: RequestId, params: McpServerEventStreamStopParams, } | { "method": "mcpServer/tool/call", id: RequestId, params: McpServerToolCallParams, } | { "method": "windowsSandbox/setupStart", id: RequestId, params: WindowsSandboxSetupStartParams, } | { "method": "windowsSandbox/readiness", id: RequestId, params: undefined, } | { "method": "account/login/start", id: RequestId, params: LoginAccountParams, } | { "method": "account/bedrock/discover", id: RequestId, params: BedrockDiscoverParams, } | { "method": "account/bedrock/setup", id: RequestId, params: BedrockSetupParams, } | { "method": "account/gcp/setup", id: RequestId, params: GcpSetupParams, } | { "method": "account/bedrock/checkGovCloudRequirements", id: RequestId, params: BedrockCheckGovCloudRequirementsParams, } | { "method": "account/login/cancel", id: RequestId, params: CancelLoginAccountParams, } | { "method": "accountSession/list", id: RequestId, params: AccountSessionsListParams, } | { "method": "accountSession/switch", id: RequestId, params: AccountSessionsSwitchParams, } | { "method": "account/logout", id: RequestId, params: undefined, } | { "method": "account/securitySetup/read", id: RequestId, params: undefined, } | { "method": "account/rateLimits/read", id: RequestId, params?: GetAccountRateLimitsParams | undefined, } | { "method": "account/rateLimitResetCredit/consume", id: RequestId, params: ConsumeAccountRateLimitResetCreditParams, } | { "method": "account/usage/read", id: RequestId, params?: GetAccountTokenUsageParams | undefined, } | { "method": "account/workspaceMessages/read", id: RequestId, params: undefined, } | { "method": "account/sendAddCreditsNudgeEmail", id: RequestId, params: SendAddCreditsNudgeEmailParams, } | { "method": "feedback/upload", id: RequestId, params: FeedbackUploadParams, } | { "method": "feedback/save", id: RequestId, params: FeedbackSaveParams, } | { "method": "command/exec", id: RequestId, params: CommandExecParams, } | { "method": "command/exec/write", id: RequestId, params: CommandExecWriteParams, } | { "method": "command/exec/terminate", id: RequestId, params: CommandExecTerminateParams, } | { "method": "command/exec/resize", id: RequestId, params: CommandExecResizeParams, } | { "method": "process/spawn", id: RequestId, params: ProcessSpawnParams, } | { "method": "process/writeStdin", id: RequestId, params: ProcessWriteStdinParams, } | { "method": "process/kill", id: RequestId, params: ProcessKillParams, } | { "method": "process/resizePty", id: RequestId, params: ProcessResizePtyParams, } | { "method": "config/read", id: RequestId, params: ConfigReadParams, } | { "method": "externalAgentConfig/detect", id: RequestId, params: ExternalAgentConfigDetectParams, } | { "method": "externalAgentConfig/import", id: RequestId, params: ExternalAgentConfigImportParams, } | { "method": "externalAgentConfig/import/recordHistory", id: RequestId, params: ExternalAgentConfigImportHistoryRecordParams, } | { "method": "externalAgentConfig/import/readHistories", id: RequestId, params: undefined, } | { "method": "config/value/write", id: RequestId, params: ConfigValueWriteParams, } | { "method": "config/batchWrite", id: RequestId, params: ConfigBatchWriteParams, } | { "method": "configRequirements/read", id: RequestId, params: undefined, } | { "method": "account/read", id: RequestId, params: GetAccountParams, } | { "method": "getConversationSummary", id: RequestId, params: GetConversationSummaryParams, } | { "method": "gitDiffToRemote", id: RequestId, params: GitDiffToRemoteParams, } | { "method": "getAuthStatus", id: RequestId, params: GetAuthStatusParams, } | { "method": "fuzzyFileSearch", id: RequestId, params: FuzzyFileSearchParams, } | { "method": "fuzzyFileSearch/sessionStart", id: RequestId, params: FuzzyFileSearchSessionStartParams, } | { "method": "fuzzyFileSearch/sessionUpdate", id: RequestId, params: FuzzyFileSearchSessionUpdateParams, } | { "method": "fuzzyFileSearch/sessionStop", id: RequestId, params: FuzzyFileSearchSessionStopParams, };
 
 // CodexResponseHandoffMode.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -410,7 +415,7 @@ import type { ImageDetail } from "./ImageDetail";
  * Responses API compatible content items that can be returned by a tool call.
  * This is a subset of ContentItem with the types we support as function call outputs.
  */
-export type FunctionCallOutputContentItem = { "type": "input_text", text: string, } | { "type": "input_image", detail?: ImageDetail, } & ({ image_url: string, } | { file_id: string, }) | { "type": "input_audio", audio_url: string, } | { "type": "encrypted_content", encrypted_content: string, };
+export type FunctionCallOutputContentItem = { "type": "input_text", text: string, } | { "type": "input_image", detail?: ImageDetail, } & ({ image_url: string, } | { file_id: string, }) | { "type": "input_audio", } & ({ audio_url: string, } | { file_id: string, }) | { "type": "encrypted_content", encrypted_content: string, };
 
 // FuzzyFileSearchMatchType.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -1414,6 +1419,16 @@ export type WebSearchLocation = { country: string | null, region: string | null,
 
 export type WebSearchMode = "disabled" | "cached" | "indexed" | "live";
 
+// WebSearchProvider.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * Provider preference selected by the resolved model catalog entry.
+ */
+export type WebSearchProvider = "standalone" | "search_mcp";
+
 // WebSearchToolConfig.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
@@ -1526,6 +1541,7 @@ export type { WebSearchContextSize } from "./WebSearchContextSize";
 export type { WebSearchItem } from "./WebSearchItem";
 export type { WebSearchLocation } from "./WebSearchLocation";
 export type { WebSearchMode } from "./WebSearchMode";
+export type { WebSearchProvider } from "./WebSearchProvider";
 export type { WebSearchToolConfig } from "./WebSearchToolConfig";
 export * as v2 from "./v2";
 
@@ -1580,6 +1596,21 @@ export type AccountRateLimitsUpdatedNotification = { rateLimits: RateLimitSnapsh
  * Backend routing policy. Wire values match the accounts/check contract.
  */
 export type AccountRoutingOverride = "NO_CONSTRAINT" | "us" | "us_cr";
+
+// v2/AccountSecuritySetupAction.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type AccountSecuritySetupAction = { label: string, url: string, };
+
+// v2/AccountSecuritySetupNotice.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { AccountSecuritySetupAction } from "./AccountSecuritySetupAction";
+
+export type AccountSecuritySetupNotice = { accountId: string, userId: string, title: string, description: string, action: AccountSecuritySetupAction, };
 
 // v2/AccountSession.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -1769,6 +1800,28 @@ export type AgentMessageDelivery = "async";
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
 export type AgentMessageDeltaNotification = { threadId: string, turnId: string, itemId: string, delta: string, };
+
+// v2/AgentMessageDisplay.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * A presentation instruction for Chat to apply to this answer when recovering history.
+ */
+export type AgentMessageDisplay = {
+/**
+ * Unknown actions must be left for the producing client to handle.
+ */
+action: string, blockType: string | null, cyberTrustedAccess: boolean | null, checkTrustedContacts: boolean | null, };
+
+// v2/AgentMessageModeration.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { AgentMessageDisplay } from "./AgentMessageDisplay";
+
+export type AgentMessageModeration = { moderated: boolean, display: AgentMessageDisplay | null, };
 
 // v2/AllowDenyRequirement.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -2214,6 +2267,24 @@ import type { AwsCredentialType } from "./AwsCredentialType";
 
 export type BedrockEnvironmentCredential = { type: AwsCredentialType, region: string | null, };
 
+// v2/BedrockProviderId.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type BedrockProviderId = "amazon-bedrock" | "amazon-bedrock-runtime";
+
+// v2/BedrockSettingsParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { BedrockProviderId } from "./BedrockProviderId";
+
+/**
+ * AWS configuration fields for built-in Bedrock providers.
+ */
+export type BedrockSettingsParams = { providerId: BedrockProviderId, profile?: string | null, region?: string | null, };
+
 // v2/BedrockSetupParams.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
@@ -2371,7 +2442,7 @@ import type { NonSteerableTurnKind } from "./NonSteerableTurnKind";
  * When an upstream HTTP status is available (for example, from the Responses API or a provider),
  * it is forwarded in `httpStatusCode` on the relevant `codexErrorInfo` variant.
  */
-export type CodexErrorInfo = "contextWindowExceeded" | "sessionBudgetExceeded" | "usageLimitExceeded" | "rateLimitExceeded" | "flexUnavailable" | "serverOverloaded" | "modelNotFound" | "policyCapacityUnavailable" | "cyberPolicy" | "misalignmentPolicyViolation" | "tooManyDenials" | { "httpConnectionFailed": { httpStatusCode: number | null, } } | { "responseStreamConnectionFailed": { httpStatusCode: number | null, } } | "internalServerError" | "unauthorized" | "badRequest" | "threadRollbackFailed" | "sandboxError" | { "responseStreamDisconnected": { httpStatusCode: number | null, } } | { "responseTooManyFailedAttempts": { httpStatusCode: number | null, } } | { "activeTurnNotSteerable": { turnKind: NonSteerableTurnKind, } } | "other" | string | { [key: string]: unknown };
+export type CodexErrorInfo = "contextWindowExceeded" | "sessionBudgetExceeded" | "usageLimitExceeded" | "rateLimitExceeded" | "flexUnavailable" | "serverOverloaded" | "modelNotFound" | "policyCapacityUnavailable" | "inferenceHookDenied" | "cyberPolicy" | "misalignmentPolicyViolation" | "tooManyDenials" | { "httpConnectionFailed": { httpStatusCode: number | null, } } | { "responseStreamConnectionFailed": { httpStatusCode: number | null, } } | "internalServerError" | "unauthorized" | "badRequest" | "threadRollbackFailed" | "sandboxError" | { "responseStreamDisconnected": { httpStatusCode: number | null, } } | { "responseTooManyFailedAttempts": { httpStatusCode: number | null, } } | { "activeTurnNotSteerable": { turnKind: NonSteerableTurnKind, } } | "other" | string | { [key: string]: unknown };
 
 // v2/CollabAgentState.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -2934,6 +3005,7 @@ import type { ReasoningEffort } from "../ReasoningEffort";
 import type { ReasoningSummary } from "../ReasoningSummary";
 import type { Verbosity } from "../Verbosity";
 import type { WebSearchMode } from "../WebSearchMode";
+import type { WebSearchProvider } from "../WebSearchProvider";
 import type { JsonValue } from "../serde_json/JsonValue";
 import type { AnalyticsConfig } from "./AnalyticsConfig";
 import type { ApprovalsReviewer } from "./ApprovalsReviewer";
@@ -2951,7 +3023,11 @@ export type Config = { model: string | null, review_model: string | null, model_
  * [UNSTABLE] Optional default for where approval requests are routed for
  * review.
  */
-approvals_reviewer: ApprovalsReviewer | null, sandbox_mode: SandboxMode | null, sandbox_workspace_write: SandboxWorkspaceWrite | null, forced_chatgpt_workspace_id: ForcedChatgptWorkspaceIds | null, forced_login_method: ForcedLoginMethod | null, web_search: WebSearchMode | null, tools: ToolsV2 | null, instructions: string | null, developer_instructions: string | null, compact_prompt: string | null, model_reasoning_effort: ReasoningEffort | null, model_reasoning_summary: ReasoningSummary | null, model_verbosity: Verbosity | null, service_tier: string | null, analytics: AnalyticsConfig | null, apps: AppsConfig | null, browser_use: BrowserUseConfig | null, computer_use: ComputerUseConfig | null, desktop: { [key in string]?: JsonValue } | null, } & ({ [key in string]?: number | string | boolean | Array<JsonValue> | { [key in string]?: JsonValue } | null });
+approvals_reviewer: ApprovalsReviewer | null, sandbox_mode: SandboxMode | null, sandbox_workspace_write: SandboxWorkspaceWrite | null, forced_chatgpt_workspace_id: ForcedChatgptWorkspaceIds | null, forced_login_method: ForcedLoginMethod | null, web_search: WebSearchMode | null,
+/**
+ * Effective tools.client_search_provider hint. Model-selected providers take precedence.
+ */
+client_search_provider: WebSearchProvider | null, tools: ToolsV2 | null, instructions: string | null, developer_instructions: string | null, compact_prompt: string | null, model_reasoning_effort: ReasoningEffort | null, model_reasoning_summary: ReasoningSummary | null, model_verbosity: Verbosity | null, service_tier: string | null, analytics: AnalyticsConfig | null, apps: AppsConfig | null, browser_use: BrowserUseConfig | null, computer_use: ComputerUseConfig | null, desktop: { [key in string]?: JsonValue } | null, } & ({ [key in string]?: number | string | boolean | Array<JsonValue> | { [key in string]?: JsonValue } | null });
 
 // v2/ConfigBatchWriteParams.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -3265,6 +3341,17 @@ export type CurrentTimeReadResponse = {
  * Current time as whole Unix seconds.
  */
 currentTimeAt: number, };
+
+// v2/CustomGatewaySettingsParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type CustomGatewaySettingsParams = {
+/**
+ * Omit or pass null to allocate a new custom provider ID.
+ */
+providerId?: string | null, name?: string, baseUrl?: string | null, envKey?: string | null, };
 
 // v2/CyberAccessProgram.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -4328,6 +4415,13 @@ dataBase64: string, };
  */
 export type FsWriteFileResponse = Record<string, never>;
 
+// v2/GatewayAuth.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type GatewayAuth = { "mode": "none" } | { "mode": "environmentVariable", envKey: string, } | { "mode": "externallyConfigured", envKey: string | null, };
+
 // v2/GatewayOAuthCancelResponse.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
@@ -4343,16 +4437,60 @@ import type { GatewayOAuthStatus } from "./GatewayOAuthStatus";
 
 export type GatewayOAuthChangedNotification = {
 /**
+ * Identifies the completed device login attempt.
+ */
+loginId: string | null,
+/**
  * Authorization handoff, sent only to the connection that started login.
  */
 authUrl: string | null, providerId: string, status: GatewayOAuthStatus, error: string | null, };
+
+// v2/GatewayOAuthLoginParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * Authorize a configured provider without changing the default or any thread's provider.
+ */
+export type GatewayOAuthLoginParams = {
+/**
+ * Defaults to the current provider when omitted.
+ */
+modelProvider?: string | null,
+/**
+ * Select device authorization when the server advertises support for it.
+ */
+deviceAuth?: boolean, };
 
 // v2/GatewayOAuthLoginResponse.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { GatewayOAuthPrompt } from "./GatewayOAuthPrompt";
 
-export type GatewayOAuthLoginResponse = Record<string, never>;
+export type GatewayOAuthLoginResponse = { prompt: GatewayOAuthPrompt | null, };
+
+// v2/GatewayOAuthPrompt.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type GatewayOAuthPrompt = { loginId: string, verificationUrl: string, userCode: string, };
+
+// v2/GatewayOAuthReadParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * Read credential readiness for a configured provider without starting browser login.
+ */
+export type GatewayOAuthReadParams = {
+/**
+ * Defaults to the current provider when omitted.
+ */
+modelProvider?: string | null, };
 
 // v2/GatewayOAuthReadResponse.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -4369,6 +4507,10 @@ export type GatewayOAuthReadResponse = { providerId: string, providerName: strin
  */
 required: boolean,
 /**
+ * Whether the administrator configured a device authorization endpoint.
+ */
+supportsDeviceAuth?: boolean,
+/**
  * Null when the effective provider does not use gateway OAuth.
  */
 status: GatewayOAuthStatus | null, error: string | null, };
@@ -4379,6 +4521,24 @@ status: GatewayOAuthStatus | null, error: string | null, };
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
 export type GatewayOAuthStatus = "notReady" | "started" | "succeeded" | "failed";
+
+// v2/GcpProviderId.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type GcpProviderId = "gcp";
+
+// v2/GcpSettingsParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { GcpProviderId } from "./GcpProviderId";
+
+/**
+ * GCP configuration fields. Credential-file paths refer to the app-server host.
+ */
+export type GcpSettingsParams = { providerId: GcpProviderId, projectId?: string | null, location?: string | null, credentialFile?: string | null, };
 
 // v2/GcpSetupParams.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -4479,7 +4639,23 @@ rateLimitUpsell: JsonValue | null, };
 import type { Account } from "./Account";
 import type { WorkspaceRouting } from "./WorkspaceRouting";
 
-export type GetAccountResponse = { account: Account | null, requiresOpenaiAuth: boolean, workspaceRouting: WorkspaceRouting | null, };
+export type GetAccountResponse = { account: Account | null,
+/**
+ * ChatGPT user ID belonging to this account response, when available.
+ */
+userId: string | null, requiresOpenaiAuth: boolean, workspaceRouting: WorkspaceRouting | null, };
+
+// v2/GetAccountSecuritySetupResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { AccountSecuritySetupNotice } from "./AccountSecuritySetupNotice";
+
+/**
+ * Optional security reminder bound to the account that fetched it. Unavailable or
+ * ineligible accounts return no notice; this read never changes account security.
+ */
+export type GetAccountSecuritySetupResponse = { notice: AccountSecuritySetupNotice | null, };
 
 // v2/GetAccountTokenUsageParams.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -4824,6 +5000,11 @@ callable: boolean, };
 import type { ThreadItem } from "./ThreadItem";
 
 export type ItemCompletedNotification = { item: ThreadItem, threadId: string, turnId: string,
+/**
+ * Native content tokens for the completed assistant message, including a sampled footer.
+ * Null when unavailable. Completion telemetry is not part of the stored thread item.
+ */
+contentTokenCount?: number | null,
 /**
  * Unix timestamp (in milliseconds) when this item lifecycle completed.
  */
@@ -5307,9 +5488,14 @@ export type McpElicitationUntitledSingleSelectEnumSchema = { type: McpElicitatio
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { JsonValue } from "../serde_json/JsonValue";
 import type { McpResourceReadTarget } from "./McpResourceReadTarget";
 
-export type McpResourceReadParams = { threadId?: string | null,
+export type McpResourceReadParams = {
+/**
+ * Additional MCP request metadata. Account and turn routing keys are reserved.
+ */
+_meta?: { [key in string]?: JsonValue } | null, threadId?: string | null,
 /**
  * Originating MCP tool call used to select the resource's app.
  */
@@ -5790,6 +5976,10 @@ export type ModelAvailabilityNux = { message: string, };
 
 export type ModelListParams = {
 /**
+ * List models for this configured provider instead of the app-server default.
+ */
+modelProvider?: string | null,
+/**
  * Opaque pagination cursor returned by a previous call.
  */
 cursor?: string | null,
@@ -5829,6 +6019,22 @@ export type ModelProviderCapabilitiesReadParams = Record<string, never>;
 
 export type ModelProviderCapabilitiesReadResponse = { imageGeneration: boolean, webSearch: boolean, };
 
+// v2/ModelProviderConfigWriteParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ProviderSettingsPatch } from "./ProviderSettingsPatch";
+
+export type ModelProviderConfigWriteParams = { settings: ProviderSettingsPatch, };
+
+// v2/ModelProviderConfigWriteResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ModelProviderSummary } from "./ModelProviderSummary";
+
+export type ModelProviderConfigWriteResponse = { provider: ModelProviderSummary, };
+
 // v2/ModelProviderError.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
@@ -5838,6 +6044,37 @@ export type ModelProviderCapabilitiesReadResponse = { imageGeneration: boolean, 
  * Structured JSON-RPC error data. Unknown errors must retain the client's normal fallback.
  */
 export type ModelProviderError = { "type": "modelProviderMismatch", modelProvider: string, currentModelProvider: string, } | { "type": "modelProviderNotConfigured", modelProvider: string, } | { "type": "modelProviderPolicyConflict", modelProvider: string, requiredModelProvider: string, };
+
+// v2/ModelProviderListParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ModelProviderListParams = Record<string, never>;
+
+// v2/ModelProviderListResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ModelProviderSummary } from "./ModelProviderSummary";
+
+export type ModelProviderListResponse = { data: Array<ModelProviderSummary>, defaultProviderId: string, canChangeDefault: boolean, };
+
+// v2/ModelProviderSummary.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ProviderSettings } from "./ProviderSettings";
+
+export type ModelProviderSummary = { id: string, name: string,
+/**
+ * Whether a supported configuration field can be edited in the active user layer.
+ */
+canEdit: boolean,
+/**
+ * Null when the endpoint is absent or cannot be safely displayed.
+ */
+baseUrl: string | null, settings: ProviderSettings, };
 
 // v2/ModelRerouteReason.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -6298,7 +6535,7 @@ import type { AbsolutePathBuf } from "../AbsolutePathBuf";
 export type PluginInterface = { displayName: string | null, shortDescription: string | null, longDescription: string | null, developerName: string | null, category: string | null, capabilities: Array<string>, websiteUrl: string | null, privacyPolicyUrl: string | null, termsOfServiceUrl: string | null,
 /**
  * Starter prompts for the plugin. Capped at 3 entries with a maximum of
- * 128 characters per entry.
+ * 512 characters per entry.
  */
 defaultPrompt: Array<string> | null, brandColor: string | null,
 /**
@@ -7183,13 +7420,42 @@ import type { Project } from "./Project";
 
 export type ProjectUpdateResponse = { project: Project, };
 
+// v2/ProviderSettings.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { GatewayAuth } from "./GatewayAuth";
+
+export type ProviderSettings = { "type": "openai" } | { "type": "customGateway", auth: GatewayAuth, } | { "type": "bedrock", profile: string | null, region: string | null, } | { "type": "gcp", projectId: string | null, location: string | null,
+/**
+ * Path on the app-server host, without credential-file contents.
+ */
+credentialFile: string | null, };
+
+// v2/ProviderSettingsPatch.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { BedrockSettingsParams } from "./BedrockSettingsParams";
+import type { CustomGatewaySettingsParams } from "./CustomGatewaySettingsParams";
+import type { GcpSettingsParams } from "./GcpSettingsParams";
+
+/**
+ * Omitted patch fields preserve their values. Explicit null clears a nullable field.
+ */
+export type ProviderSettingsPatch = { "type": "customGateway" } & CustomGatewaySettingsParams | { "type": "bedrock" } & BedrockSettingsParams | { "type": "gcp" } & GcpSettingsParams;
+
 // v2/QueuedSubmission.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 import type { UserInput } from "./UserInput";
 
-export type QueuedSubmission = { id: string, input: Array<UserInput>, clientUserMessageId: string, };
+export type QueuedSubmission = { id: string, input: Array<UserInput>, clientUserMessageId: string,
+/**
+ * Metadata retained with this input, including across reconnect and restoration.
+ */
+responsesapiClientMetadata: { [key in string]?: string } | null, };
 
 // v2/RateLimitReachedType.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -7973,6 +8239,10 @@ sessionId: string,
  */
 forkedFromId: string | null,
 /**
+ * Parent that owns this persisted attached thread, independent of fork or spawn lineage.
+ */
+attachedToThreadId: string | null,
+/**
  * The ID of the parent thread. This will only be set if this thread is a subagent.
  */
 parentThreadId: string | null,
@@ -8706,7 +8976,7 @@ import type { ThreadGuardianAssessment } from "./ThreadGuardianAssessment";
 
 export type ThreadGuardianReviewResponse = { callId: string,
 /**
- * Null when exec policy skips approval.
+ * Null when current policy or a remembered approval skips review.
  */
 assessment: ThreadGuardianAssessment | null, };
 
@@ -8781,6 +9051,7 @@ import type { SleepItem } from "../SleepItem";
 import type { WebSearchItem } from "../WebSearchItem";
 import type { JsonValue } from "../serde_json/JsonValue";
 import type { AgentMessageDelivery } from "./AgentMessageDelivery";
+import type { AgentMessageModeration } from "./AgentMessageModeration";
 import type { AsyncUserInputQuestion } from "./AsyncUserInputQuestion";
 import type { CollabAgentState } from "./CollabAgentState";
 import type { CollabAgentTool } from "./CollabAgentTool";
@@ -8813,7 +9084,7 @@ startedAtMs?: number | null,
 /**
  * Unix timestamp in milliseconds when the item completed, if recorded.
  */
-completedAtMs?: number | null, } & ({ "type": "userMessage", id: string, clientId: string | null, content: Array<UserInput>, } | { "type": "hookPrompt", id: string, fragments: Array<HookPromptFragment>, } | { "type": "agentMessage", id: string, text: string, phase: MessagePhase | null, memoryCitation: MemoryCitation | null, delivery: AgentMessageDelivery | null, questions: Array<AsyncUserInputQuestion> | null, } | { "type": "functionCallOutput", id: string, name: string, namespace: string | null, output: FunctionCallOutputBody, } | { "type": "plan", id: string, text: string, } | { "type": "reasoning", id: string, summary: Array<string>, content: Array<string>, } | { "type": "commandExecution", id: string,
+completedAtMs?: number | null, } & ({ "type": "userMessage", id: string, clientId: string | null, content: Array<UserInput>, } | { "type": "hookPrompt", id: string, fragments: Array<HookPromptFragment>, } | { "type": "agentMessage", moderation: AgentMessageModeration | null, id: string, text: string, phase: MessagePhase | null, memoryCitation: MemoryCitation | null, delivery: AgentMessageDelivery | null, questions: Array<AsyncUserInputQuestion> | null, } | { "type": "functionCallOutput", id: string, name: string, namespace: string | null, output: FunctionCallOutputBody, } | { "type": "plan", id: string, text: string, } | { "type": "reasoning", id: string, summary: Array<string>, content: Array<string>, } | { "type": "commandExecution", id: string,
 /**
  * Trusted first-party plugin id when this command resolves to one plugin script.
  */
@@ -8926,6 +9197,10 @@ export type ThreadItemEntry = {
  */
 turnId: string, item: ThreadItem,
 /**
+ * The saved output was omitted. Fetch the complete item with `thread/items/read`.
+ */
+outputDeferred?: boolean,
+/**
  * Unix timestamp (milliseconds) when the item started, if recorded by the producer.
  */
 startedAtMs: number | null,
@@ -8933,6 +9208,21 @@ startedAtMs: number | null,
  * Unix timestamp (milliseconds) when the item completed, if recorded by the producer.
  */
 completedAtMs: number | null, };
+
+// v2/ThreadItemOutputDeferral.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ThreadItemOutputDeferral = {
+/**
+ * Defer nonempty output from successful commands.
+ */
+commandExecution?: boolean,
+/**
+ * Defer nonempty plain-text results from successful MCP tool calls.
+ */
+mcpToolCall?: boolean, };
 
 // v2/ThreadItemsListAnchor.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -8960,6 +9250,7 @@ export type ThreadItemsListCursor = string | ThreadItemsListAnchor;
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 import type { SortDirection } from "./SortDirection";
+import type { ThreadItemOutputDeferral } from "./ThreadItemOutputDeferral";
 import type { ThreadItemsListCursor } from "./ThreadItemsListCursor";
 
 export type ThreadItemsListParams = { threadId: string,
@@ -8980,7 +9271,11 @@ limit?: number | null,
 /**
  * Optional item pagination direction; defaults to ascending.
  */
-sortDirection?: SortDirection | null, };
+sortDirection?: SortDirection | null,
+/**
+ * For a single turn, choose which saved outputs to fetch separately by item ID.
+ */
+deferOutput?: ThreadItemOutputDeferral | null, };
 
 // v2/ThreadItemsListResponse.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -9034,6 +9329,14 @@ import type { ThreadSortKey } from "./ThreadSortKey";
 import type { ThreadSourceKind } from "./ThreadSourceKind";
 
 export type ThreadListParams = {
+/**
+ * Include persistent threads attached to a parent when searching by title.
+ */
+includeAttachedThreads?: boolean,
+/**
+ * Show local history visible to the current ChatGPT account. Defaults to false.
+ */
+currentAccountOnly?: boolean,
 /**
  * Opaque pagination cursor returned by a previous call.
  */
@@ -9304,6 +9607,31 @@ import type { ThreadPredictionResult } from "./ThreadPredictionResult";
 
 export type ThreadPredictionUpdatedNotification = { threadId: string, sourceTurnId: string, result: ThreadPredictionResult, };
 
+// v2/ThreadPrepareApprovedPlanParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * Prepare an approved plan for the first turn of a fresh thread.
+ */
+export type ThreadPrepareApprovedPlanParams = { threadId: string, markdown: string,
+/**
+ * Absolute path to the optional app-server copy of the plan.
+ */
+attachmentPath?: string | null, };
+
+// v2/ThreadPrepareApprovedPlanResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ThreadPrepareApprovedPlanResponse = {
+/**
+ * Initial user prompt. If no attachment is readable, the plan is already in the thread's context.
+ */
+prompt: string, };
+
 // v2/ThreadProjectUpdatedNotification.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
@@ -9317,7 +9645,11 @@ export type ThreadProjectUpdatedNotification = { threadId: string, projectId: st
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 import type { UserInput } from "./UserInput";
 
-export type ThreadQueueAddParams = { threadId: string, input: Array<UserInput>, clientUserMessageId: string, };
+export type ThreadQueueAddParams = { threadId: string, input: Array<UserInput>, clientUserMessageId: string,
+/**
+ * ResponsesAPI metadata captured from the client submitting this input.
+ */
+responsesapiClientMetadata?: { [key in string]?: string } | null, };
 
 // v2/ThreadQueueAddResponse.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -9410,7 +9742,11 @@ export type ThreadQueueStartResponse = { turn: Turn, };
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 import type { UserInput } from "./UserInput";
 
-export type ThreadQueueUpdateParams = { threadId: string, queuedSubmissionId: string, input: Array<UserInput>, };
+export type ThreadQueueUpdateParams = { threadId: string, queuedSubmissionId: string, input: Array<UserInput>,
+/**
+ * Non-empty metadata replaces the input's metadata; omission or an empty map preserves it.
+ */
+responsesapiClientMetadata?: { [key in string]?: string } | null, };
 
 // v2/ThreadQueueUpdateResponse.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -10144,10 +10480,13 @@ import type { ThreadSource } from "./ThreadSource";
 
 export type ThreadSampleParams = { threadId: string,
 /**
- * The loaded source's latest completed, failed, or interrupted turn.
- * Stale or active sources are rejected.
+ * The loaded source's latest turn, which must be finished (completed, failed, or interrupted) unless `allowInProgressTurn` is true.
  */
-expectedTurnId: string, prompt: string,
+expectedTurnId: string,
+/**
+ * Allow sampling the latest turn before it finishes.
+ */
+allowInProgressTurn?: boolean, prompt: string,
 /**
  * Applied only when the provider and model support cache-preserving reasoning-effort updates.
  */
@@ -10243,6 +10582,14 @@ import type { ThreadSearchSortKey } from "./ThreadSearchSortKey";
 import type { ThreadSourceKind } from "./ThreadSourceKind";
 
 export type ThreadSearchParams = {
+/**
+ * Include persistent threads attached to a parent in search results.
+ */
+includeAttachedThreads?: boolean,
+/**
+ * Show local history visible to the current ChatGPT account. Defaults to false.
+ */
+currentAccountOnly?: boolean,
 /**
  * Opaque pagination cursor returned by a previous call.
  */
@@ -10548,12 +10895,18 @@ import type { ActivePermissionProfile } from "./ActivePermissionProfile";
 import type { ApprovalsReviewer } from "./ApprovalsReviewer";
 import type { AskForApproval } from "./AskForApproval";
 import type { SandboxPolicy } from "./SandboxPolicy";
+import type { ThreadEnvironment } from "./ThreadEnvironment";
 
 export type ThreadSettings = {
 /**
  * Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.
  */
-disabledPluginIds: Array<string>, cwd: AbsolutePathBuf, approvalPolicy: AskForApproval, approvalsReviewer: ApprovalsReviewer, sandboxPolicy: SandboxPolicy, activePermissionProfile: ActivePermissionProfile | null, model: string, modelProvider: string, serviceTier: string | null, effort: ReasoningEffort | null, summary: ReasoningSummary | null, collaborationMode: CollaborationMode,
+disabledPluginIds: Array<string>, cwd: AbsolutePathBuf,
+/**
+ * Environments configured for future turns, in priority order, primary first.
+ * `null` means the server does not expose the selection; [] means none are selected.
+ */
+environments: Array<ThreadEnvironment> | null, approvalPolicy: AskForApproval, approvalsReviewer: ApprovalsReviewer, sandboxPolicy: SandboxPolicy, activePermissionProfile: ActivePermissionProfile | null, model: string, modelProvider: string, serviceTier: string | null, effort: ReasoningEffort | null, summary: ReasoningSummary | null, collaborationMode: CollaborationMode,
 /**
  * @deprecated Always `explicitRequestOnly`. Use `effort` for Ultra behavior.
  */
@@ -10575,6 +10928,7 @@ import type { ReasoningSummary } from "../ReasoningSummary";
 import type { ApprovalsReviewer } from "./ApprovalsReviewer";
 import type { AskForApproval } from "./AskForApproval";
 import type { SandboxPolicy } from "./SandboxPolicy";
+import type { TurnEnvironmentParams } from "./TurnEnvironmentParams";
 
 export type ThreadSettingsUpdateParams = { threadId: string,
 /**
@@ -10586,6 +10940,12 @@ disabledPluginIds?: Array<string> | null,
  * Override the working directory for subsequent turns.
  */
 cwd?: string | null,
+/**
+ * Replace the environments for future turns without changing the running turn.
+ * Omitted/null preserves the selection unless `cwd` is also provided, which selects
+ * the default environments for that directory. [] clears the selection.
+ */
+environments?: Array<TurnEnvironmentParams> | null,
 /**
  * Override the approval policy for subsequent turns.
  */
@@ -11252,6 +11612,7 @@ export type TurnPlanUpdatedNotification = { threadId: string, turnId: string, ex
 import type { ReasoningEffort } from "../ReasoningEffort";
 import type { ReasoningSummary } from "../ReasoningSummary";
 import type { ApprovalsReviewer } from "./ApprovalsReviewer";
+import type { TurnEnvironmentParams } from "./TurnEnvironmentParams";
 
 /**
  * Experimental settings changes for one running turn, not future turns.
@@ -11265,6 +11626,11 @@ export type TurnSettingsUpdateParams = { threadId: string, turnId: string,
  * Already captured steps and pending approvals retain their original reviewer.
  */
 approvalsReviewer?: ApprovalsReviewer | null,
+/**
+ * Replace the environments for subsequent steps of this turn, not future turns.
+ * Omitted/null preserves the selection; [] clears it. An already-started step is unchanged.
+ */
+environments?: Array<TurnEnvironmentParams> | null,
 /**
  * Omission or `null` leaves the model unchanged.
  */
@@ -11849,6 +12215,8 @@ export type { Account } from "./Account";
 export type { AccountLoginCompletedNotification } from "./AccountLoginCompletedNotification";
 export type { AccountRateLimitsUpdatedNotification } from "./AccountRateLimitsUpdatedNotification";
 export type { AccountRoutingOverride } from "./AccountRoutingOverride";
+export type { AccountSecuritySetupAction } from "./AccountSecuritySetupAction";
+export type { AccountSecuritySetupNotice } from "./AccountSecuritySetupNotice";
 export type { AccountSession } from "./AccountSession";
 export type { AccountSessionWorkspace } from "./AccountSessionWorkspace";
 export type { AccountSessionWorkspaceKind } from "./AccountSessionWorkspaceKind";
@@ -11869,6 +12237,8 @@ export type { AdditionalNetworkPermissions } from "./AdditionalNetworkPermission
 export type { AdditionalPermissionProfile } from "./AdditionalPermissionProfile";
 export type { AgentMessageDelivery } from "./AgentMessageDelivery";
 export type { AgentMessageDeltaNotification } from "./AgentMessageDeltaNotification";
+export type { AgentMessageDisplay } from "./AgentMessageDisplay";
+export type { AgentMessageModeration } from "./AgentMessageModeration";
 export type { AllowDenyRequirement } from "./AllowDenyRequirement";
 export type { AnalyticsConfig } from "./AnalyticsConfig";
 export type { AppBranding } from "./AppBranding";
@@ -11910,6 +12280,8 @@ export type { BedrockCheckGovCloudRequirementsResponse } from "./BedrockCheckGov
 export type { BedrockDiscoverParams } from "./BedrockDiscoverParams";
 export type { BedrockDiscoverResponse } from "./BedrockDiscoverResponse";
 export type { BedrockEnvironmentCredential } from "./BedrockEnvironmentCredential";
+export type { BedrockProviderId } from "./BedrockProviderId";
+export type { BedrockSettingsParams } from "./BedrockSettingsParams";
 export type { BedrockSetupParams } from "./BedrockSetupParams";
 export type { BedrockSetupResponse } from "./BedrockSetupResponse";
 export type { BrowserUseAccessApprovalLifetime } from "./BrowserUseAccessApprovalLifetime";
@@ -11986,6 +12358,7 @@ export type { ContextCompactedNotification } from "./ContextCompactedNotificatio
 export type { CreditsSnapshot } from "./CreditsSnapshot";
 export type { CurrentTimeReadParams } from "./CurrentTimeReadParams";
 export type { CurrentTimeReadResponse } from "./CurrentTimeReadResponse";
+export type { CustomGatewaySettingsParams } from "./CustomGatewaySettingsParams";
 export type { CyberAccessProgram } from "./CyberAccessProgram";
 export type { DeprecationNoticeNotification } from "./DeprecationNoticeNotification";
 export type { DesktopOnboardingEntrypoint } from "./DesktopOnboardingEntrypoint";
@@ -12072,17 +12445,24 @@ export type { FsWatchParams } from "./FsWatchParams";
 export type { FsWatchResponse } from "./FsWatchResponse";
 export type { FsWriteFileParams } from "./FsWriteFileParams";
 export type { FsWriteFileResponse } from "./FsWriteFileResponse";
+export type { GatewayAuth } from "./GatewayAuth";
 export type { GatewayOAuthCancelResponse } from "./GatewayOAuthCancelResponse";
 export type { GatewayOAuthChangedNotification } from "./GatewayOAuthChangedNotification";
+export type { GatewayOAuthLoginParams } from "./GatewayOAuthLoginParams";
 export type { GatewayOAuthLoginResponse } from "./GatewayOAuthLoginResponse";
+export type { GatewayOAuthPrompt } from "./GatewayOAuthPrompt";
+export type { GatewayOAuthReadParams } from "./GatewayOAuthReadParams";
 export type { GatewayOAuthReadResponse } from "./GatewayOAuthReadResponse";
 export type { GatewayOAuthStatus } from "./GatewayOAuthStatus";
+export type { GcpProviderId } from "./GcpProviderId";
+export type { GcpSettingsParams } from "./GcpSettingsParams";
 export type { GcpSetupParams } from "./GcpSetupParams";
 export type { GcpSetupResponse } from "./GcpSetupResponse";
 export type { GetAccountParams } from "./GetAccountParams";
 export type { GetAccountRateLimitsParams } from "./GetAccountRateLimitsParams";
 export type { GetAccountRateLimitsResponse } from "./GetAccountRateLimitsResponse";
 export type { GetAccountResponse } from "./GetAccountResponse";
+export type { GetAccountSecuritySetupResponse } from "./GetAccountSecuritySetupResponse";
 export type { GetAccountTokenUsageParams } from "./GetAccountTokenUsageParams";
 export type { GetAccountTokenUsageResponse } from "./GetAccountTokenUsageResponse";
 export type { GetWorkspaceMessagesResponse } from "./GetWorkspaceMessagesResponse";
@@ -12210,7 +12590,12 @@ export type { ModelListParams } from "./ModelListParams";
 export type { ModelListResponse } from "./ModelListResponse";
 export type { ModelProviderCapabilitiesReadParams } from "./ModelProviderCapabilitiesReadParams";
 export type { ModelProviderCapabilitiesReadResponse } from "./ModelProviderCapabilitiesReadResponse";
+export type { ModelProviderConfigWriteParams } from "./ModelProviderConfigWriteParams";
+export type { ModelProviderConfigWriteResponse } from "./ModelProviderConfigWriteResponse";
 export type { ModelProviderError } from "./ModelProviderError";
+export type { ModelProviderListParams } from "./ModelProviderListParams";
+export type { ModelProviderListResponse } from "./ModelProviderListResponse";
+export type { ModelProviderSummary } from "./ModelProviderSummary";
 export type { ModelRerouteReason } from "./ModelRerouteReason";
 export type { ModelReroutedNotification } from "./ModelReroutedNotification";
 export type { ModelSafetyBufferingUpdatedNotification } from "./ModelSafetyBufferingUpdatedNotification";
@@ -12327,6 +12712,8 @@ export type { ProjectRoot } from "./ProjectRoot";
 export type { ProjectSortKey } from "./ProjectSortKey";
 export type { ProjectUpdateParams } from "./ProjectUpdateParams";
 export type { ProjectUpdateResponse } from "./ProjectUpdateResponse";
+export type { ProviderSettings } from "./ProviderSettings";
+export type { ProviderSettingsPatch } from "./ProviderSettingsPatch";
 export type { QueuedSubmission } from "./QueuedSubmission";
 export type { RateLimitReachedType } from "./RateLimitReachedType";
 export type { RateLimitResetCredit } from "./RateLimitResetCredit";
@@ -12468,6 +12855,7 @@ export type { ThreadInjectItemsParams } from "./ThreadInjectItemsParams";
 export type { ThreadInjectItemsResponse } from "./ThreadInjectItemsResponse";
 export type { ThreadItem } from "./ThreadItem";
 export type { ThreadItemEntry } from "./ThreadItemEntry";
+export type { ThreadItemOutputDeferral } from "./ThreadItemOutputDeferral";
 export type { ThreadItemsListAnchor } from "./ThreadItemsListAnchor";
 export type { ThreadItemsListCursor } from "./ThreadItemsListCursor";
 export type { ThreadItemsListParams } from "./ThreadItemsListParams";
@@ -12490,6 +12878,8 @@ export type { ThreadPredictionRequestParams } from "./ThreadPredictionRequestPar
 export type { ThreadPredictionRequestResponse } from "./ThreadPredictionRequestResponse";
 export type { ThreadPredictionResult } from "./ThreadPredictionResult";
 export type { ThreadPredictionUpdatedNotification } from "./ThreadPredictionUpdatedNotification";
+export type { ThreadPrepareApprovedPlanParams } from "./ThreadPrepareApprovedPlanParams";
+export type { ThreadPrepareApprovedPlanResponse } from "./ThreadPrepareApprovedPlanResponse";
 export type { ThreadProjectUpdatedNotification } from "./ThreadProjectUpdatedNotification";
 export type { ThreadQueueAddParams } from "./ThreadQueueAddParams";
 export type { ThreadQueueAddResponse } from "./ThreadQueueAddResponse";

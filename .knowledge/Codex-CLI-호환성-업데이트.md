@@ -83,6 +83,12 @@ Codex 0.x.y 기준으로 호환성 업데이트해
 
 ## 확인 기록
 
+### 2026-11-16 Codex 0.169.0 기준 갱신 — 코드 변경 없음
+
+- 0.167.0→0.169.0 스키마는 `account/securitySetup/read`·`modelProvider/list`·`modelProvider/config/write`·`thread/prepareApprovedPlan` 요청과 선택 필드(`moderation`, `contentTokenCount`, `environments`, `outputDeferred`, `currentAccountOnly` 등), 오류 값 `inferenceHookDenied` 추가뿐이다. 서버 요청·알림 메서드는 변하지 않았고 `suggest` API도 없다.
+- `thread/list`의 `currentAccountOnly` 기본값은 false라 재개 목록은 그대로다. `codex exec`의 미신뢰 폴더 설정 차단은 제목·제안 실행이 임시 폴더와 `--ignore-user-config`를 써서 영향이 없다.
+- 실제 0.169.0 app-server 모델 목록 8개는 모두 단가 표에 있다.
+
 ### 2026-09-10 필수 호환성 수정 및 검수 — 미배포
 
 - 병렬 구현 범위는 승인된 네 항목뿐이다. Codex 요청 분기와 MCP 표시, Claude SDK 상향·사용량 최적화를 분리 구현하고 독립 읽기 전용 검수와 별도 MCP 실행 검증을 수행했다. 의도적인 질문 중단 방식·권한 정책은 유지했다.

@@ -23,14 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude Code 2.1.321을 적용해 `/model`에서 Claude Fable 5.2를 선택할 수 있습니다.",
-    "`/auto-knowledge`를 꺼도 지식 문서 기록을 막지 않고, 필요하면 모델이 판단해 기록합니다.",
+    "Claude Code 2.1.325를 적용하고, Claude Fable 5.2의 1M 컨텍스트 표시와 비용 계산 단가를 바로잡았습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Applied Claude Code 2.1.321 so you can select Claude Fable 5.2 in `/model`.",
-    "Turning `/auto-knowledge` off no longer blocks knowledge notes; the model records them when it judges them worth keeping.",
+    "Applied Claude Code 2.1.325 and fixed Claude Fable 5.2's 1M context display and cost rates.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");
