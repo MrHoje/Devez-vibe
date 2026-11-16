@@ -23,12 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude Code 2.1.325를 적용하고, Claude Fable 5.2의 1M 컨텍스트 표시와 비용 계산 단가를 바로잡았습니다.",
+    "Codex에서 Computer Use 중 첫 Esc는 컴퓨터 조작만 중단하고, 다음 Esc는 진행 중인 요청을 중단합니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Applied Claude Code 2.1.325 and fixed Claude Fable 5.2's 1M context display and cost rates.",
+    "In Codex, the first Esc during Computer Use stops only computer control; the next Esc interrupts the ongoing request.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

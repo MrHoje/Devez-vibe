@@ -52,6 +52,8 @@ struct ActiveTurn {
     computer: bool,
     computer_calls: BTreeSet<String>,
     armed_generation: u64,
+    computer_stopped: bool,
+    native_stop_generation: Option<u64>,
     stop_requested: bool,
     stop_version: u64,
     interrupt_sent: bool,
@@ -59,6 +61,18 @@ struct ActiveTurn {
     marker_seen: bool,
     session: Option<String>,
     cwd: Option<String>,
+}
+
+impl ActiveTurn {
+    fn stop_computer(&mut self, generation: u64) -> bool {
+        self.computer = true;
+        if self.computer_stopped {
+            return false;
+        }
+        self.computer_stopped = true;
+        self.native_stop_generation = Some(generation);
+        true
+    }
 }
 
 #[derive(Default, Clone)]
@@ -136,7 +150,7 @@ impl State {
             self.generation = self.generation.wrapping_add(1).max(1);
         }
         for (turn, active) in &mut self.turns {
-            if active.computer_calls.is_empty() && !active.stop_requested {
+            if active.computer_calls.is_empty() && !active.computer_stopped && !active.stop_requested {
                 active.armed_generation = 0;
             } else if active.armed_generation == 0 || !previous.contains(turn) {
                 active.armed_generation = self.generation;
@@ -210,9 +224,10 @@ impl State {
                     } else if computer {
                         active.computer_calls.insert(id.to_owned());
                     }
-                    if stopped && !active.stop_requested {
-                        active.stop_version = active.stop_version.wrapping_add(1);
-                        active.stop_requested = true;
+                    if stopped && active.stop_computer(self.generation) {
+                        // A new press after the native stop must differ from an
+                        // already queued signal for the key that caused the stop.
+                        self.generation = self.generation.wrapping_add(1).max(1);
                     }
                 }
             }
@@ -249,7 +264,7 @@ impl State {
     fn escape_targets(&self) -> Vec<Turn> {
         self.turns
             .iter()
-            .filter(|(_, active)| !active.computer_calls.is_empty() || active.stop_requested)
+            .filter(|(_, active)| !active.computer_calls.is_empty() || active.computer_stopped || active.stop_requested)
             .map(|(turn, _)| turn.clone())
             .collect()
     }
@@ -266,9 +281,19 @@ impl State {
             .filter(|active| {
                 active.armed_generation != 0
                     && active.armed_generation <= generation
-                    && (!active.computer_calls.is_empty() || active.stop_requested)
+                    && (!active.computer_calls.is_empty() || active.computer_stopped || active.stop_requested)
             })
         {
+            if active.native_stop_generation.is_some_and(|stopped| generation <= stopped) {
+                active.native_stop_generation = None;
+                continue;
+            }
+            // The native helper receives this same key and stops input injection.
+            // Only a new physical press may also stop the surrounding model turn.
+            if !active.computer_stopped {
+                active.computer_stopped = true;
+                continue;
+            }
             active.stop_requested = true;
             active.stop_version = active.stop_version.wrapping_add(1);
             active.interrupt_sent = false; // a fresh press can retry a failed stop
@@ -293,9 +318,9 @@ impl State {
                 })
             {
                 active.marker_seen = true;
-                active.computer = true;
-                active.stop_version = active.stop_version.wrapping_add(1);
-                active.stop_requested = true;
+                if active.stop_computer(self.generation) {
+                    self.generation = self.generation.wrapping_add(1).max(1);
+                }
             }
         }
         self.rearm(previous);
@@ -426,7 +451,7 @@ impl Observer {
         let ended = state.observe(method, params);
         let next = state.targets();
         *self.probe_gate.lock().expect("cursor probe gate") = next.is_empty();
-        // 종료 정리는 턴 전체를 추적하되 전역 Esc는 실행 중인 호출에만 적용한다.
+        // 종료 정리는 턴 전체를 추적하고, 첫 Esc 이후에는 다음 누름도 감지한다.
         self.arm.arm(if state.escape_targets().is_empty() { 0 } else { state.generation });
         if !next.is_empty() {
             self.enabled.store(true, Ordering::Release);
@@ -850,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_computer_calls_stay_interruptible_until_the_last_completion() {
+    fn overlapping_computer_calls_keep_the_two_press_stop_until_the_last_completion() {
         for finish_both in [false, true] {
             let mut state = State::default();
             state.observe("turn/started", &started("a", "1"));
@@ -865,6 +890,8 @@ mod tests {
             if finish_both {
                 state.observe("item/completed", &second);
             }
+            state.escape(state.generation);
+            assert!(take(&mut state).is_empty());
             state.escape(state.generation);
             assert_eq!(take(&mut state), if finish_both { vec![] } else { vec![turn("a", "1")] });
         }
@@ -883,6 +910,8 @@ mod tests {
         state.escape(generation);
         assert!(take(&mut state).is_empty());
         state.escape(state.generation);
+        assert!(take(&mut state).is_empty());
+        state.escape(state.generation);
         assert_eq!(take(&mut state), vec![turn("a", "1")]);
     }
 
@@ -896,6 +925,9 @@ mod tests {
         );
         state.generation = 4;
         state.escape(4);
+        assert!(take(&mut state).is_empty());
+        state.observe("item/completed", &item("a", "1", "cua_repl", "await tab.click()"));
+        state.escape(state.generation);
         assert_eq!(take(&mut state), vec![turn("a", "1")]);
         assert!(take(&mut state).is_empty());
         assert_eq!(state.targets(), vec![turn("a", "1")]); // ack is not completion
@@ -934,6 +966,8 @@ mod tests {
         }
         state.generation = 7;
         state.escape(7);
+        assert!(take(&mut state).is_empty());
+        state.escape(7);
         assert_eq!(take(&mut state), vec![turn("a", "1"), turn("b", "1")]);
         assert!(take(&mut state).is_empty());
         state.observe("turn/completed", &started("a", "1"));
@@ -947,12 +981,14 @@ mod tests {
     }
 
     #[test]
-    fn exact_helper_stop_error_is_promoted_to_turn_interrupt() {
+    fn exact_helper_stop_error_waits_for_another_escape() {
         let mut state = State::default();
         state.observe("turn/started", &started("a", "1"));
         let mut payload = item("a", "1", "node_repl", "alias.click({})");
         payload["item"]["result"] = json!({"content":[{"type":"text","text":format!("Error: {PHYSICAL_ESCAPE} Stop your work.")}]});
         state.observe("item/completed", &payload);
+        assert!(take(&mut state).is_empty());
+        state.escape(state.generation);
         assert_eq!(take(&mut state), vec![turn("a", "1")]);
         payload["item"]["server"] = json!("unrelated");
         assert!(!is_computer_stop(&payload["item"]));
@@ -960,6 +996,44 @@ mod tests {
         payload["item"]["result"]["content"][0]["text"] =
             json!(format!("Documentation says: {PHYSICAL_ESCAPE}"));
         assert!(!is_computer_stop(&payload["item"]));
+    }
+
+    #[test]
+    fn native_stop_and_the_first_queued_escape_never_interrupt_the_turn() {
+        for (native_first, queued_second) in [(false, false), (true, false), (true, true)] {
+            let mut state = State::default();
+            state.observe("turn/started", &started("a", "1"));
+            let mut call = item("a", "1", "cua_repl", "await tab.click()");
+            state.observe("item/started", &call);
+            let generation = state.generation;
+            call["item"]["error"] = json!({"message": PHYSICAL_ESCAPE});
+            if native_first {
+                state.observe("item/completed", &call);
+            }
+            state.escape(generation);
+            if !native_first {
+                state.observe("item/completed", &call);
+            }
+            assert!(take(&mut state).is_empty());
+            // Repeated tool results are not an additional key press either.
+            state.observe("item/completed", &call);
+            assert!(take(&mut state).is_empty());
+            state.escape(if queued_second { generation } else { state.generation });
+            assert_eq!(take(&mut state), vec![turn("a", "1")]);
+        }
+    }
+
+    #[test]
+    fn native_stop_without_a_hook_signal_uses_the_next_press_to_interrupt() {
+        let mut state = State::default();
+        state.observe("turn/started", &started("a", "1"));
+        let mut call = item("a", "1", "cua_repl", "await tab.click()");
+        state.observe("item/started", &call);
+        call["item"]["error"] = json!({"message": PHYSICAL_ESCAPE});
+        state.observe("item/completed", &call);
+        assert!(take(&mut state).is_empty());
+        state.escape(state.generation);
+        assert_eq!(take(&mut state), vec![turn("a", "1")]);
     }
 
     #[test]
@@ -975,6 +1049,8 @@ mod tests {
         assert!(take(&mut state).is_empty());
         state.observe("turn/started", &started("test-session", "old-turn"));
         state.mark_interrupts(Some(&home));
+        assert!(take(&mut state).is_empty());
+        state.escape(state.generation);
         assert_eq!(take(&mut state), vec![target]);
         assert!(marker.is_file()); // the SDK's stop boundary must not be bypassed
         std::fs::remove_dir_all(home).unwrap();
@@ -1035,6 +1111,8 @@ mod tests {
         state.observe("thread/started", &json!({"thread":{"id":"child-thread","sessionId":"root-session","parentThreadId":"parent","cwd":"C:/work"}}));
         state.observe("turn/started", &started("child-thread", "child-turn"));
         state.mark_interrupts(Some(&home));
+        assert!(take(&mut state).is_empty());
+        state.escape(state.generation);
         assert_eq!(take(&mut state), vec![turn("child-thread", "child-turn")]);
         std::fs::remove_dir_all(home).unwrap();
     }

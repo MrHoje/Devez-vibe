@@ -111,10 +111,18 @@ async fn terminal_report(
 /// Cancel-safe: the queued event is popped without an await before the return,
 /// and dropping the future only releases a lock.
 pub async fn next_event() -> Option<Incoming> {
-    if let Some(event) = deferred_event() {
+    loop {
+        let event = match deferred_event() {
+            Some(event) => event,
+            None => hub().events.lock().await.next().await?,
+        };
+        if matches!(&event, Ok(Event::Key(key)) if key.code == KeyCode::Esc)
+            && crate::computer_use_input::suppress_terminal_escape()
+        {
+            continue;
+        }
         return Some(event);
     }
-    hub().events.lock().await.next().await
 }
 
 pub fn deferred_event() -> Option<Incoming> {

@@ -1520,7 +1520,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn physical_escape_interrupts_the_native_pipe_turn_without_a_marker() {
+    async fn first_physical_escape_keeps_the_turn_running_and_second_interrupts() {
         let (client, mut messages) = computer_test_client();
         let (events, mut event_rx) = mpsc::unbounded_channel();
         let (input, input_rx) = mpsc::unbounded_channel();
@@ -1529,6 +1529,15 @@ mod tests {
         input.send(0).unwrap(); // Escape before any CU turn cannot cancel later work.
         tokio::task::yield_now().await;
         observe_computer_turn(&observer, "native-pipe-thread", "turn-1", "cua_repl");
+        input.send(monitor.generation()).unwrap();
+        assert!(timeout(Duration::from_millis(200), messages.recv()).await.is_err());
+        observer.observe(&json!({"method":"item/completed","params":{
+            "threadId":"native-pipe-thread","turnId":"turn-1","item":{
+                "id":"computer-call","type":"mcpToolCall","server":"cua_repl","tool":"js",
+                "error":{"message":"Computer Use was stopped by the user with the physical Escape key."}
+            }
+        }}));
+        assert!(timeout(Duration::from_millis(200), messages.recv()).await.is_err());
         input.send(monitor.generation()).unwrap();
         let request = timeout(Duration::from_secs(1), messages.recv()).await.unwrap().unwrap();
         assert_eq!(request["method"], "turn/interrupt");
@@ -1555,6 +1564,7 @@ mod tests {
         let generation = monitor.generation();
         observe_computer_turn(&observer, "b", "1", "cua_repl");
         input.send(generation).unwrap();
+        input.send(generation).unwrap();
         let request = timeout(Duration::from_secs(1), messages.recv()).await.unwrap().unwrap();
         assert_eq!(request["params"], json!({"threadId":"a","turnId":"1"}));
         acknowledge_computer_interrupt(&client, &request, &events, false).await;
@@ -1576,6 +1586,7 @@ mod tests {
         let monitor = crate::computer_use::Monitor::start_with_test_input(client.clone(), events.clone(), None, input_rx);
         observe_computer_turn(&monitor.observer(), "a", "1", "node_repl");
         input.send(monitor.generation()).unwrap();
+        input.send(monitor.generation()).unwrap();
         let request = timeout(Duration::from_secs(1), messages.recv()).await.unwrap().unwrap();
         monitor.observer().observe(&json!({"method":"item/completed","params":{
             "threadId":"a","turnId":"1","item":{"id":"computer-call","type":"mcpToolCall","server":"node_repl","tool":"js"}
@@ -1585,7 +1596,7 @@ mod tests {
         assert!(messages.try_recv().is_err());
         acknowledge_computer_interrupt(&client, &request, &events, true).await;
         assert!(matches!(timeout(Duration::from_secs(1), event_rx.recv()).await.unwrap(), Some(ServerEvent::ProtocolWarning(_))));
-        // The second press happened while A was pending; failure must preserve it.
+        // A fresh press happened while A was pending; failure must preserve it.
         let retry = timeout(Duration::from_secs(1), messages.recv()).await.unwrap().unwrap();
         assert_eq!(retry["params"], request["params"]);
         acknowledge_computer_interrupt(&client, &retry, &events, false).await;

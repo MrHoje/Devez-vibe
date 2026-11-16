@@ -6,11 +6,21 @@
 use std::{
     io,
     sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 use tokio::sync::mpsc::UnboundedReceiver;
+
+static TERMINAL_ESCAPES: Mutex<Vec<Weak<AtomicBool>>> = Mutex::new(Vec::new());
+
+/// A captured physical press also reaches the terminal. Let only the hook handle
+/// it, including repeats and terminal events delayed beyond the end of the turn.
+pub(crate) fn suppress_terminal_escape() -> bool {
+    let mut guards = TERMINAL_ESCAPES.lock().expect("terminal Escape guards");
+    guards.retain(|guard| guard.strong_count() != 0);
+    guards.iter().filter_map(Weak::upgrade).any(|guard| guard.load(Ordering::Acquire))
+}
 
 pub(crate) struct PhysicalEscape {
     arm: EscapeArmHandle,
@@ -38,7 +48,13 @@ impl PhysicalEscape {
         #[cfg(all(windows, not(test)))]
         {
             let arm = EscapeArmHandle::default();
-            let (inner, receiver) = platform::HookThread::start(Arc::clone(&arm.generation))?;
+            let captured = Arc::new(AtomicBool::new(false));
+            let (inner, receiver) =
+                platform::HookThread::start(Arc::clone(&arm.generation), captured.clone())?;
+            TERMINAL_ESCAPES
+                .lock()
+                .expect("terminal Escape guards")
+                .push(Arc::downgrade(&captured));
             Ok((Self { arm, _inner: inner }, receiver))
         }
         #[cfg(any(not(windows), test))]
@@ -59,6 +75,7 @@ impl PhysicalEscape {
 #[derive(Default)]
 struct EscapeDebounce {
     pressed: bool,
+    captured: bool,
 }
 
 #[cfg(any(windows, test))]
@@ -76,6 +93,9 @@ impl EscapeDebounce {
         }
         let was_pressed = self.pressed;
         self.pressed = pressed;
+        if pressed && !was_pressed {
+            self.captured = generation != 0;
+        }
         (pressed && !was_pressed && generation != 0).then_some(generation)
     }
 }
@@ -112,6 +132,7 @@ mod platform {
 
     struct HookContext {
         generation: Arc<AtomicU64>,
+        captured: Arc<AtomicBool>,
         sender: UnboundedSender<u64>,
         escape: EscapeDebounce,
     }
@@ -132,6 +153,7 @@ mod platform {
     impl HookThread {
         pub(super) fn start(
             generation: Arc<AtomicU64>,
+            captured: Arc<AtomicBool>,
         ) -> io::Result<(Self, UnboundedReceiver<u64>)> {
             let stopping = Arc::new(AtomicBool::new(false));
             let thread_id = Arc::new(Mutex::new(None));
@@ -144,7 +166,7 @@ mod platform {
                 thread::Builder::new()
                     .name("computer-use-escape".into())
                     .spawn(move || {
-                        run_hook(generation, stopping, thread_id, sender, ready_tx);
+                        run_hook(generation, captured, stopping, thread_id, sender, ready_tx);
                     })?
             };
             match ready_rx.recv() {
@@ -209,6 +231,7 @@ mod platform {
 
     fn run_hook(
         generation: Arc<AtomicU64>,
+        captured: Arc<AtomicBool>,
         stopping: Arc<AtomicBool>,
         thread_id: Arc<Mutex<Option<u32>>>,
         sender: UnboundedSender<u64>,
@@ -223,6 +246,7 @@ mod platform {
         CONTEXT.with(|context| {
             *context.borrow_mut() = Some(HookContext {
                 generation,
+                captured,
                 sender,
                 escape: EscapeDebounce::default(),
             });
@@ -281,13 +305,15 @@ mod platform {
                         };
                         if let Some(context) = context.as_mut() {
                             let generation = context.generation.load(Ordering::Acquire);
-                            if let Some(generation) = context.escape.observe(
+                            let signal = context.escape.observe(
                                 true,
                                 event.flags & LLKHF_INJECTED != 0,
                                 event.flags & LLKHF_LOWER_IL_INJECTED != 0,
                                 pressed,
                                 generation,
-                            ) {
+                            );
+                            context.captured.store(context.escape.captured, Ordering::Release);
+                            if let Some(generation) = signal {
                                 let _ = context.sender.send(generation);
                             }
                         }
@@ -303,6 +329,30 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "전역 터미널 입력을 사용하므로 이 검사만 단독 실행"]
+    async fn captured_escape_is_filtered_by_the_terminal_input_hub() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
+
+        let captured = Arc::new(AtomicBool::new(true));
+        TERMINAL_ESCAPES.lock().unwrap().push(Arc::downgrade(&captured));
+        let mut escape = KeyEvent::from(KeyCode::Esc);
+        crate::input_hub::defer(Ok(Event::Key(escape)));
+        escape.kind = KeyEventKind::Repeat;
+        crate::input_hub::defer(Ok(Event::Key(escape)));
+        let character = Event::Key(KeyEvent::from(KeyCode::Char('x')));
+        crate::input_hub::defer(Ok(character.clone()));
+        assert_eq!(crate::input_hub::next_event().await.unwrap().unwrap(), character);
+        assert!(crate::input_hub::deferred_event().is_none());
+
+        captured.store(false, Ordering::Release);
+        let escape = Event::Key(KeyEvent::from(KeyCode::Esc));
+        crate::input_hub::defer(Ok(escape.clone()));
+        assert_eq!(crate::input_hub::next_event().await.unwrap().unwrap(), escape);
+        drop(captured);
+        assert!(!suppress_terminal_escape());
+    }
 
     #[test]
     fn test_builds_never_install_desktop_hooks() {
@@ -362,6 +412,21 @@ mod tests {
         assert_eq!(escape.observe(true, false, false, true, 7), None);
         assert_eq!(escape.observe(true, false, false, false, 7), None);
         assert_eq!(escape.observe(true, false, false, true, 7), Some(7));
+    }
+
+    #[test]
+    fn captured_terminal_escape_stays_suppressed_until_a_new_unarmed_press() {
+        let mut escape = EscapeDebounce::default();
+        assert_eq!(escape.observe(true, false, false, true, 7), Some(7));
+        assert!(escape.captured);
+        assert_eq!(escape.observe(true, false, false, true, 0), None);
+        assert!(escape.captured, "repeats must not interrupt a new turn");
+        assert_eq!(escape.observe(true, true, false, false, 0), None);
+        assert!(escape.captured, "injected input must not release the physical guard");
+        assert_eq!(escape.observe(true, false, false, false, 0), None);
+        assert!(escape.captured, "terminal delivery may follow physical key-up");
+        assert_eq!(escape.observe(true, false, false, true, 0), None);
+        assert!(!escape.captured, "ordinary terminal Escape must work again");
     }
 
     #[test]
