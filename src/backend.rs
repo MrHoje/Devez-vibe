@@ -1034,7 +1034,6 @@ impl BackendServer {
                         backing,
                         codex_model,
                         prompt,
-                        self.codex.as_ref().and_then(AppServer::proxy),
                     );
                 }
             }

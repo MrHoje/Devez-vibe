@@ -16,7 +16,6 @@ use crate::terminal_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     agent::{self, AgentMode},
-    app_server::CodexProxySettings,
     completion::{
         CompletionCandidate, CompletionKind, CompletionMode, CompletionSource, CompletionTarget,
         completion_target, completion_text, filter_candidates, fuzzy_score,
@@ -689,7 +688,6 @@ const SLASH_COMMANDS: [SlashCommand; 38] = [
 fn is_slash_command_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("reload-skills")
         || name.eq_ignore_ascii_case("p")
-        || name.eq_ignore_ascii_case("proxy")
         || SLASH_COMMANDS
             .iter()
             .any(|command| command.name[1..].eq_ignore_ascii_case(name))
@@ -1352,7 +1350,6 @@ pub enum Action {
     /// Save whether completed progress responses stay visible or fold away.
     PersistResponseDisplayMode(ResponseDisplayMode),
     PersistAutoKnowledge(bool),
-    PersistCodexProxy(CodexProxySettings),
     PersistPromptSuggestions(bool),
     PersistLanguage(bool),
     /// Save the `/skin` default; empty clears it.
@@ -1738,15 +1735,6 @@ enum PendingInteraction {
     SettingPicker {
         setting: DisplaySetting,
         selected: usize,
-    },
-    CodexProxyChoice {
-        settings: CodexProxySettings,
-        selected: usize,
-    },
-    CodexProxyAddress {
-        editor: Editor,
-        paired: Option<reqwest::Url>,
-        invalid: bool,
     },
     ClaudePermissionsPanel {
         tab: usize,
@@ -3330,8 +3318,6 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
             | PendingInteraction::RuntimePicker { .. }
             | PendingInteraction::AgentPicker { .. }
             | PendingInteraction::SettingPicker { .. }
-            | PendingInteraction::CodexProxyChoice { .. }
-            | PendingInteraction::CodexProxyAddress { .. }
             | PendingInteraction::ClaudePermissionsPanel { .. }
             | PendingInteraction::ClaudePermissionScopePicker { .. }
             | PendingInteraction::ClaudePermissionRuleInput { .. }
@@ -5570,10 +5556,6 @@ impl AppState {
     /// Space reach their pending interaction immediately.
     pub fn has_pending_interaction(&self) -> bool {
         self.pending.is_some()
-    }
-
-    pub fn proxy_address_input_active(&self) -> bool {
-        matches!(self.pending, Some(PendingInteraction::CodexProxyAddress { .. }))
     }
 
     /// The free-text row is an editor as soon as it owns focus, matching Claude
@@ -8586,19 +8568,6 @@ impl AppState {
             Some(PendingInteraction::MarketplacePicker(picker)) => picker.handle_paste(text),
             Some(PendingInteraction::ProviderPicker(picker)) => picker.handle_paste(text),
             Some(PendingInteraction::ProviderOAuthCode { editor, .. }) => editor.insert_str(text),
-            Some(PendingInteraction::CodexProxyAddress { editor, paired, invalid }) => {
-                if let Some(url) = CodexProxySettings::parse_address(text).filter(|url| url.password().is_some()) {
-                    editor.set_text(CodexProxySettings::displayed_address(&url));
-                    *paired = Some(url);
-                    *invalid = false;
-                } else if text.contains('@') {
-                    *invalid = true;
-                } else {
-                    editor.insert_str(text);
-                    *paired = None;
-                    *invalid = false;
-                }
-            }
             Some(PendingInteraction::SkinRgb { editor, invalid }) => {
                 editor.insert_str(text);
                 *invalid = false;
@@ -9444,8 +9413,6 @@ impl AppState {
                     | PendingInteraction::RuntimePicker { .. }
                     | PendingInteraction::AgentPicker { .. }
                     | PendingInteraction::SettingPicker { .. }
-                    | PendingInteraction::CodexProxyChoice { .. }
-                    | PendingInteraction::CodexProxyAddress { .. }
                     | PendingInteraction::ClaudePermissionsPanel { .. }
                     | PendingInteraction::ClaudePermissionScopePicker { .. }
                     | PendingInteraction::VibeModePicker { .. }
@@ -11475,14 +11442,6 @@ impl AppState {
             }
         }
         match parts.first().copied().unwrap_or_default() {
-            "/proxy" => {
-                let settings = CodexProxySettings::load().unwrap_or_else(|error| {
-                    self.push_notice(BlockKind::Warning, "Could not load Codex proxy", error.to_string());
-                    CodexProxySettings::default()
-                });
-                self.pending = Some(PendingInteraction::CodexProxyChoice { settings, selected: 0 });
-                Action::None
-            }
             "/help" => {
                 let provider_help = if crate::open_code::PROVIDER_ENABLED {
                     tr("/connect  OpenCode provider 연결\n", "/connect  Connect an OpenCode provider\n")
@@ -12616,57 +12575,6 @@ impl AppState {
                     _ => {}
                 }
                 self.pending = Some(PendingInteraction::SettingPicker { setting, selected });
-                Action::None
-            }
-            PendingInteraction::CodexProxyChoice { settings, mut selected } => {
-                match key.code {
-                    KeyCode::Esc => return Action::None,
-                    KeyCode::Up | KeyCode::Left => selected = selected.saturating_sub(1),
-                    KeyCode::Down | KeyCode::Right => selected = (selected + 1).min(1),
-                    KeyCode::Tab => selected = (selected + 1) % 2,
-                    KeyCode::Char(ch @ '1'..='2') if !ctrl && !alt => {
-                        return self.choose_codex_proxy(settings, (ch as u8 - b'1') as usize);
-                    }
-                    KeyCode::Enter if key.kind != KeyEventKind::Repeat => {
-                        return self.choose_codex_proxy(settings, selected);
-                    }
-                    _ => {}
-                }
-                self.pending = Some(PendingInteraction::CodexProxyChoice { settings, selected });
-                Action::None
-            }
-            PendingInteraction::CodexProxyAddress { mut editor, mut paired, mut invalid } => {
-                match key.code {
-                    KeyCode::Esc => return Action::None,
-                    KeyCode::Enter if key.kind != KeyEventKind::Repeat => {
-                        let address = paired.clone().or_else(|| {
-                            CodexProxySettings::parse_address(&editor.text()).filter(|url| url.password().is_none())
-                        });
-                        if !invalid && let Some(address) = address {
-                            return Action::PersistCodexProxy(CodexProxySettings {
-                                enabled: true,
-                                address: address.to_string(),
-                            });
-                        }
-                        invalid = true;
-                    }
-                    KeyCode::Backspace => editor.backspace(),
-                    KeyCode::Delete => editor.delete(),
-                    KeyCode::Left => editor.move_left(),
-                    KeyCode::Right => editor.move_right(),
-                    KeyCode::Home => editor.move_home(),
-                    KeyCode::End => editor.move_end(),
-                    KeyCode::Char('u') if ctrl => editor.clear(),
-                    KeyCode::Char(ch) if !ctrl && !alt => editor.insert(ch),
-                    _ => {}
-                }
-                if key.code != KeyCode::Enter {
-                    invalid = false;
-                    if paired.as_ref().is_some_and(|url| CodexProxySettings::displayed_address(url) != editor.text()) {
-                        paired = None;
-                    }
-                }
-                self.pending = Some(PendingInteraction::CodexProxyAddress { editor, paired, invalid });
                 Action::None
             }
             PendingInteraction::ClaudePermissionsPanel {
@@ -14012,48 +13920,6 @@ impl AppState {
                 input_label: "",
                 input_placeholder: "",
             }),
-            PendingInteraction::CodexProxyChoice { settings, selected } => Some(OverlayView {
-                title: "Codex Proxy".to_owned(),
-                lines: vec![
-                    OverlayLine {
-                        text: format!("{} · {}", if settings.enabled { "On" } else { "Off" },
-                            CodexProxySettings::parse_address(&settings.address)
-                                .map_or_else(|| "—".to_owned(), |address| CodexProxySettings::displayed_address(&address))),
-                        selected: false,
-                        muted: true,
-                    },
-                    OverlayLine { text: "1. Enable / Edit address".to_owned(), selected: *selected == 0, muted: false },
-                    OverlayLine { text: "2. Turn off".to_owned(), selected: *selected == 1, muted: false },
-                ],
-                slider: None,
-                hint: "↑↓ Select  ·  Enter Continue  ·  Esc Cancel".to_owned(),
-                closable: true,
-                style: OverlayStyle::Picker,
-                input: None,
-                input_label: "",
-                input_placeholder: "",
-            }),
-            PendingInteraction::CodexProxyAddress { editor, paired, invalid } => Some(OverlayView {
-                title: "Codex Proxy Address".to_owned(),
-                // The format guide, brightened once a bad address was entered.
-                lines: vec![OverlayLine {
-                    text: if paired.is_some() && !*invalid {
-                        tr("중계 암호가 포함된 주소를 받았습니다.", "The connection address includes a relay password.")
-                    } else {
-                        tr("프록시 주소를 입력하거나 데스크톱에서 복사한 접속 주소를 붙여넣으세요.",
-                            "Enter a proxy URL or paste the connection address copied from the desktop.")
-                    }.to_owned(),
-                    selected: false,
-                    muted: !*invalid,
-                }],
-                slider: None,
-                hint: "Ctrl+P Paste  ·  Enter Save  ·  Ctrl+U Clear  ·  Esc Cancel".to_owned(),
-                closable: true,
-                style: OverlayStyle::ManagementPanel,
-                input: Some(editor),
-                input_label: "Address",
-                input_placeholder: "http://desktop-proxy.corp:3128",
-            }),
             PendingInteraction::ClaudePermissionsPanel {
                 tab,
                 selected,
@@ -15056,9 +14922,6 @@ impl AppState {
             return Vec::new();
         }
         let query = query.to_ascii_lowercase();
-        if query == "proxy" {
-            return Vec::new();
-        }
         let mut skills = self
             .skills
             .iter()
@@ -16632,9 +16495,6 @@ impl AppState {
             return Action::None;
         }
         match self.pending.take() {
-            Some(PendingInteraction::CodexProxyChoice { settings, .. }) if (1..=2).contains(&row) => {
-                self.choose_codex_proxy(settings, row - 1)
-            }
             Some(PendingInteraction::ModelPicker {
                 model_index,
                 query,
@@ -17083,22 +16943,6 @@ impl AppState {
             setting,
             selected: selected.min(setting.choices().len().saturating_sub(1)),
         });
-    }
-
-    fn choose_codex_proxy(&mut self, mut settings: CodexProxySettings, selected: usize) -> Action {
-        if selected == 1 {
-            settings.enabled = false;
-            return Action::PersistCodexProxy(settings);
-        }
-        let mut editor = Editor::default();
-        let address = CodexProxySettings::parse_address(&settings.address);
-        if let Some(address) = &address {
-            editor.set_text(CodexProxySettings::displayed_address(address));
-        }
-        self.pending = Some(PendingInteraction::CodexProxyAddress {
-            editor, paired: address.filter(|url| url.password().is_some()), invalid: false,
-        });
-        Action::None
     }
 
     fn toggle_status_line_field(&mut self, field: StatusLineField) -> Action {
@@ -35467,62 +35311,6 @@ mod tests {
         state.handle_key(KeyEvent::from(KeyCode::Backspace));
         state.handle_buffered_composer_text("$", false);
         assert!(!state.view().suggestions.is_empty());
-    }
-
-    #[test]
-    fn codex_proxy_is_hidden_but_can_be_configured_from_the_composer() {
-        let mut state = test_state();
-        state.update_skills(&json!({ "data": [{ "cwd": "cwd", "skills": [
-            { "name": "proxy", "path": "C:/skills/proxy/SKILL.md", "description": "Proxy", "enabled": true },
-            { "name": "proxy-helper", "path": "C:/skills/proxy-helper/SKILL.md", "description": "Proxy helper", "enabled": true }
-        ] }] }));
-        state.editor.set_text("/");
-        assert!(state.slash_suggestion_views().iter().all(|row| row.command != "/proxy"));
-        state.editor.set_text("/proxy");
-        assert!(state.slash_suggestion_views().is_empty());
-        state.handle_key(KeyEvent::from(KeyCode::Enter));
-        assert_eq!(state.overlay_view().unwrap().title, "Codex Proxy");
-        state.handle_key(KeyEvent::from(KeyCode::Enter));
-        assert_eq!(state.overlay_view().unwrap().title, "Codex Proxy Address");
-        state.handle_paste("invalid");
-        assert!(matches!(state.handle_key(KeyEvent::from(KeyCode::Enter)), Action::None));
-        assert!(!state.overlay_view().unwrap().lines.is_empty());
-        state.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        state.handle_paste("http://desktop:3128");
-        let Action::PersistCodexProxy(settings) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
-            panic!("valid proxy address should be saved");
-        };
-        assert!(settings.enabled);
-        assert_eq!(settings.address, "http://desktop:3128/");
-        assert!(state.overlay_view().is_none());
-
-        state.pending = Some(PendingInteraction::CodexProxyChoice { settings, selected: 0 });
-        let Action::PersistCodexProxy(settings) = state.click_overlay_row(2) else {
-            panic!("the off row should save the setting");
-        };
-        assert!(!settings.enabled);
-        assert_eq!(settings.address, "http://desktop:3128/");
-
-        state.run_command("/proxy");
-        state.handle_key(KeyEvent::from(KeyCode::Enter));
-        assert!(matches!(state.handle_key(KeyEvent::from(KeyCode::Esc)), Action::None));
-        assert!(state.overlay_view().is_none());
-    }
-
-    #[test]
-    fn codex_proxy_accepts_the_standalone_address_without_displaying_its_password() {
-        let mut state = test_state();
-        let password = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 16]);
-        let address = format!("http://dvz:{password}@192.168.0.10:25080");
-        state.run_command("/proxy");
-        let panel = state.overlay_view().unwrap();
-        assert_eq!(panel.lines.len(), 3);
-        assert!(panel.lines.iter().all(|line| !line.text.contains("Desktop Relay")));
-        state.handle_key(KeyEvent::from(KeyCode::Enter));
-        state.handle_paste(&address);
-        assert_eq!(state.overlay_view().unwrap().input.unwrap().text(), "http://192.168.0.10:25080/");
-        assert!(matches!(state.handle_key(KeyEvent::from(KeyCode::Enter)), Action::PersistCodexProxy(settings)
-            if settings.address.trim_end_matches('/') == address));
     }
 
     #[test]

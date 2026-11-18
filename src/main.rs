@@ -1073,7 +1073,6 @@ fn hold_until_thread(
         | Action::Quit
         | Action::SetTheme(_)
         | Action::PersistAutoKnowledge(_)
-        | Action::PersistCodexProxy(_)
         | Action::PersistPromptSuggestions(_)
         | Action::PersistLanguage(_)
         | Action::PersistSkin(_)
@@ -1955,9 +1954,7 @@ async fn event_loop(
                             PreeditInput::Update(text) => {
                                 let input_state =
                                     focused_state_mut(state, &mut btw_state, split_focus);
-                                if !input_state.proxy_address_input_active() {
-                                    input_log::record(|| format!("preedit {text:?}"));
-                                }
+                                input_log::record(|| format!("preedit {text:?}"));
                                 apply_composer_preedit_update(
                                     input_state,
                                     &mut composer_paste,
@@ -1969,9 +1966,7 @@ async fn event_loop(
                     }
                     Some(Ok(Event::Key(key))) => {
                         let key = alt_code.normalize(key);
-                        if input_log::enabled()
-                            && !focused_state_mut(state, &mut btw_state, split_focus).proxy_address_input_active()
-                        {
+                        if input_log::enabled() {
                             let selection = renderer.composer_selection_range();
                             let select_all = renderer.composer_select_all_active();
                             let text = focused_state_mut(state, &mut btw_state, split_focus)
@@ -2142,7 +2137,7 @@ async fn event_loop(
                     }
                     Some(Ok(Event::Paste(text))) => {
                         let input_state = focused_state_mut(state, &mut btw_state, split_focus);
-                        if input_log::enabled() && !input_state.proxy_address_input_active() {
+                        if input_log::enabled() {
                             let select_all = renderer.composer_select_all_active();
                             let selection = renderer.composer_selection_range();
                             let composer = input_state.editor.text();
@@ -3432,13 +3427,6 @@ async fn run_action(
                 state.push_notice(BlockKind::Warning, "Auto knowledge setting save failed", error.to_string());
             }
         }
-        Action::PersistCodexProxy(settings) => match settings.save() {
-            Ok(()) => state.push_notice(BlockKind::System, "Codex Proxy", tr(
-                "설정을 저장했습니다. Devez Vibe를 다시 시작하면 적용됩니다.",
-                "Settings saved. Restart Devez Vibe to apply them.",
-            )),
-            Err(error) => state.push_notice(BlockKind::Warning, "Could not save Codex proxy", error.to_string()),
-        },
         Action::PersistModelFavorites(ids) => {
             if let Err(error) = state::write_model_favorites(&ids) {
                 state.push_notice(BlockKind::Warning, "Failed to save favorites", error.to_string());
@@ -5685,7 +5673,7 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "- Do not assert that external work completed, was cancelled or rejected, or what caused it, before an actual response or error. If a question fails to reach the user or gets no answer, restate the needed question in plain text, and do not run changes that need the answer before it arrives.\n",
     "Browser use:\n",
     "- Use Google Chrome unless the user explicitly requests another browser. A Chrome connection failure does not authorize switching to DevezCode's embedded browser or bypassing browser access checks.\n",
-    "- When available, use the devez-chrome MCP tools for Chrome tasks. They connect to the user's running Google Chrome after Chrome's own connection approval. Use list_pages and select_page for an existing tab. If connection setup is required, ask the user to enable chrome://inspect/#remote-debugging and allow Chrome's connection prompt; do not silently switch profiles or bypass approval.\n",
+    "- When available, use the devez-chrome MCP tools for Chrome tasks. They launch a dedicated Google Chrome profile without connection approval; the user's own tabs and logins are not available there, so ask the user to sign in on that window when a page needs it.\n",
     "Progress:\n",
     "- State the target and action without labels or headers. After the first notice, report briefly only when a new fact or scope change would change the user's decision. Do not announce repeated plans, empty progress lines, or internal tool or Skill procedures.\n",
     "- Name a subagent's task_name with lowercase English letters, digits, and underscores describing its target and action.\n",
@@ -7030,24 +7018,16 @@ fn paste_clipboard_text_shortcut(
     now: Instant,
     selection: Option<std::ops::Range<usize>>,
 ) -> bool {
-    let proxy_input = state.proxy_address_input_active();
-    // Terminals that consume Ctrl+V can still deliver Ctrl+P to the proxy form.
-    let direct_proxy_paste = proxy_input
-        && key.kind == crossterm::event::KeyEventKind::Press
-        && matches!(key.code, KeyCode::Char('p' | 'P'))
-        && key.modifiers == KeyModifiers::CONTROL;
-    if !(is_paste_shortcut(key) || direct_proxy_paste)
-        || (state.has_pending_interaction() && !state.buffers_pending_text_input() && !proxy_input)
+    // A blocking overlay usually swallows Ctrl+V, but a free-text question is a
+    // text field like the composer and must accept a clipboard paste too.
+    if !is_paste_shortcut(key)
+        || (state.has_pending_interaction() && !state.buffers_pending_text_input())
     {
         return false;
     }
     let Some(text) = clipboard_text().filter(|text| !text.is_empty()) else {
         return false;
     };
-    if direct_proxy_paste {
-        apply_direct_paste(state, &text);
-        return true;
-    }
     // A paste replaces the selection the way typing does. The clipboard is read
     // first, so a paste that never arrives leaves the selected text in place.
     if let Some(range) = selection {
