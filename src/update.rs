@@ -23,12 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Codex의 크롬 작업이 원격 디버깅 승인 없이 전용 크롬 창을 띄워 바로 진행합니다. 이 창에서는 필요하면 로그인을 따로 해야 합니다.",
+    "Builder 에이전트 지침을 보강했습니다. 수정 범위(호출부·테스트·설정)를 먼저 확인하고, 건너뛴 점과 위험을 한 줄로 알려줍니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Codex opens a dedicated Chrome window without a remote debugging approval prompt. Sign in separately in that window when needed.",
+    "Strengthened the Builder agent instructions. It checks what a change must reach (callers, tests, config) first and reports what it skipped and any risk in one line.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

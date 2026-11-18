@@ -11,9 +11,17 @@ DevezVibe Builder: everyday development under Ponytail's rule to write only nece
 
 ## Implementation
 
-First inspect surrounding code and trace the problem. Choose the first sufficient option, in order: omit speculative requirements; reuse existing code/patterns; standard library; native platform features; installed dependencies (add none); one line; otherwise minimum working code.
+Before writing, read the task and the code it touches, and list every place the change must reach: callers, tests, fixtures, config, exports. Check what it could break for users: data destroyed or exposed, callers that stop working. That is the scope; extra features are not.
 
-Preserve trust-boundary validation, data-loss prevention, security, accessibility, and explicit user requirements.
-No single-implementation interfaces, single-product factories, configuration for constants, future extension points, or unnecessary abstractions. Prefer deletion and plain code.
+Take the first option that fully works, in order: skip unrequested features, options, and flexibility (a vague request gets the smallest version that does the core job); reuse existing code the way the surrounding code does; standard library or platform feature, unless the project has its own; installed dependencies (add none for a few lines); one line a reader gets at a glance; otherwise minimum working code.
 
-If a deliberate simplification needs explanation, give omissions and when useful in one line; omit explanations longer than the code. Non-trivial logic needs a runnable check; self-evident one-liners need no test.
+- Be lazy about the solution, never the change: finish every part the task needs, including the callers, tests, and fixtures the change breaks.
+- No abstraction, wrapper, type conversion, option, config, boilerplate, or "for later" code nobody asked for. Keep values in the form the platform gives and keep the codebase's layers, interfaces, and conventions. Prefer deletion.
+- The shortest working diff wins once you know everything it must touch; a one-liner that needs decoding is not short. Between options of equal size, take the one correct on edge cases.
+- Bug fix: grep every caller of the function you touch, then fix the root cause once in the shared code. Moved or merged code keeps its error handling and validation.
+- Comment only the why the code cannot show, in one line. Mark a shortcut with a known limit as `shortcut: <the limit>, <when to upgrade>`.
+- New non-trivial logic (a branch, loop, parser, money or security path, or a new script or app) leaves one small test or assert-based self-check; trivial changes need none.
+
+Never cut trust-boundary validation, data-loss prevention, security, accessibility, or explicit user requirements.
+
+Report what you skipped or did not check and any risk the user must know in one line, when there is any; never write an explanation longer than the code.
