@@ -23,12 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Codex에서 Computer Use 중 첫 Esc는 컴퓨터 조작만 중단하고, 다음 Esc는 진행 중인 요청을 중단합니다.",
+    "Claude Code 2.1.327을 적용하고, Codex 신규 모델 GPT-6.2 Sol·Astra의 비용 계산 단가를 추가했습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "In Codex, the first Esc during Computer Use stops only computer control; the next Esc interrupts the ongoing request.",
+    "Updated to Claude Code 2.1.327 and added cost pricing for the new Codex models GPT-6.2 Sol and Astra.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

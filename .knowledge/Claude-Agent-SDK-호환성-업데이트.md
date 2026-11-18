@@ -138,6 +138,15 @@ TUI를 띄우지 않고 실제 에이전트 동작을 확인할 때는 브리지
 
 ## 확인 기록
 
+### 2026-11-18 SDK 0.3.327(Claude Code 2.1.327) 상향 — 미배포
+
+- 0.3.325→0.3.327 `sdk.d.ts` 차이: `mcpServersDelivery`(`argv`/`initialize`)와 초기화 요청의 `mcpServers`·`mcp_servers_applied`, 시작 실패 사유 `initialize_fields_not_delivered`, `task_started.prompt` 설명(재개된 하위 에이전트 실행에는 없음), `BUILTIN_TOOL_NAMES`의 `ProposeGoal`→`SetGoal`, `modelUsage`·`total_cost_usd`에 과금되는 자동 모드 분류기 호출과 중단된 호출 포함, 설정 주석 변경이다.
+- 시작 실패 안내 표가 자체 검사로 모든 사유를 요구해 `initialize_fields_not_delivered` 안내를 추가했다.
+- `mcpServersDelivery` 미설정 경고(`CLAUDE_SDK_MCP_SERVERS_ARGV_DEPRECATED`)는 외부 실행 파일을 쓰면서 프로세스 전송 MCP 서버(stdio·SSE·HTTP)를 넘길 때만 난다. 브리지는 `createSdkMcpServer` 서버만 넘겨 해당 없음을 번들 코드 조건(`Object.keys(qm).length>0`)으로 확인했다. 앞으로 stdio·HTTP 서버를 `mcpServers`로 넘기면 이 옵션을 정해야 한다.
+- 브리지는 `task_started.prompt`·`ProposeGoal`을 쓰지 않는다. 비용 표시는 브리지의 `modelUsage` 합계를 쓰므로 API 키 사용자는 분류기 토큰만큼 합계가 늘 수 있다(구독 요금제는 제외). 실제 값은 확인하지 않았다.
+- 번들 CLI 실시간 모델 목록 12개는 예비 목록·1M 판정과 맞다. 새 Claude 모델은 없다.
+- 검증: 브리지 자체 검사, Rust 전체 1,682개 통과·27개 기본 제외, `git diff --check` 통과. 실제 대화 턴은 확인하지 않았다.
+
 ### 2026-11-16 SDK 0.3.325(Claude Code 2.1.325) 상향 — 미배포
 
 - 0.3.319→0.3.325 `sdk.d.ts` 차이는 세션 보관(`archiveSession`·`archived`), `matchDeniedModels`, `reloadPlugins({ refuseIfBusy })`, 결과 오류의 `invalid_config_file`, 시작 실패 사유 `managed_settings_not_delivered` 추가와 주석 변경이다. 브리지가 쓰는 메서드·메시지 형태는 그대로다.

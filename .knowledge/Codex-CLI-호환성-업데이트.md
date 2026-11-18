@@ -84,6 +84,11 @@ Codex 0.x.y 기준으로 호환성 업데이트해
 
 ## 확인 기록
 
+### 2026-11-18 Codex 0.169.1 기준 갱신 — 단가만 추가
+
+- 0.169.1 릴리스 노트는 변경 요약이 없고, `generate-ts --experimental` 스키마는 0.169.0과 SHA-256까지 같다. 기준 버전만 0.169.1로 갱신했다. `thread/prediction/request`는 여전히 없으므로 제안은 `thread/sample`을 유지한다.
+- 실제 app-server 모델 목록이 10개로 늘었고 새 `gpt-6.2-sol`·`gpt-6.2-astra`가 단가 표에 없어 추가했다.
+
 ### 2026-11-16 Codex 0.169.0 기준 갱신 — 코드 변경 없음
 
 - 0.167.0→0.169.0 스키마는 `account/securitySetup/read`·`modelProvider/list`·`modelProvider/config/write`·`thread/prepareApprovedPlan` 요청과 선택 필드(`moderation`, `contentTokenCount`, `environments`, `outputDeferred`, `currentAccountOnly` 등), 오류 값 `inferenceHookDenied` 추가뿐이다. 서버 요청·알림 메서드는 변하지 않았고 `suggest` API도 없다.

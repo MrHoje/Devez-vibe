@@ -108,6 +108,8 @@ const CACHE_READ_MULTIPLIER: f64 = 0.1;
 /// before `gpt-5.6`, or the tier would fall through to the generic rate.
 const PRICES: &[(&str, f64, f64)] = &[
     // GPT (Codex)
+    ("gpt-6.2-astra", 8.0, 40.0),
+    ("gpt-6.2-sol", 2.0, 10.0),
     ("gpt-6-astra", 10.0, 50.0),
     ("gpt-6.1-sol", 2.0, 10.0),
     ("gpt-6.1-terra", 1.0, 5.0),
@@ -149,8 +151,8 @@ pub fn estimate_usd(model: &str, totals: TokenTotals) -> Option<f64> {
         .find(|(slug, _, _)| model.contains(slug))
         .copied()?;
     // Fable/Mythos 5.1 and 5.2 cut cache reads to 0.025x their input rate
-    // ($0.25 and $0.20/MTok) — and Opus 5.5, Sonnet 5.5 and GPT-6.1 Sol/Terra to
-    // 0.05x, against the 0.1x every other model on either vendor still charges.
+    // ($0.25 and $0.20/MTok) — and Opus 5.5, Sonnet 5.5, GPT-6.1 Sol/Terra and
+    // GPT-6.2 Sol/Astra to 0.05x, against the 0.1x every other model still charges.
     let cache_read_multiplier = if model.contains("claude-fable-5-1")
         || model.contains("claude-mythos-5-1")
         || model.contains("claude-fable-5-2")
@@ -161,6 +163,8 @@ pub fn estimate_usd(model: &str, totals: TokenTotals) -> Option<f64> {
         || model.contains("claude-sonnet-5-5")
         || model.contains("gpt-6.1-sol")
         || model.contains("gpt-6.1-terra")
+        || model.contains("gpt-6.2-sol")
+        || model.contains("gpt-6.2-astra")
     {
         0.05
     } else {
@@ -219,6 +223,9 @@ mod tests {
         // $0.10/MTok on GPT-6.1 Sol; GPT-6 Sol stays at 0.1x of $2 = $0.20.
         assert!((estimate_usd("gpt-6.1-sol", totals).unwrap() - 0.10).abs() < 1e-9);
         assert!((estimate_usd("gpt-6-sol", totals).unwrap() - 0.20).abs() < 1e-9);
+        // GPT-6.2 Sol $0.10/MTok, Astra $0.40/MTok (0.05x).
+        assert!((estimate_usd("gpt-6.2-sol", totals).unwrap() - 0.10).abs() < 1e-9);
+        assert!((estimate_usd("gpt-6.2-astra", totals).unwrap() - 0.40).abs() < 1e-9);
     }
 
     #[test]
@@ -264,6 +271,8 @@ mod tests {
         };
 
         assert_eq!(estimate_usd("gpt-5.6-luna", totals), Some(1.4));
+        assert_eq!(estimate_usd("gpt-6.2-astra", totals), Some(48.0));
+        assert_eq!(estimate_usd("gpt-6.2-sol", totals), Some(12.0));
         assert_eq!(estimate_usd("gpt-6-astra", totals), Some(60.0));
         assert_eq!(estimate_usd("gpt-6.1-sol", totals), Some(12.0));
         assert_eq!(estimate_usd("gpt-6.1-terra", totals), Some(6.0));
