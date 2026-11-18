@@ -1295,11 +1295,15 @@ async fn is_open_code_v2(command: &Path) -> bool {
     let Ok(Ok(output)) = timeout(Duration::from_secs(10), probe.output()).await else {
         return false;
     };
-    String::from_utf8_lossy(&output.stdout)
-        .split(|character: char| !character.is_ascii_digit())
-        .find(|part| !part.is_empty())
-        .and_then(|major| major.parse::<u32>().ok())
-        .is_some_and(|major| major >= 2)
+    open_code_major_version(&String::from_utf8_lossy(&output.stdout)).is_some_and(|major| major >= 2)
+}
+
+/// 2.3 colors `--version` even when piped (`ESC[1mopencode ... ESC[1m2.3.0`),
+/// so the major comes from the first dotted number, not the first digits.
+fn open_code_major_version(text: &str) -> Option<u32> {
+    text.split(|character: char| !character.is_ascii_digit() && character != '.')
+        .find(|part| part.contains('.'))
+        .and_then(|version| version.split('.').next()?.parse().ok())
 }
 
 fn normalize_skill_catalog(response: Value) -> Value {
@@ -5415,6 +5419,16 @@ mod tests {
         assert_eq!(plan_status(Some("in_progress")), "inProgress");
         assert_eq!(plan_status(Some("completed")), "completed");
         assert_eq!(plan_status(Some("pending")), "pending");
+    }
+
+    #[test]
+    fn open_code_major_version_ignores_ansi_colors() {
+        assert_eq!(open_code_major_version("1.19.0\n"), Some(1));
+        assert_eq!(open_code_major_version("opencode v2.0.27\n"), Some(2));
+        assert_eq!(
+            open_code_major_version("\u{1b}[1mopencode\u{1b}[0m \u{1b}[2mv\u{1b}[0m\u{1b}[1m2.3.0\u{1b}[0m\n"),
+            Some(2)
+        );
     }
 
     #[test]

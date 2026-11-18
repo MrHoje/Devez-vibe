@@ -720,6 +720,102 @@ pub fn set_current(theme: ThemeKind) {
     CURRENT_THEME.with(|current| current.set(theme.index() as u8));
 }
 
+/// Settings key for the `/skin` default.
+pub const SKIN_KEY: &str = "model_skin";
+
+/// `/skin` rows between Default and Custom RGB: the settings value, and a label
+/// the renderer's model colour lookup recognises.
+pub const SKINS: [(&str, &str); 8] = [
+    ("fable", "Claude Fable"),
+    ("opus", "Claude Opus"),
+    ("sonnet", "Claude Sonnet"),
+    ("haiku", "Claude Haiku"),
+    ("astra", "GPT-6 Astra"),
+    ("sol", "GPT-6 Sol"),
+    ("terra", "GPT-6 Terra"),
+    ("luna", "GPT-6 Luna"),
+];
+
+/// `/skin`: the colour model-tinted chrome wears instead of the real model's.
+/// The model itself, and the status line's model name, stay the real ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Skin {
+    /// A label from `SKINS`, so the family's shade follows the theme.
+    Model(&'static str),
+    Rgb(Rgb),
+}
+
+impl Skin {
+    /// `r,g,b` rather than `#RRGGBB`: the settings reader drops `#` onwards.
+    pub fn config_value(self) -> String {
+        match self {
+            Self::Model(label) => SKINS
+                .iter()
+                .find(|(_, candidate)| *candidate == label)
+                .map(|(key, _)| (*key).to_owned())
+                .unwrap_or_default(),
+            Self::Rgb(Rgb(red, green, blue)) => format!("{red},{green},{blue}"),
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        SKINS
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(value))
+            .map(|(_, label)| Self::Model(label))
+            .or_else(|| parse_rgb(value).map(Self::Rgb))
+    }
+}
+
+/// `#B500D1`, `B500D1`, `181,0,209` or `181 0 209`.
+pub fn parse_rgb(text: &str) -> Option<Rgb> {
+    let text = text.trim();
+    let hex = text.strip_prefix('#').unwrap_or(text);
+    if hex.len() == 6 && hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        let channel = |at: usize| u8::from_str_radix(&hex[at..at + 2], 16).ok();
+        return Some(Rgb(channel(0)?, channel(2)?, channel(4)?));
+    }
+    let channels = text
+        .split([',', ' '])
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse::<u8>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    match channels[..] {
+        [red, green, blue] => Some(Rgb(red, green, blue)),
+        _ => None,
+    }
+}
+
+// Process-wide like the theme, and per-thread under test for the same reason.
+#[cfg(not(test))]
+static SKIN: std::sync::Mutex<Option<Skin>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+thread_local! {
+    static SKIN: std::cell::Cell<Option<Skin>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(not(test))]
+pub fn skin() -> Option<Skin> {
+    *SKIN.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(not(test))]
+pub fn set_skin(skin: Option<Skin>) {
+    *SKIN.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = skin;
+}
+
+#[cfg(test)]
+pub fn skin() -> Option<Skin> {
+    SKIN.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub fn set_skin(skin: Option<Skin>) {
+    SKIN.with(|current| current.set(skin));
+}
+
 pub fn palette() -> &'static ThemePalette {
     palette_of(current())
 }
@@ -785,6 +881,20 @@ fn devez_code_theme_file() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skin_values_round_trip_and_rgb_accepts_hex_or_channels() {
+        for value in ["#B500D1", "b500d1", "181,0,209", "181 0 209", " 181, 0, 209 "] {
+            assert_eq!(parse_rgb(value), Some(Rgb(181, 0, 209)), "{value}");
+        }
+        for value in ["", "#B500D", "256,0,0", "1,2", "1,2,3,4", "red"] {
+            assert_eq!(parse_rgb(value), None, "{value}");
+        }
+        for skin in [Skin::Model("Claude Opus"), Skin::Model("GPT-6 Luna"), Skin::Rgb(Rgb(1, 2, 3))] {
+            assert_eq!(Skin::parse(&skin.config_value()), Some(skin));
+        }
+        assert_eq!(Skin::parse(""), None);
+    }
 
     #[test]
     fn aliases_parse_to_the_devez_code_themes() {

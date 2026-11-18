@@ -6306,6 +6306,8 @@ enum Tone {
     ModelOpus,
     ModelFable,
     ModelOpenCode,
+    /// `/skin`'s typed colour, on every model-tinted reading.
+    Skin(Rgb),
     StatusModel56,
     StatusModelAstra,
     StatusModelSol,
@@ -9039,7 +9041,7 @@ fn overlay_frame_with_expansion(
                 lines.push(panel_padding_row(panel_width));
             }
 
-            let model_picker = title == "Model";
+            let model_picker = title == "Model" || title == "Skin";
             // A row may carry a two-column body (name US description); the
             // name column is sized once so every description starts flush.
             let picker_name_width = overlay
@@ -11501,7 +11503,7 @@ fn side_panel_prompt_lines(
     let mut lines = vec![heading, PaintLine::blank()];
     for prompt in prompts {
         let text = prompt.body.split_whitespace().collect::<Vec<_>>().join(" ");
-        let marker_tone = model_tone(&prompt.title).unwrap_or(Tone::User);
+        let marker_tone = chrome_model_tone(&prompt.title).unwrap_or(Tone::User);
         let prefix = "› ";
         let available = content_width.saturating_sub(UnicodeWidthStr::width(prefix));
         lines.push(PaintLine {
@@ -15017,6 +15019,10 @@ fn is_open_code_model_label(model: &str) -> bool {
 /// 모델을 타든 테마의 OpenCode 파란색을 쓴다. `/model` 목록이 쓰는
 /// `model_tone`에는 색을 주지 않아 선택창만 무채색으로 남는다.
 fn chrome_model_tone(model: &str) -> Option<Tone> {
+    let model = match skinned_model(model) {
+        Ok(model) => model,
+        Err(tone) => return Some(tone),
+    };
     if is_open_code_model_label(model) {
         return Some(Tone::ModelOpenCode);
     }
@@ -15067,7 +15073,22 @@ fn model_tone(model: &str) -> Option<Tone> {
     }
 }
 
+/// The model a reading is coloured as under `/skin`, or the typed colour.
+/// The `/model` list and model-change notices keep the real colours.
+fn skinned_model(model: &str) -> Result<&str, Tone> {
+    match theme::skin() {
+        Some(theme::Skin::Model(label)) => Ok(label),
+        // A theme switched onto the typed colour falls back to the real one.
+        Some(theme::Skin::Rgb(rgb)) if rgb != theme::palette().background => Err(Tone::Skin(rgb)),
+        _ => Ok(model),
+    }
+}
+
 fn status_model_tone(model: &str) -> Option<Tone> {
+    let model = match skinned_model(model) {
+        Ok(model) => model,
+        Err(tone) => return Some(tone),
+    };
     if is_open_code_model_label(model) {
         return Some(Tone::ModelOpenCode);
     }
@@ -15156,6 +15177,7 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::ModelOpus => palette.status.model_opus,
         Tone::ModelFable => palette.status.model_fable,
         Tone::ModelOpenCode => palette.model_opencode,
+        Tone::Skin(rgb) => rgb,
         Tone::StatusModelSol => palette.model_sol,
         Tone::StatusModelLuna => palette.model_luna,
         Tone::StatusModelSpark => palette.model_spark,
@@ -29045,6 +29067,26 @@ mod tests {
             status_model_tone("opencode:anthropic/claude-sonnet-5"),
             Some(Tone::ModelOpenCode)
         );
+    }
+
+    #[test]
+    fn skin_recolours_model_chrome_but_not_the_model_list() {
+        theme::set_skin(Some(theme::Skin::Model("Claude Opus")));
+        assert_eq!(chrome_model_tone("gpt-5.6-sol"), Some(Tone::ModelOpus));
+        assert_eq!(status_model_tone("GPT-5.6 Sol"), Some(Tone::StatusModelOpus));
+        assert_eq!(picker_model_tone("2. gpt-5.6-sol"), Tone::ModelSol);
+
+        let rgb = Rgb(181, 0, 209);
+        theme::set_skin(Some(theme::Skin::Rgb(rgb)));
+        assert_eq!(chrome_model_tone("opencode/big-pickle"), Some(Tone::Skin(rgb)));
+        assert_eq!(tone_rgb(Tone::Skin(rgb)), Some(rgb));
+        assert_eq!(notice_model_tone("Claude Haiku 5.5"), Tone::ModelHaiku);
+
+        theme::set_skin(Some(theme::Skin::Rgb(theme::palette().background)));
+        assert_eq!(chrome_model_tone("gpt-5.6-sol"), Some(Tone::ModelSol));
+
+        theme::set_skin(None);
+        assert_eq!(chrome_model_tone("gpt-5.6-sol"), Some(Tone::ModelSol));
     }
 
     #[test]

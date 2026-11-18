@@ -23,12 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude Code 2.1.327을 적용하고, Codex 신규 모델 GPT-6.2 Sol·Astra의 비용 계산 단가를 추가했습니다.",
+    "자동으로 짓는 세션 제목이 길이 제한에 걸려도 마지막 단어를 빼지 않고 끝까지 표시합니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Updated to Claude Code 2.1.327 and added cost pricing for the new Codex models GPT-6.2 Sol and Astra.",
+    "Automatically generated session titles keep the final word intact when trimmed to the length limit.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

@@ -16,6 +16,7 @@ use crate::terminal_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     agent::{self, AgentMode},
+    app_server::CodexProxySettings,
     completion::{
         CompletionCandidate, CompletionKind, CompletionMode, CompletionSource, CompletionTarget,
         completion_target, completion_text, filter_candidates, fuzzy_score,
@@ -40,7 +41,7 @@ use crate::{
         format_clock_time, format_elapsed, visible_window,
     },
     rollout::{PlanSnapshot, Rollout, RolloutEvent, RolloutKind},
-    theme::{self, ThemeKind},
+    theme::{self, Skin, ThemeKind},
 };
 
 const SPINNER: [&str; 8] = ["✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳"];
@@ -453,7 +454,7 @@ impl SlashCommand {
     }
 }
 
-const SLASH_COMMANDS: [SlashCommand; 37] = [
+const SLASH_COMMANDS: [SlashCommand; 38] = [
     SlashCommand {
         name: "/provider",
         korean: "Claude·Codex provider 전환 또는 OpenCode 연결",
@@ -513,6 +514,12 @@ const SLASH_COMMANDS: [SlashCommand; 37] = [
         korean: "화면 언어 전환 (한국어·English)",
         english: "Switch the screen language (Korean or English)",
         takes_argument: true,
+    },
+    SlashCommand {
+        name: "/skin",
+        korean: "모델 색 스킨 바꾸기 (실제 모델은 그대로)",
+        english: "Change the model color skin (the real model stays)",
+        takes_argument: false,
     },
     SlashCommand {
         name: "/login",
@@ -682,6 +689,7 @@ const SLASH_COMMANDS: [SlashCommand; 37] = [
 fn is_slash_command_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("reload-skills")
         || name.eq_ignore_ascii_case("p")
+        || name.eq_ignore_ascii_case("proxy")
         || SLASH_COMMANDS
             .iter()
             .any(|command| command.name[1..].eq_ignore_ascii_case(name))
@@ -1344,8 +1352,11 @@ pub enum Action {
     /// Save whether completed progress responses stay visible or fold away.
     PersistResponseDisplayMode(ResponseDisplayMode),
     PersistAutoKnowledge(bool),
+    PersistCodexProxy(CodexProxySettings),
     PersistPromptSuggestions(bool),
     PersistLanguage(bool),
+    /// Save the `/skin` default; empty clears it.
+    PersistSkin(String),
     /// Save the model ids starred with Space in `/model`.
     PersistModelFavorites(Vec<String>),
     /// Save the transcript's Shell display preference for future sessions.
@@ -1728,6 +1739,15 @@ enum PendingInteraction {
         setting: DisplaySetting,
         selected: usize,
     },
+    CodexProxyChoice {
+        settings: CodexProxySettings,
+        selected: usize,
+    },
+    CodexProxyAddress {
+        editor: Editor,
+        paired: Option<reqwest::Url>,
+        invalid: bool,
+    },
     ClaudePermissionsPanel {
         tab: usize,
         selected: usize,
@@ -1772,6 +1792,19 @@ enum PendingInteraction {
     },
     ThemePicker {
         theme_index: usize,
+    },
+    /// `/skin`: Default, the `theme::SKINS` families, then Custom RGB.
+    SkinPicker {
+        selected: usize,
+    },
+    SkinRgb {
+        editor: Editor,
+        invalid: bool,
+    },
+    /// `/skin`'s last step: this session only, or every launch.
+    SkinScope {
+        skin: Option<Skin>,
+        selected: usize,
     },
     SessionPicker(SessionPicker),
     HistoryPicker(HistoryPicker),
@@ -3277,6 +3310,8 @@ fn visible_resume_picker_rows() -> usize {
 /// Rows the `Apply to` step prints before its choices: the pick it is confirming
 /// and the blank under it.
 const MODEL_SCOPE_HEADER_ROWS: usize = 2;
+/// Default, the `theme::SKINS` families, and Custom RGB.
+const SKIN_ROWS: usize = theme::SKINS.len() + 2;
 const SKILLS_PICKER_ROWS: usize = 10;
 const SKILL_NAME_MAX_COLUMNS: usize = 32;
 
@@ -3295,6 +3330,8 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
             | PendingInteraction::RuntimePicker { .. }
             | PendingInteraction::AgentPicker { .. }
             | PendingInteraction::SettingPicker { .. }
+            | PendingInteraction::CodexProxyChoice { .. }
+            | PendingInteraction::CodexProxyAddress { .. }
             | PendingInteraction::ClaudePermissionsPanel { .. }
             | PendingInteraction::ClaudePermissionScopePicker { .. }
             | PendingInteraction::ClaudePermissionRuleInput { .. }
@@ -3306,6 +3343,9 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
             | PendingInteraction::SessionPicker(_)
             | PendingInteraction::HistoryPicker(_)
             | PendingInteraction::ProviderPicker(_)
+            | PendingInteraction::SkinPicker { .. }
+            | PendingInteraction::SkinRgb { .. }
+            | PendingInteraction::SkinScope { .. }
     )
 }
 
@@ -5530,6 +5570,10 @@ impl AppState {
     /// Space reach their pending interaction immediately.
     pub fn has_pending_interaction(&self) -> bool {
         self.pending.is_some()
+    }
+
+    pub fn proxy_address_input_active(&self) -> bool {
+        matches!(self.pending, Some(PendingInteraction::CodexProxyAddress { .. }))
     }
 
     /// The free-text row is an editor as soon as it owns focus, matching Claude
@@ -8542,6 +8586,23 @@ impl AppState {
             Some(PendingInteraction::MarketplacePicker(picker)) => picker.handle_paste(text),
             Some(PendingInteraction::ProviderPicker(picker)) => picker.handle_paste(text),
             Some(PendingInteraction::ProviderOAuthCode { editor, .. }) => editor.insert_str(text),
+            Some(PendingInteraction::CodexProxyAddress { editor, paired, invalid }) => {
+                if let Some(url) = CodexProxySettings::parse_address(text).filter(|url| url.password().is_some()) {
+                    editor.set_text(CodexProxySettings::displayed_address(&url));
+                    *paired = Some(url);
+                    *invalid = false;
+                } else if text.contains('@') {
+                    *invalid = true;
+                } else {
+                    editor.insert_str(text);
+                    *paired = None;
+                    *invalid = false;
+                }
+            }
+            Some(PendingInteraction::SkinRgb { editor, invalid }) => {
+                editor.insert_str(text);
+                *invalid = false;
+            }
             Some(PendingInteraction::ClaudePermissionRuleInput { editor, .. }) => {
                 editor.insert_str(text)
             }
@@ -9383,6 +9444,8 @@ impl AppState {
                     | PendingInteraction::RuntimePicker { .. }
                     | PendingInteraction::AgentPicker { .. }
                     | PendingInteraction::SettingPicker { .. }
+                    | PendingInteraction::CodexProxyChoice { .. }
+                    | PendingInteraction::CodexProxyAddress { .. }
                     | PendingInteraction::ClaudePermissionsPanel { .. }
                     | PendingInteraction::ClaudePermissionScopePicker { .. }
                     | PendingInteraction::VibeModePicker { .. }
@@ -9390,6 +9453,9 @@ impl AppState {
                     | PendingInteraction::SkillsPicker { .. }
                     | PendingInteraction::ModelScope { .. }
                     | PendingInteraction::ThemePicker { .. }
+                    | PendingInteraction::SkinPicker { .. }
+                    | PendingInteraction::SkinRgb { .. }
+                    | PendingInteraction::SkinScope { .. }
                     | PendingInteraction::SessionPicker(_)
                     | PendingInteraction::McpPicker(_)
                     | PendingInteraction::PluginPicker(_)
@@ -11409,6 +11475,14 @@ impl AppState {
             }
         }
         match parts.first().copied().unwrap_or_default() {
+            "/proxy" => {
+                let settings = CodexProxySettings::load().unwrap_or_else(|error| {
+                    self.push_notice(BlockKind::Warning, "Could not load Codex proxy", error.to_string());
+                    CodexProxySettings::default()
+                });
+                self.pending = Some(PendingInteraction::CodexProxyChoice { settings, selected: 0 });
+                Action::None
+            }
             "/help" => {
                 let provider_help = if crate::open_code::PROVIDER_ENABLED {
                     tr("/connect  OpenCode provider 연결\n", "/connect  Connect an OpenCode provider\n")
@@ -11466,8 +11540,8 @@ impl AppState {
                     BlockKind::System,
                     "Commands",
                     tr(
-                        format!("/provider [claude|codex|opencode]  provider 선택\n/provider [claude|codex|opencode] MODEL  provider와 모델 선택\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}/auto-knowledge [on|off]  지식 자동 기록 켜기·끄기\n{effort_help}/Response [All|Completed]  응답 압축 방식\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/vibemode  응답·Shell·Diff 표시 한 번에 설정\n/theme [minimal|soft|dark|gray|softpink|midnight]  화면 테마\n/language [korean|english]  화면 언어\n/agent [builder|planner|goal-runner|reviewer|researcher]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 열기·닫기\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/worktree [NAME]  git 작업 트리에서 대화 이어 가기\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n{rename_help}/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n/exit  /quit 별칭\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+Z / Ctrl+Y  입력 실행 취소·다시 실행\nCtrl+S  입력 초안 보관·되돌리기\nCtrl+R  프롬프트 이력 검색\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 열기·닫기(폭은 패널 머리글의 [◀][▶])\nShift+Tab  Claude 권한 모드 전환"),
-                        format!("/provider [claude|codex|opencode]  Select a provider\n/provider [claude|codex|opencode] MODEL  Select a provider and model\n/model [MODEL] [EFFORT]  Select the current provider's model and effort\n{provider_help}{fast_help}/auto-knowledge [on|off]  Turn automatic knowledge recording on or off\n{effort_help}/Response [All|Completed]  Response compression\n/shell [hide|collapse|expand]  Shell display\n/diff [hide|collapse|expand]  Diff display\n/vibemode  Set response, shell, and diff display at once\n/theme [minimal|soft|dark|gray|softpink|midnight]  Screen theme\n/language [korean|english]  Screen language\n/agent [builder|planner|goal-runner|reviewer|researcher]  Choose the agent role\n/statusline  Status line items\n/side-panel  Open or close the right side panel\n{integration_help}/btw [MESSAGE]  Ephemeral side conversation\n/compact  Compact the context\n/copy  Copy the last response\n/worktree [NAME]  Continue the conversation in a git worktree\n/resume [SESSION]  Pick an earlier session\n/continue  Alias for /resume\n{rename_help}/new  New conversation\n/clear  Alias for /new\n{login_help}/status  Current settings\n/usage  Usage limits\n/quit  Quit\n/exit  Alias for /quit\n\n$  Search plugins, skills, and apps\n@  Search plugins, skills, files, and folders\nEsc or Ctrl+C  Stop the run\nCtrl+Enter / Shift+Enter  New line\nTab  Switch the agent role\nAlt+Enter  Queue a prompt while a response runs\nCtrl+Z / Ctrl+Y  Undo or redo input\nCtrl+S  Stash or restore the input draft\nCtrl+R  Search prompt history\nShift+Space or Alt+W  Collapse or expand task steps\nAlt+P  Open or close the right side panel (resize with [◀][▶] in the panel header)\nShift+Tab  Switch the Claude permission mode"),
+                        format!("/provider [claude|codex|opencode]  provider 선택\n/provider [claude|codex|opencode] MODEL  provider와 모델 선택\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}/auto-knowledge [on|off]  지식 자동 기록 켜기·끄기\n{effort_help}/Response [All|Completed]  응답 압축 방식\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/vibemode  응답·Shell·Diff 표시 한 번에 설정\n/theme [minimal|soft|dark|gray|softpink|midnight]  화면 테마\n/language [korean|english]  화면 언어\n/skin  모델 색 스킨\n/agent [builder|planner|goal-runner|reviewer|researcher]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 열기·닫기\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/worktree [NAME]  git 작업 트리에서 대화 이어 가기\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n{rename_help}/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n/exit  /quit 별칭\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+Z / Ctrl+Y  입력 실행 취소·다시 실행\nCtrl+S  입력 초안 보관·되돌리기\nCtrl+R  프롬프트 이력 검색\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 열기·닫기(폭은 패널 머리글의 [◀][▶])\nShift+Tab  Claude 권한 모드 전환"),
+                        format!("/provider [claude|codex|opencode]  Select a provider\n/provider [claude|codex|opencode] MODEL  Select a provider and model\n/model [MODEL] [EFFORT]  Select the current provider's model and effort\n{provider_help}{fast_help}/auto-knowledge [on|off]  Turn automatic knowledge recording on or off\n{effort_help}/Response [All|Completed]  Response compression\n/shell [hide|collapse|expand]  Shell display\n/diff [hide|collapse|expand]  Diff display\n/vibemode  Set response, shell, and diff display at once\n/theme [minimal|soft|dark|gray|softpink|midnight]  Screen theme\n/language [korean|english]  Screen language\n/skin  Model color skin\n/agent [builder|planner|goal-runner|reviewer|researcher]  Choose the agent role\n/statusline  Status line items\n/side-panel  Open or close the right side panel\n{integration_help}/btw [MESSAGE]  Ephemeral side conversation\n/compact  Compact the context\n/copy  Copy the last response\n/worktree [NAME]  Continue the conversation in a git worktree\n/resume [SESSION]  Pick an earlier session\n/continue  Alias for /resume\n{rename_help}/new  New conversation\n/clear  Alias for /new\n{login_help}/status  Current settings\n/usage  Usage limits\n/quit  Quit\n/exit  Alias for /quit\n\n$  Search plugins, skills, and apps\n@  Search plugins, skills, files, and folders\nEsc or Ctrl+C  Stop the run\nCtrl+Enter / Shift+Enter  New line\nTab  Switch the agent role\nAlt+Enter  Queue a prompt while a response runs\nCtrl+Z / Ctrl+Y  Undo or redo input\nCtrl+S  Stash or restore the input draft\nCtrl+R  Search prompt history\nShift+Space or Alt+W  Collapse or expand task steps\nAlt+P  Open or close the right side panel (resize with [◀][▶] in the panel header)\nShift+Tab  Switch the Claude permission mode"),
                     ),
                 ));
                 Action::None
@@ -11789,6 +11863,17 @@ impl AppState {
                     return Action::None;
                 };
                 self.apply_theme(selected)
+            }
+            "/skin" => {
+                let selected = match theme::skin() {
+                    None => 0,
+                    Some(Skin::Model(label)) => {
+                        1 + theme::SKINS.iter().position(|(_, row)| *row == label).unwrap_or(0)
+                    }
+                    Some(Skin::Rgb(_)) => SKIN_ROWS - 1,
+                };
+                self.pending = Some(PendingInteraction::SkinPicker { selected });
+                Action::None
             }
             "/language" if parts.len() == 1 => {
                 self.open_setting_picker(DisplaySetting::Language, usize::from(language::english()));
@@ -12533,6 +12618,57 @@ impl AppState {
                 self.pending = Some(PendingInteraction::SettingPicker { setting, selected });
                 Action::None
             }
+            PendingInteraction::CodexProxyChoice { settings, mut selected } => {
+                match key.code {
+                    KeyCode::Esc => return Action::None,
+                    KeyCode::Up | KeyCode::Left => selected = selected.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Right => selected = (selected + 1).min(1),
+                    KeyCode::Tab => selected = (selected + 1) % 2,
+                    KeyCode::Char(ch @ '1'..='2') if !ctrl && !alt => {
+                        return self.choose_codex_proxy(settings, (ch as u8 - b'1') as usize);
+                    }
+                    KeyCode::Enter if key.kind != KeyEventKind::Repeat => {
+                        return self.choose_codex_proxy(settings, selected);
+                    }
+                    _ => {}
+                }
+                self.pending = Some(PendingInteraction::CodexProxyChoice { settings, selected });
+                Action::None
+            }
+            PendingInteraction::CodexProxyAddress { mut editor, mut paired, mut invalid } => {
+                match key.code {
+                    KeyCode::Esc => return Action::None,
+                    KeyCode::Enter if key.kind != KeyEventKind::Repeat => {
+                        let address = paired.clone().or_else(|| {
+                            CodexProxySettings::parse_address(&editor.text()).filter(|url| url.password().is_none())
+                        });
+                        if !invalid && let Some(address) = address {
+                            return Action::PersistCodexProxy(CodexProxySettings {
+                                enabled: true,
+                                address: address.to_string(),
+                            });
+                        }
+                        invalid = true;
+                    }
+                    KeyCode::Backspace => editor.backspace(),
+                    KeyCode::Delete => editor.delete(),
+                    KeyCode::Left => editor.move_left(),
+                    KeyCode::Right => editor.move_right(),
+                    KeyCode::Home => editor.move_home(),
+                    KeyCode::End => editor.move_end(),
+                    KeyCode::Char('u') if ctrl => editor.clear(),
+                    KeyCode::Char(ch) if !ctrl && !alt => editor.insert(ch),
+                    _ => {}
+                }
+                if key.code != KeyCode::Enter {
+                    invalid = false;
+                    if paired.as_ref().is_some_and(|url| CodexProxySettings::displayed_address(url) != editor.text()) {
+                        paired = None;
+                    }
+                }
+                self.pending = Some(PendingInteraction::CodexProxyAddress { editor, paired, invalid });
+                Action::None
+            }
             PendingInteraction::ClaudePermissionsPanel {
                 mut tab,
                 mut selected,
@@ -12916,6 +13052,68 @@ impl AppState {
                     _ => {}
                 }
                 self.pending = Some(PendingInteraction::ThemePicker { theme_index });
+                Action::None
+            }
+            PendingInteraction::SkinPicker { mut selected } => {
+                match key.code {
+                    KeyCode::Esc => return Action::None,
+                    KeyCode::Up | KeyCode::Left => selected = selected.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
+                        selected = (selected + 1).min(SKIN_ROWS - 1);
+                    }
+                    // `0` is the tenth row, Custom RGB.
+                    KeyCode::Char(ch @ '0'..='9') if !ctrl && !alt => {
+                        return self.choose_skin((ch as usize - '0' as usize + 9) % 10);
+                    }
+                    KeyCode::Enter => return self.choose_skin(selected),
+                    _ => {}
+                }
+                self.pending = Some(PendingInteraction::SkinPicker { selected });
+                Action::None
+            }
+            PendingInteraction::SkinRgb { mut editor, mut invalid } => {
+                match key.code {
+                    KeyCode::Esc => return Action::None,
+                    KeyCode::Enter if key.kind != KeyEventKind::Repeat => {
+                        if let Some(rgb) = theme::parse_rgb(&editor.text()) {
+                            // The background's own colour would hide the chrome:
+                            // that is Default.
+                            self.pending = Some(PendingInteraction::SkinScope {
+                                skin: (rgb != theme::palette().background).then_some(Skin::Rgb(rgb)),
+                                selected: 0,
+                            });
+                            return Action::None;
+                        }
+                        invalid = true;
+                    }
+                    KeyCode::Backspace => editor.backspace(),
+                    KeyCode::Delete => editor.delete(),
+                    KeyCode::Left => editor.move_left(),
+                    KeyCode::Right => editor.move_right(),
+                    KeyCode::Home => editor.move_home(),
+                    KeyCode::End => editor.move_end(),
+                    KeyCode::Char('u') if ctrl => editor.clear(),
+                    KeyCode::Char(ch) if !ctrl && !alt => {
+                        editor.insert(ch);
+                        invalid = false;
+                    }
+                    _ => {}
+                }
+                self.pending = Some(PendingInteraction::SkinRgb { editor, invalid });
+                Action::None
+            }
+            PendingInteraction::SkinScope { skin, mut selected } => {
+                match key.code {
+                    KeyCode::Esc => return Action::None,
+                    KeyCode::Up | KeyCode::Left => selected = 0,
+                    KeyCode::Down | KeyCode::Right | KeyCode::Tab => selected = 1,
+                    KeyCode::Char(ch @ ('1' | '2')) if !ctrl && !alt => {
+                        return self.apply_skin(skin, ch == '2');
+                    }
+                    KeyCode::Enter => return self.apply_skin(skin, selected == 1),
+                    _ => {}
+                }
+                self.pending = Some(PendingInteraction::SkinScope { skin, selected });
                 Action::None
             }
             PendingInteraction::SessionPicker(mut picker) => match picker.handle_key(key) {
@@ -13814,6 +14012,48 @@ impl AppState {
                 input_label: "",
                 input_placeholder: "",
             }),
+            PendingInteraction::CodexProxyChoice { settings, selected } => Some(OverlayView {
+                title: "Codex Proxy".to_owned(),
+                lines: vec![
+                    OverlayLine {
+                        text: format!("{} · {}", if settings.enabled { "On" } else { "Off" },
+                            CodexProxySettings::parse_address(&settings.address)
+                                .map_or_else(|| "—".to_owned(), |address| CodexProxySettings::displayed_address(&address))),
+                        selected: false,
+                        muted: true,
+                    },
+                    OverlayLine { text: "1. Enable / Edit address".to_owned(), selected: *selected == 0, muted: false },
+                    OverlayLine { text: "2. Turn off".to_owned(), selected: *selected == 1, muted: false },
+                ],
+                slider: None,
+                hint: "↑↓ Select  ·  Enter Continue  ·  Esc Cancel".to_owned(),
+                closable: true,
+                style: OverlayStyle::Picker,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            }),
+            PendingInteraction::CodexProxyAddress { editor, paired, invalid } => Some(OverlayView {
+                title: "Codex Proxy Address".to_owned(),
+                // The format guide, brightened once a bad address was entered.
+                lines: vec![OverlayLine {
+                    text: if paired.is_some() && !*invalid {
+                        tr("중계 암호가 포함된 주소를 받았습니다.", "The connection address includes a relay password.")
+                    } else {
+                        tr("프록시 주소를 입력하거나 데스크톱에서 복사한 접속 주소를 붙여넣으세요.",
+                            "Enter a proxy URL or paste the connection address copied from the desktop.")
+                    }.to_owned(),
+                    selected: false,
+                    muted: !*invalid,
+                }],
+                slider: None,
+                hint: "Ctrl+P Paste  ·  Enter Save  ·  Ctrl+U Clear  ·  Esc Cancel".to_owned(),
+                closable: true,
+                style: OverlayStyle::ManagementPanel,
+                input: Some(editor),
+                input_label: "Address",
+                input_placeholder: "http://desktop-proxy.corp:3128",
+            }),
             PendingInteraction::ClaudePermissionsPanel {
                 tab,
                 selected,
@@ -14075,6 +14315,84 @@ impl AppState {
                 input_label: "",
                 input_placeholder: "",
             }),
+            PendingInteraction::SkinPicker { selected } => {
+                // Each row wears its own family colour; Default wears the real
+                // model's, which its label names.
+                let custom = match theme::skin() {
+                    Some(Skin::Rgb(rgb)) => format!(" ({})", rgb.hex()),
+                    _ => String::new(),
+                };
+                let labels = std::iter::once(format!("Default ({})", self.selected_model_display_name()))
+                    .chain(theme::SKINS.iter().map(|(_, label)| (*label).to_owned()))
+                    .chain(std::iter::once(format!("Custom RGB{custom}")));
+                Some(OverlayView {
+                    closable: true,
+                    title: "Skin".to_owned(),
+                    lines: labels
+                        .enumerate()
+                        .map(|(index, label)| OverlayLine {
+                            text: format!("{}. {label}", index + 1),
+                            selected: index == *selected,
+                            muted: false,
+                        })
+                        .collect(),
+                    slider: None,
+                    hint: "1-9, 0 select   ↑↓ navigate   Enter apply   Esc cancel".to_owned(),
+                    style: OverlayStyle::Picker,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
+                })
+            }
+            PendingInteraction::SkinRgb { editor, invalid } => Some(OverlayView {
+                title: "Custom RGB".to_owned(),
+                // The format guide, brightened once a bad colour was entered.
+                lines: vec![OverlayLine {
+                    text: tr(
+                        "#B500D1 또는 181,0,209 형식으로 입력하세요.",
+                        "Enter #B500D1 or 181,0,209.",
+                    )
+                    .to_owned(),
+                    selected: false,
+                    muted: !*invalid,
+                }],
+                slider: None,
+                hint: "Enter Next  ·  Ctrl+U Clear  ·  Esc Cancel".to_owned(),
+                closable: true,
+                style: OverlayStyle::ManagementPanel,
+                input: Some(editor),
+                input_label: "RGB",
+                input_placeholder: "#B500D1",
+            }),
+            PendingInteraction::SkinScope { selected, .. } => {
+                let rows = [
+                    (ModelScope::Session.label(), ModelScope::Session.detail()),
+                    (
+                        ModelScope::Default.label(),
+                        tr("다음 실행부터도 이 스킨을 씁니다", "Keeps this skin on every launch"),
+                    ),
+                ];
+                Some(OverlayView {
+                    closable: true,
+                    title: "Apply to".to_owned(),
+                    lines: rows
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (label, detail))| OverlayLine {
+                            text: format!("{}. {label:<17}  ·  {detail}", index + 1),
+                            selected: index == *selected,
+                            muted: false,
+                        })
+                        .collect(),
+                    slider: None,
+                    hint: "1-2 select  ·  ↑↓ navigate  ·  Enter to apply  ·  Esc to cancel"
+                        .to_owned(),
+                    style: OverlayStyle::Picker,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
+                })
+            }
             PendingInteraction::SessionPicker(picker) => Some(picker.overlay_view()),
             PendingInteraction::HistoryPicker(picker) => Some(picker.overlay_view()),
             PendingInteraction::McpPicker(picker) => Some(picker.overlay_view()),
@@ -14738,6 +15056,9 @@ impl AppState {
             return Vec::new();
         }
         let query = query.to_ascii_lowercase();
+        if query == "proxy" {
+            return Vec::new();
+        }
         let mut skills = self
             .skills
             .iter()
@@ -16311,6 +16632,9 @@ impl AppState {
             return Action::None;
         }
         match self.pending.take() {
+            Some(PendingInteraction::CodexProxyChoice { settings, .. }) if (1..=2).contains(&row) => {
+                self.choose_codex_proxy(settings, row - 1)
+            }
             Some(PendingInteraction::ModelPicker {
                 model_index,
                 query,
@@ -16361,6 +16685,10 @@ impl AppState {
                         Action::Tick(false)
                     }
                 }
+            }
+            Some(PendingInteraction::SkinPicker { .. }) if row < SKIN_ROWS => self.choose_skin(row),
+            Some(PendingInteraction::SkinScope { skin, .. }) if row < 2 => {
+                self.apply_skin(skin, row == 1)
             }
             Some(PendingInteraction::ThemePicker { theme_index }) => {
                 match ThemeKind::ALL.get(row) {
@@ -16757,6 +17085,22 @@ impl AppState {
         });
     }
 
+    fn choose_codex_proxy(&mut self, mut settings: CodexProxySettings, selected: usize) -> Action {
+        if selected == 1 {
+            settings.enabled = false;
+            return Action::PersistCodexProxy(settings);
+        }
+        let mut editor = Editor::default();
+        let address = CodexProxySettings::parse_address(&settings.address);
+        if let Some(address) = &address {
+            editor.set_text(CodexProxySettings::displayed_address(address));
+        }
+        self.pending = Some(PendingInteraction::CodexProxyAddress {
+            editor, paired: address.filter(|url| url.password().is_some()), invalid: false,
+        });
+        Action::None
+    }
+
     fn toggle_status_line_field(&mut self, field: StatusLineField) -> Action {
         let enabled = self.status_line_settings.toggle(field);
         Action::PersistStatusLine {
@@ -16870,6 +17214,37 @@ impl AppState {
     fn apply_theme(&mut self, selected: ThemeKind) -> Action {
         self.commit_welcome_card();
         Action::SetTheme(selected)
+    }
+
+    /// A `/skin` row: Custom RGB asks for the colour first; every other row
+    /// goes straight to how long it lasts.
+    fn choose_skin(&mut self, row: usize) -> Action {
+        if row == SKIN_ROWS - 1 {
+            let mut editor = Editor::default();
+            if let Some(Skin::Rgb(rgb)) = theme::skin() {
+                editor.set_text(Skin::Rgb(rgb).config_value());
+            }
+            self.pending = Some(PendingInteraction::SkinRgb { editor, invalid: false });
+        } else {
+            let skin = row
+                .checked_sub(1)
+                .and_then(|family| theme::SKINS.get(family))
+                .map(|(_, label)| Skin::Model(label));
+            self.pending = Some(PendingInteraction::SkinScope { skin, selected: 0 });
+        }
+        Action::None
+    }
+
+    /// `None` is Default: the real model's colours again. Saving it as the
+    /// default clears the saved skin.
+    fn apply_skin(&mut self, skin: Option<Skin>, save: bool) -> Action {
+        self.commit_welcome_card();
+        theme::set_skin(skin);
+        if save {
+            Action::PersistSkin(skin.map(Skin::config_value).unwrap_or_default())
+        } else {
+            Action::None
+        }
     }
 
     fn commit_welcome_card(&mut self) {
@@ -27562,6 +27937,57 @@ mod tests {
     }
 
     #[test]
+    fn skin_picks_a_family_or_typed_colour_for_the_session_or_as_default() {
+        let key = |state: &mut AppState, code| state.handle_key(KeyEvent::from(code));
+        let mut state = test_state();
+        theme::set_skin(None);
+        state.run_slash_command("/skin");
+        let overlay = state.overlay_view().expect("skin picker");
+        assert_eq!(overlay.lines.len(), SKIN_ROWS);
+        assert!(overlay.lines[0].text.starts_with("1. Default (") && overlay.lines[0].selected);
+        assert_eq!(overlay.lines[2].text, "3. Claude Opus");
+        assert_eq!(overlay.lines[9].text, "10. Custom RGB");
+
+        // A family for this session only: nothing is saved.
+        state.run_slash_command("/skin");
+        key(&mut state, KeyCode::Char('3'));
+        assert!(matches!(key(&mut state, KeyCode::Char('1')), Action::None));
+        assert_eq!(theme::skin(), Some(Skin::Model("Claude Opus")));
+        assert!(state.pending.is_none());
+
+        // `0` is Custom RGB; a bad colour stays open, a good one moves on.
+        state.run_slash_command("/skin");
+        assert!(matches!(state.pending, Some(PendingInteraction::SkinPicker { selected: 2 })));
+        key(&mut state, KeyCode::Char('0'));
+        state.handle_paste("#B5");
+        key(&mut state, KeyCode::Enter);
+        assert!(matches!(state.pending, Some(PendingInteraction::SkinRgb { invalid: true, .. })));
+        state.handle_paste("00D1");
+        key(&mut state, KeyCode::Enter);
+        assert!(matches!(
+            key(&mut state, KeyCode::Char('2')),
+            Action::PersistSkin(value) if value == "181,0,209"
+        ));
+        assert_eq!(theme::skin(), Some(Skin::Rgb(theme::Rgb(181, 0, 209))));
+
+        // The background's own colour is Default.
+        state.run_slash_command("/skin");
+        key(&mut state, KeyCode::Char('0'));
+        state.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        state.handle_paste(&theme::palette().background.hex());
+        key(&mut state, KeyCode::Enter);
+        assert!(matches!(state.pending, Some(PendingInteraction::SkinScope { skin: None, .. })));
+        state.pending = None;
+
+        // Default saved as the default clears the saved skin.
+        state.run_slash_command("/skin");
+        assert!(matches!(state.pending, Some(PendingInteraction::SkinPicker { selected: 9 })));
+        key(&mut state, KeyCode::Char('1'));
+        assert!(matches!(key(&mut state, KeyCode::Char('2')), Action::PersistSkin(value) if value.is_empty()));
+        assert_eq!(theme::skin(), None);
+    }
+
+    #[test]
     fn model_and_server_text_stays_korean_in_english_mode() {
         language::set_english(true);
         let hangul = |text: &str| text.chars().any(|ch| ('가'..='힣').contains(&ch));
@@ -35041,6 +35467,62 @@ mod tests {
         state.handle_key(KeyEvent::from(KeyCode::Backspace));
         state.handle_buffered_composer_text("$", false);
         assert!(!state.view().suggestions.is_empty());
+    }
+
+    #[test]
+    fn codex_proxy_is_hidden_but_can_be_configured_from_the_composer() {
+        let mut state = test_state();
+        state.update_skills(&json!({ "data": [{ "cwd": "cwd", "skills": [
+            { "name": "proxy", "path": "C:/skills/proxy/SKILL.md", "description": "Proxy", "enabled": true },
+            { "name": "proxy-helper", "path": "C:/skills/proxy-helper/SKILL.md", "description": "Proxy helper", "enabled": true }
+        ] }] }));
+        state.editor.set_text("/");
+        assert!(state.slash_suggestion_views().iter().all(|row| row.command != "/proxy"));
+        state.editor.set_text("/proxy");
+        assert!(state.slash_suggestion_views().is_empty());
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(state.overlay_view().unwrap().title, "Codex Proxy");
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(state.overlay_view().unwrap().title, "Codex Proxy Address");
+        state.handle_paste("invalid");
+        assert!(matches!(state.handle_key(KeyEvent::from(KeyCode::Enter)), Action::None));
+        assert!(!state.overlay_view().unwrap().lines.is_empty());
+        state.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        state.handle_paste("http://desktop:3128");
+        let Action::PersistCodexProxy(settings) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
+            panic!("valid proxy address should be saved");
+        };
+        assert!(settings.enabled);
+        assert_eq!(settings.address, "http://desktop:3128/");
+        assert!(state.overlay_view().is_none());
+
+        state.pending = Some(PendingInteraction::CodexProxyChoice { settings, selected: 0 });
+        let Action::PersistCodexProxy(settings) = state.click_overlay_row(2) else {
+            panic!("the off row should save the setting");
+        };
+        assert!(!settings.enabled);
+        assert_eq!(settings.address, "http://desktop:3128/");
+
+        state.run_command("/proxy");
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(state.handle_key(KeyEvent::from(KeyCode::Esc)), Action::None));
+        assert!(state.overlay_view().is_none());
+    }
+
+    #[test]
+    fn codex_proxy_accepts_the_standalone_address_without_displaying_its_password() {
+        let mut state = test_state();
+        let password = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 16]);
+        let address = format!("http://dvz:{password}@192.168.0.10:25080");
+        state.run_command("/proxy");
+        let panel = state.overlay_view().unwrap();
+        assert_eq!(panel.lines.len(), 3);
+        assert!(panel.lines.iter().all(|line| !line.text.contains("Desktop Relay")));
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+        state.handle_paste(&address);
+        assert_eq!(state.overlay_view().unwrap().input.unwrap().text(), "http://192.168.0.10:25080/");
+        assert!(matches!(state.handle_key(KeyEvent::from(KeyCode::Enter)), Action::PersistCodexProxy(settings)
+            if settings.address.trim_end_matches('/') == address));
     }
 
     #[test]

@@ -194,6 +194,7 @@ async fn main() -> Result<()> {
             )
         );
     }
+    theme::set_skin(state::read_vibe_setting(theme::SKIN_KEY).and_then(|value| theme::Skin::parse(&value)));
     let cwd = resolve_cwd(cli.cwd.as_deref())?;
     let mut server =
         BackendServer::spawn(&cli.codex, &cli.open_code, &cli.node, &cli.claude, &cwd).await?;
@@ -1072,8 +1073,10 @@ fn hold_until_thread(
         | Action::Quit
         | Action::SetTheme(_)
         | Action::PersistAutoKnowledge(_)
+        | Action::PersistCodexProxy(_)
         | Action::PersistPromptSuggestions(_)
         | Action::PersistLanguage(_)
+        | Action::PersistSkin(_)
         | Action::PersistModelFavorites(_)
         | Action::Copy(_)
         | Action::CopyQuietly(_)
@@ -1952,7 +1955,9 @@ async fn event_loop(
                             PreeditInput::Update(text) => {
                                 let input_state =
                                     focused_state_mut(state, &mut btw_state, split_focus);
-                                input_log::record(|| format!("preedit {text:?}"));
+                                if !input_state.proxy_address_input_active() {
+                                    input_log::record(|| format!("preedit {text:?}"));
+                                }
                                 apply_composer_preedit_update(
                                     input_state,
                                     &mut composer_paste,
@@ -1964,7 +1969,9 @@ async fn event_loop(
                     }
                     Some(Ok(Event::Key(key))) => {
                         let key = alt_code.normalize(key);
-                        if input_log::enabled() {
+                        if input_log::enabled()
+                            && !focused_state_mut(state, &mut btw_state, split_focus).proxy_address_input_active()
+                        {
                             let selection = renderer.composer_selection_range();
                             let select_all = renderer.composer_select_all_active();
                             let text = focused_state_mut(state, &mut btw_state, split_focus)
@@ -2135,7 +2142,7 @@ async fn event_loop(
                     }
                     Some(Ok(Event::Paste(text))) => {
                         let input_state = focused_state_mut(state, &mut btw_state, split_focus);
-                        if input_log::enabled() {
+                        if input_log::enabled() && !input_state.proxy_address_input_active() {
                             let select_all = renderer.composer_select_all_active();
                             let selection = renderer.composer_selection_range();
                             let composer = input_state.editor.text();
@@ -3425,6 +3432,13 @@ async fn run_action(
                 state.push_notice(BlockKind::Warning, "Auto knowledge setting save failed", error.to_string());
             }
         }
+        Action::PersistCodexProxy(settings) => match settings.save() {
+            Ok(()) => state.push_notice(BlockKind::System, "Codex Proxy", tr(
+                "설정을 저장했습니다. Devez Vibe를 다시 시작하면 적용됩니다.",
+                "Settings saved. Restart Devez Vibe to apply them.",
+            )),
+            Err(error) => state.push_notice(BlockKind::Warning, "Could not save Codex proxy", error.to_string()),
+        },
         Action::PersistModelFavorites(ids) => {
             if let Err(error) = state::write_model_favorites(&ids) {
                 state.push_notice(BlockKind::Warning, "Failed to save favorites", error.to_string());
@@ -3443,6 +3457,11 @@ async fn run_action(
                 state::write_vibe_config_value(language::CONFIG_KEY, language::config_value(english))
             {
                 state.push_notice(BlockKind::Warning, "Language setting save failed", error.to_string());
+            }
+        }
+        Action::PersistSkin(value) => {
+            if let Err(error) = state::write_vibe_config_value(theme::SKIN_KEY, &value) {
+                state.push_notice(BlockKind::Warning, "Skin setting save failed", error.to_string());
             }
         }
         Action::SetFast(enabled) => {
@@ -7011,16 +7030,24 @@ fn paste_clipboard_text_shortcut(
     now: Instant,
     selection: Option<std::ops::Range<usize>>,
 ) -> bool {
-    // A blocking overlay usually swallows Ctrl+V, but a free-text question is a
-    // text field like the composer and must accept a clipboard paste too.
-    if !is_paste_shortcut(key)
-        || (state.has_pending_interaction() && !state.buffers_pending_text_input())
+    let proxy_input = state.proxy_address_input_active();
+    // Terminals that consume Ctrl+V can still deliver Ctrl+P to the proxy form.
+    let direct_proxy_paste = proxy_input
+        && key.kind == crossterm::event::KeyEventKind::Press
+        && matches!(key.code, KeyCode::Char('p' | 'P'))
+        && key.modifiers == KeyModifiers::CONTROL;
+    if !(is_paste_shortcut(key) || direct_proxy_paste)
+        || (state.has_pending_interaction() && !state.buffers_pending_text_input() && !proxy_input)
     {
         return false;
     }
     let Some(text) = clipboard_text().filter(|text| !text.is_empty()) else {
         return false;
     };
+    if direct_proxy_paste {
+        apply_direct_paste(state, &text);
+        return true;
+    }
     // A paste replaces the selection the way typing does. The clipboard is read
     // first, so a paste that never arrives leaves the selected text in place.
     if let Some(range) = selection {

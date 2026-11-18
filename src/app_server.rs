@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
@@ -162,6 +163,108 @@ pub enum ServerEvent {
     Closed(String),
 }
 
+#[derive(Default, serde::Deserialize, serde::Serialize)]
+pub(crate) struct CodexProxySettings {
+    pub enabled: bool,
+    pub address: String,
+}
+
+impl CodexProxySettings {
+    pub fn parse_address(address: &str) -> Option<reqwest::Url> {
+        let address = address.trim();
+        if address.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+            return None;
+        }
+        let url = reqwest::Url::parse(address).ok()?;
+        (matches!(url.scheme(), "http" | "https")
+            && url.host().is_some()
+            && url.port() != Some(0)
+            && ((url.username().is_empty() && url.password().is_none())
+                || Self::is_relay_address(&url))
+            && url.path() == "/"
+            && url.query().is_none()
+            && url.fragment().is_none())
+        .then_some(url)
+    }
+
+    fn is_relay_address(url: &reqwest::Url) -> bool {
+        url.scheme() == "http" && url.username() == "dvz"
+            && url.host_str().and_then(|host| host.parse::<std::net::Ipv4Addr>().ok())
+                .is_some_and(|ip| ip.is_private() || ip.is_loopback())
+            && url.password().is_some_and(|password| {
+                URL_SAFE_NO_PAD.decode(password).is_ok_and(|secret| secret.len() == 16)
+            })
+    }
+
+    pub fn displayed_address(url: &reqwest::Url) -> String {
+        let mut display = url.clone();
+        let _ = display.set_password(None);
+        let _ = display.set_username("");
+        display.to_string()
+    }
+
+    fn path() -> Option<PathBuf> {
+        crate::state::vibe_settings_path().map(|path| path.with_file_name("codex-proxy.json"))
+    }
+
+    pub fn load() -> std::io::Result<Self> {
+        if cfg!(test) {
+            return Ok(Self::default());
+        }
+        match Self::path() {
+            Some(path) => Self::load_at(&path),
+            None => Ok(Self::default()),
+        }
+    }
+
+    fn load_at(path: &Path) -> std::io::Result<Self> {
+        match std::fs::read(path) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn save(&self) -> std::io::Result<()> {
+        let path = Self::path().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                tr("Devez Vibe 설정 경로를 찾을 수 없습니다.", "Can't find the Devez Vibe settings path."),
+            )
+        })?;
+        self.save_at(&path)
+    }
+
+    fn save_at(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        let bytes = serde_json::to_vec_pretty(self)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&temporary)?;
+        use std::io::Write;
+        let result = file.write_all(&bytes).and_then(|_| file.sync_all());
+        drop(file);
+        result.and_then(|_| std::fs::rename(&temporary, path)).inspect_err(|_| {
+            let _ = std::fs::remove_file(&temporary);
+        })
+    }
+
+    fn endpoint(&self) -> Result<Option<reqwest::Url>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        Self::parse_address(&self.address).map(Some).context(tr(
+            "저장된 Codex 프록시 주소가 올바르지 않습니다. /proxy에서 다시 설정하세요.",
+            "The saved Codex proxy address is invalid. Set it again with /proxy.",
+        ))
+    }
+}
+
 pub struct AppServer {
     child: Child,
     /// app-server가 띄운 MCP 서버까지 함께 끝낸다.
@@ -177,10 +280,12 @@ pub struct AppServer {
     stderr_task: JoinHandle<()>,
     config_path: Option<PathBuf>,
     computer_use_pipe: Mutex<Option<String>>,
+    proxy: Option<reqwest::Url>,
 }
 
 impl AppServer {
     pub async fn spawn(codex_path: &Path, devezcode_room: Option<&str>) -> Result<Self> {
+        let proxy = CodexProxySettings::load()?.endpoint()?;
         let config_path = crate::state::codex_home().map(|home| home.join("config.toml"));
         let computer_use_pipe = config_path
             .as_deref()
@@ -193,6 +298,7 @@ impl AppServer {
         }
         let resolved_codex = resolve_command(codex_path);
         let mut command = codex_command(&resolved_codex);
+        apply_codex_proxy(&mut command, proxy.as_ref());
         if current_process_is_elevated()
             && let Some(path) = &config_path
             && let (Some(home), Ok(config)) = (path.parent(), std::fs::read_to_string(path))
@@ -332,6 +438,7 @@ impl AppServer {
             stderr_task,
             config_path,
             computer_use_pipe: Mutex::new(computer_use_pipe),
+            proxy,
         })
     }
 
@@ -339,6 +446,10 @@ impl AppServer {
         let response = self.request("initialize", initialize_params()).await?;
         self.notify("initialized", None)?;
         Ok(response)
+    }
+
+    pub(crate) fn proxy(&self) -> Option<&reqwest::Url> {
+        self.proxy.as_ref()
     }
 
     pub async fn request(&self, method: &str, mut params: Value) -> Result<Value> {
@@ -655,6 +766,18 @@ fn codex_command(resolved: &Path) -> Command {
     codex_invocation(resolved, &["app-server", "--listen", "stdio://"])
 }
 
+fn apply_codex_proxy(command: &mut Command, proxy: Option<&reqwest::Url>) {
+    if let Some(proxy) = proxy {
+        command.env("HTTPS_PROXY", proxy.as_str());
+        #[cfg(not(windows))]
+        command.env("https_proxy", proxy.as_str());
+        command.args([
+            "-c", "features.respect_system_proxy=false",
+            "-c", "features.system_proxy_fallback=false",
+        ]);
+    }
+}
+
 fn codex_invocation(resolved: &Path, args: &[&str]) -> Command {
     // Keep the selected launcher authoritative. The npm shim also selects the
     // platform package and prepares its environment; a guessed vendored binary
@@ -672,7 +795,8 @@ Not counting spaces, aim for about 20 bytes and never exceed 24, counting a Kore
 No quotes or trailing punctuation. Reply with the title only. Do not run commands or use tools.";
 /// Enough of a long first prompt to say what it is about.
 const TITLE_PROMPT_CHARS: usize = 2_000;
-/// Titles aim at about 20 bytes; this enforces the 24 the prompt allows.
+/// Titles aim at about 20 bytes; past the 24 the prompt allows, only the
+/// word the limit falls in is kept.
 const TITLE_BYTES: usize = 24;
 
 /// What both runtimes are asked to title a new session from, in the language
@@ -697,6 +821,7 @@ pub(crate) fn spawn_thread_title(
     thread_id: String,
     model: &str,
     prompt: &str,
+    proxy: Option<&reqwest::Url>,
 ) {
     let mut command = codex_invocation(
         &resolve_command(codex_path),
@@ -716,6 +841,7 @@ pub(crate) fn spawn_thread_title(
             model,
         ],
     );
+    apply_codex_proxy(&mut command, proxy);
     command
         .arg("-C")
         .arg(env::temp_dir())
@@ -815,8 +941,9 @@ pub(crate) fn clean_title(reply: &str) -> Option<String> {
         .trim_start_matches(['#', '*', '"', '\'', '`', '“', '‘', ' '])
         .trim_end_matches(['*', '"', '\'', '`', '”', '’', '.', '。', ' ']);
     // A model counts loosely, so the cap is enforced here: spaces are free, a
-    // Korean character weighs 2 and an English letter or digit 1. The cut falls
-    // at the last space that fits when it would split a word.
+    // Korean character weighs 2 and an English letter or digit 1. A word the cap
+    // would split is kept whole and the words after it dropped; only a title
+    // that is one long word is cut inside it.
     let mut bytes = 0;
     let overflow = title.char_indices().find(|&(_, c)| {
         if !c.is_whitespace() {
@@ -827,7 +954,13 @@ pub(crate) fn clean_title(reply: &str) -> Option<String> {
     let title = match overflow {
         Some((end, _)) => {
             let fitted = &title[..end];
-            fitted.rfind(' ').map_or(fitted, |space| &fitted[..space])
+            if fitted.ends_with(char::is_whitespace) || !fitted.contains(char::is_whitespace) {
+                fitted
+            } else {
+                title[end..]
+                    .find(char::is_whitespace)
+                    .map_or(title, |space| &title[..end + space])
+            }
         }
         None => title,
     }
@@ -1282,6 +1415,47 @@ mod tests {
     impl Drop for CodexLauncherFixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn codex_proxy_persists_the_address_when_disabled() {
+        let fixture = CodexLauncherFixture::new();
+        let path = fixture.0.join("codex-proxy.json");
+        assert!(CodexProxySettings::load_at(&path).unwrap().endpoint().unwrap().is_none());
+
+        let mut settings = CodexProxySettings {
+            enabled: true,
+            address: "http://[2001:db8::1]:3128/".to_owned(),
+        };
+        settings.save_at(&path).unwrap();
+        let saved = CodexProxySettings::load_at(&path).unwrap();
+        let endpoint = saved.endpoint().unwrap().unwrap();
+        assert_eq!(endpoint.as_str(), settings.address);
+
+        settings.enabled = false;
+        settings.save_at(&path).unwrap();
+        let saved = CodexProxySettings::load_at(&path).unwrap();
+        assert_eq!(saved.address, settings.address);
+        assert!(saved.endpoint().unwrap().is_none());
+
+        let mut command = codex_command(Path::new("codex"));
+        apply_codex_proxy(&mut command, saved.endpoint().unwrap().as_ref());
+        assert!(command.as_std().get_envs().all(|(key, _)| key != "HTTPS_PROXY"));
+        apply_codex_proxy(&mut command, Some(&endpoint));
+        assert!(command.as_std().get_envs().any(|(key, value)| {
+            key == "HTTPS_PROXY" && value.is_some_and(|value| value == settings.address.as_str())
+        }));
+    }
+
+    #[test]
+    fn codex_proxy_rejects_credentials_paths_and_non_http_addresses() {
+        for address in [
+            "", "desktop:3128", "socks5://desktop:3128", "http://user:pass@desktop",
+            "http://desktop:0", "http://desktop:99999", "https://desktop/path",
+            "https://desktop?data=1", "https://desktop#part", "http://desk\ttop:3128",
+        ] {
+            assert!(CodexProxySettings::parse_address(address).is_none());
         }
     }
 
@@ -2256,14 +2430,22 @@ mod tests {
             clean_title(&"가".repeat(80)).map(|title| title.chars().count()),
             Some(TITLE_BYTES / 2)
         );
-        // Spaces are free, Korean weighs 2 and ASCII 1; past 24 the cut falls at a space.
+        // Spaces are free, Korean weighs 2 and ASCII 1; a word split at 24 stays whole.
         assert_eq!(
             clean_title("세션 자동 이름 생성 규칙 변경").as_deref(),
             Some("세션 자동 이름 생성 규칙 변경")
         );
         assert_eq!(
-            clean_title("세션 자동 이름 생성 규칙을 변경").as_deref(),
-            Some("세션 자동 이름 생성 규칙을")
+            clean_title("세션 자동 이름 생성 규칙 변경 추가").as_deref(),
+            Some("세션 자동 이름 생성 규칙 변경")
+        );
+        assert_eq!(
+            clean_title("세션 자동 이름 생성 규칙을 변경 추가").as_deref(),
+            Some("세션 자동 이름 생성 규칙을 변경")
+        );
+        assert_eq!(
+            clean_title("내 PC를 프록시로 써서 접속하기").as_deref(),
+            Some("내 PC를 프록시로 써서 접속하기")
         );
         assert_eq!(
             clean_title("rename 기능 12개 추가").as_deref(),
@@ -2271,7 +2453,7 @@ mod tests {
         );
         assert_eq!(
             clean_title("Fix the login flow for OAuth users on Windows").as_deref(),
-            Some("Fix the login flow for OAuth")
+            Some("Fix the login flow for OAuth users")
         );
     }
 
