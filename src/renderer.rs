@@ -6263,6 +6263,8 @@ struct StatusArea {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tone {
     Plain,
+    /// Panel input text under Ctrl+A, painted on the theme's selection block.
+    SelectedInput,
     /// Composer text the IME has not committed yet: foreground, host-decorated.
     ComposerPreedit,
     Muted,
@@ -9471,7 +9473,12 @@ fn overlay_frame_with_expansion(
                             &continuation,
                             Tone::Border,
                             part,
-                            Tone::Plain,
+                            // A selected prompt row means its typed answer is selected.
+                            if overlay.lines.first().is_some_and(|prompt| prompt.selected) {
+                                Tone::SelectedInput
+                            } else {
+                                Tone::Plain
+                            },
                             false,
                             wrap_width,
                         )
@@ -14841,6 +14848,7 @@ fn word_background(tone: Tone) -> Option<Rgb> {
         Tone::AssistantBubble | Tone::AssistantBubbleHalf => assistant_bubble_background(),
         Tone::DiffAddedWord => palette.diff_add_word_bg,
         Tone::DiffRemovedWord => palette.diff_remove_word_bg,
+        Tone::SelectedInput => theme::selection_bg(),
         // The status-line model reading stays flat at rest; only the hover pass
         // paints a band behind it.
         _ => return None,
@@ -15153,7 +15161,7 @@ fn status_effort_tone(effort: &str) -> Option<Tone> {
 fn tone_rgb(tone: Tone) -> Option<Rgb> {
     let palette = theme::palette();
     Some(match tone {
-        Tone::Plain | Tone::ComposerPreedit | Tone::QuestionText => palette.foreground,
+        Tone::Plain | Tone::SelectedInput | Tone::ComposerPreedit | Tone::QuestionText => palette.foreground,
         Tone::Muted | Tone::Thinking | Tone::PlanDone => palette.muted,
         Tone::Accent => palette.accent,
         Tone::User => palette.blue,
@@ -26552,6 +26560,43 @@ mod tests {
             body.iter().all(|line| painted(line).ends_with('│')),
             "a body row lost its right border"
         );
+    }
+
+    #[test]
+    fn selected_panel_input_is_painted_on_the_selection_block() {
+        let mut editor = Editor::default();
+        editor.insert_str("sk-key");
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                closable: false,
+                title: "테스트".to_owned(),
+                lines: vec![OverlayLine {
+                    text: "테스트 선택지 중 어느 것 고를래?".to_owned(),
+                    selected: true,
+                    muted: false,
+                }],
+                slider: None,
+                hint: "Enter Send · Esc Cancel".to_owned(),
+                style: OverlayStyle::Question,
+                input: Some(&editor),
+                input_label: "Answer",
+                input_placeholder: "Type your answer…",
+            },
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+        let key_row = frame.lines.iter().find(|line| painted(line).contains("sk-key")).unwrap();
+        assert!(key_row.tail.iter().any(|span| span.text.contains("sk-key") && span.tone == Tone::SelectedInput));
+        assert_eq!(word_background(Tone::SelectedInput), Some(theme::selection_bg()));
     }
 
     #[test]

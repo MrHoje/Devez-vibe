@@ -7030,7 +7030,7 @@ fn paste_clipboard_text_shortcut(
     // A blocking overlay usually swallows Ctrl+V, but a free-text question is a
     // text field like the composer and must accept a clipboard paste too.
     if !is_paste_shortcut(key)
-        || (state.has_pending_interaction() && !state.buffers_pending_text_input())
+        || (state.has_pending_interaction() && !state.pending_takes_clipboard_text())
     {
         return false;
     }

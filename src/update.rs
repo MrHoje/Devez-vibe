@@ -23,12 +23,14 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude provider에서 `/api`에서 API 키 변경과 켜기·끄기를 골라, 구독 계정 대신 API 키로 호출할 수 있습니다.",
+    "`/api`의 API 키 입력 창에서 Ctrl+V 붙여넣기, Ctrl+A 전체 선택, Ctrl+Z·Ctrl+Y 되돌리기 등 입력창 편집 키를 쓸 수 있습니다.",
+    "API 키가 잘못되면 로그인 만료 대신 `/api`에서 키를 확인하라는 안내를 표시합니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "In the Claude provider, use `/api` to change your API key or turn it on and off, so calls use an API key instead of your subscription account.",
+    "The `/api` key field now supports composer editing keys: Ctrl+V paste, Ctrl+A select all, Ctrl+Z/Ctrl+Y undo and redo, and more.",
+    "A rejected API key now asks you to check the key in `/api` instead of reporting an expired login.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

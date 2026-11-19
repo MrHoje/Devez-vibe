@@ -1767,6 +1767,11 @@ enum PendingInteraction {
     },
     ClaudeApiKeyInput {
         editor: Editor,
+        /// Ctrl+A: the next typed, pasted or deleted text replaces the whole key.
+        select_all: bool,
+        /// Ctrl+Z / Ctrl+Y, one step per edit like the composer.
+        undo: Vec<crate::editor::Stash>,
+        redo: Vec<crate::editor::Stash>,
     },
     VibeModePicker {
         selected: usize,
@@ -4787,7 +4792,12 @@ impl AppState {
             // 저장된 키를 채워 두어 그대로 고쳐 쓸 수 있게 한다.
             let mut editor = Editor::default();
             editor.set_text(&self.claude_api_key);
-            self.pending = Some(PendingInteraction::ClaudeApiKeyInput { editor });
+            self.pending = Some(PendingInteraction::ClaudeApiKeyInput {
+                editor,
+                select_all: false,
+                undo: Vec::new(),
+                redo: Vec::new(),
+            });
         } else {
             self.open_setting_picker(DisplaySetting::ClaudeApi, usize::from(!self.claude_api_serving));
         }
@@ -5632,6 +5642,12 @@ impl AppState {
     /// character from the screen even though it reached the editor.
     pub fn buffers_pending_text_input(&self) -> bool {
         self.pending_text_input_target().is_some()
+    }
+
+    /// Whether Ctrl+V should read the clipboard while a panel is open.
+    pub fn pending_takes_clipboard_text(&self) -> bool {
+        self.buffers_pending_text_input()
+            || matches!(self.pending, Some(PendingInteraction::ClaudeApiKeyInput { .. }))
     }
 
     pub fn update_skills(&mut self, response: &Value) {
@@ -8623,7 +8639,14 @@ impl AppState {
             Some(PendingInteraction::ClaudePermissionRuleInput { editor, .. }) => {
                 editor.insert_str(text)
             }
-            Some(PendingInteraction::ClaudeApiKeyInput { editor }) => editor.insert_str(text.trim()),
+            Some(PendingInteraction::ClaudeApiKeyInput { editor, select_all, undo, redo }) => {
+                undo.push(editor.snapshot());
+                redo.clear();
+                if std::mem::take(select_all) {
+                    editor.clear();
+                }
+                editor.insert_str(text.trim())
+            }
             Some(_) => {}
             None => {
                 self.insert_composer_text(text, pasted);
@@ -10648,7 +10671,7 @@ impl AppState {
                     self.committed.push(Block::new(
                         BlockKind::Error,
                         "Response generation failed",
-                        provider_error_text(error, claude),
+                        provider_error_text(error, claude, self.claude_api_serving),
                     ));
                     if claude && is_safeguard_block(message) {
                         self.open_safeguard_block();
@@ -11085,7 +11108,7 @@ impl AppState {
                             _ => "Provider error",
                         }
                     },
-                    provider_error_text(error, provider == "Claude"),
+                    provider_error_text(error, provider == "Claude", self.claude_api_serving),
                 ));
                 if !retry && provider == "Claude" && is_safeguard_block(message) {
                     self.open_safeguard_block();
@@ -11157,7 +11180,7 @@ impl AppState {
                 self.push_notice(
                     BlockKind::Error,
                     "Compaction failed",
-                    provider_error_text(&params["error"], false),
+                    provider_error_text(&params["error"], false, false),
                 );
             }
             "thread/compacted" => {
@@ -12842,8 +12865,23 @@ impl AppState {
                 self.pending = Some(PendingInteraction::ClaudeApiMenu { selected });
                 Action::None
             }
-            PendingInteraction::ClaudeApiKeyInput { mut editor } => {
+            PendingInteraction::ClaudeApiKeyInput { mut editor, select_all, mut undo, mut redo } => {
+                let mut selecting = false;
+                let before = editor.snapshot();
                 match key.code {
+                    KeyCode::Char('z' | 'ㅋ' | 'y' | 'ㅛ') if ctrl => {
+                        let (from, to) = if matches!(key.code, KeyCode::Char('y' | 'ㅛ')) {
+                            (&mut redo, &mut undo)
+                        } else {
+                            (&mut undo, &mut redo)
+                        };
+                        if let Some(saved) = from.pop() {
+                            to.push(editor.snapshot());
+                            editor.restore_stash(saved);
+                        }
+                        self.pending = Some(PendingInteraction::ClaudeApiKeyInput { editor, select_all: false, undo, redo });
+                        return Action::None;
+                    }
                     KeyCode::Esc => return Action::None,
                     KeyCode::Enter => {
                         let typed = editor.text().trim().to_owned();
@@ -12851,11 +12889,35 @@ impl AppState {
                             return self.save_claude_api_key(typed);
                         }
                     }
+                    // The composer's editing keys. Ctrl+A selects the whole key the
+                    // way the composer does, so what comes next replaces it.
+                    KeyCode::Char('a' | 'ㅁ') if ctrl => selecting = !editor.is_empty(),
+                    KeyCode::Backspace | KeyCode::Delete if select_all => editor.clear(),
+                    KeyCode::Char(ch) if !ctrl && !alt && select_all => editor.set_text(ch.to_string()),
+                    KeyCode::Backspace if ctrl => editor.delete_word_left(),
                     KeyCode::Backspace => editor.backspace(),
+                    KeyCode::Delete if ctrl => editor.delete_word_right(),
+                    KeyCode::Delete => editor.delete(),
+                    KeyCode::Left if ctrl || alt => editor.move_word_left(),
+                    KeyCode::Right if ctrl || alt => editor.move_word_right(),
+                    KeyCode::Left => editor.move_left(),
+                    KeyCode::Right => editor.move_right(),
+                    KeyCode::Home => editor.move_home(),
+                    KeyCode::End => editor.move_end(),
+                    KeyCode::Char('e') if ctrl => editor.move_end(),
+                    KeyCode::Char('w') if ctrl => editor.delete_word_left(),
+                    KeyCode::Char('k') if ctrl => editor.delete_to_line_end(),
+                    KeyCode::Char('u') if ctrl => editor.delete_to_line_start(),
+                    KeyCode::Char('b') if alt => editor.move_word_left(),
+                    KeyCode::Char('f') if alt => editor.move_word_right(),
                     KeyCode::Char(ch) if !ctrl && !alt => editor.insert(ch),
                     _ => {}
                 }
-                self.pending = Some(PendingInteraction::ClaudeApiKeyInput { editor });
+                if !editor.matches_snapshot(&before) {
+                    undo.push(before);
+                    redo.clear();
+                }
+                self.pending = Some(PendingInteraction::ClaudeApiKeyInput { editor, select_all: selecting, undo, redo });
                 Action::None
             }
             PendingInteraction::VibeModePicker {
@@ -14170,17 +14232,23 @@ impl AppState {
                     input_placeholder: "",
                 })
             }
-            PendingInteraction::ClaudeApiKeyInput { editor } => Some(OverlayView {
+            PendingInteraction::ClaudeApiKeyInput { editor, select_all, .. } => Some(OverlayView {
                 closable: true,
                 title: "Claude API · API Key".to_owned(),
                 // 질문 카드 모양을 빌려 키를 패널 안 입력 줄에서 받는다.
                 lines: vec![OverlayLine {
                     text: tr("Claude API 키를 입력하세요.", "Enter the Claude API key.").to_owned(),
-                    selected: false,
+                    // The renderer paints the typed key as selected under this flag.
+                    selected: *select_all,
                     muted: false,
                 }],
                 slider: None,
-                hint: "Enter next  ·  Esc cancel".to_owned(),
+                hint: if *select_all {
+                    "All selected · Type or paste to replace  ·  Esc cancel"
+                } else {
+                    "Enter save  ·  Esc cancel"
+                }
+                .to_owned(),
                 style: OverlayStyle::Question,
                 input: Some(editor),
                 input_label: "",
@@ -17870,9 +17938,12 @@ fn codex_warning_block(method: &str, params: &Value) -> Block {
 /// What a failed turn says on screen. An expired login gets the fix; anything
 /// else is condensed, since a raw transport error can fill the screen. The
 /// Claude bridge reports an expired login with Codex's `unauthorized` too.
-fn provider_error_text(error: &Value, claude: bool) -> String {
+fn provider_error_text(error: &Value, claude: bool, api_key: bool) -> String {
     if error.get("codexErrorInfo").and_then(Value::as_str) == Some("unauthorized") {
-        return if claude {
+        // With `/api` on, the CLI's "Invalid API key" arrives as the same unauthorized.
+        return if claude && api_key {
+            "Claude API key was rejected. Check the key in /api."
+        } else if claude {
             "Claude login expired. Run /login to sign in again."
         } else {
             "Codex login expired. Run /login to sign in again."
@@ -28329,6 +28400,24 @@ mod tests {
             press(&mut state, KeyCode::Backspace);
         }
         assert!(matches!(press(&mut state, KeyCode::Enter), Action::None), "an empty key is not saved");
+        assert!(state.pending_takes_clipboard_text(), "Ctrl+V reads the clipboard into the key field");
+        // Composer editing keys: Ctrl+A then a paste replaces the whole key.
+        for ch in "old-key".chars() {
+            press(&mut state, KeyCode::Char(ch));
+        }
+        state.handle_key(key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(state.overlay_view().unwrap().input.unwrap().text(), "old-");
+        state.handle_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert_eq!(state.overlay_view().unwrap().input.unwrap().text(), "old-key");
+        state.handle_key(key(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert_eq!(state.overlay_view().unwrap().input.unwrap().text(), "old-");
+        state.handle_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert!(state.overlay_view().unwrap().hint.starts_with("All selected"));
+        state.handle_paste(" sk-ant-Pasted\n");
+        assert_eq!(state.overlay_view().unwrap().input.unwrap().text(), "sk-ant-Pasted");
+        for _ in "sk-ant-Pasted".chars() {
+            press(&mut state, KeyCode::Backspace);
+        }
         for ch in "sk-ant-Next".chars() {
             press(&mut state, KeyCode::Char(ch));
         }
@@ -28419,6 +28508,11 @@ mod tests {
                 "Codex login expired. Run /login to sign in again.",
                 "stream error: Overloaded",
             ]
+        );
+        let unauthorized = json!({ "message": "Invalid API key", "codexErrorInfo": "unauthorized" });
+        assert_eq!(
+            provider_error_text(&unauthorized, true, true),
+            "Claude API key was rejected. Check the key in /api."
         );
     }
 
