@@ -23,12 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Monitor 같은 백그라운드 이벤트로 이어지던 Claude 작업이 사용량 한도에 걸리면, 한도가 초기화된 뒤에도 자동으로 이어가지 않고 멈추던 문제를 고쳤습니다.",
+    "Claude CLI가 충돌한 뒤 응답하지 않으면 작업 중 표시가 끝없이 이어지고, Esc를 누르면 화면이 멈추던 문제를 고쳤습니다. 이제 약 100초 뒤(Esc를 누르면 5초 뒤) 작업을 오류로 끝내고, 다음 입력에서 세션을 다시 엽니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Fixed Claude work driven by background events such as Monitor stopping at the usage limit instead of resuming automatically after the reset.",
+    "Fixed an endless working indicator, and a frozen screen on Esc, when the Claude CLI stopped responding after a crash. The turn now ends with an error after about 100 seconds (5 seconds after Esc), and the next prompt reopens the session.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

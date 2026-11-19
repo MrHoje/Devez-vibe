@@ -2045,6 +2045,41 @@ function isClaudeCliCrash(error) {
   return Number(code) >= 0xC0000000;
 }
 
+// 충돌한 CLI(PCFILTER 후킹 DLL)가 종료 단계에서 멈추거나 출력 파이프를 남기고 끝나면
+// SDK는 끝을 몰라 턴이 영원히 실행 중이고 제어 요청에도 답이 없다. 정상 CLI는 1초 안팎에 답한다.
+// 호스트가 20초 정적 뒤 묻기 시작하므로 마지막 진행에서 100초 뒤에 끊는다.
+const CLI_PROBE_TIMEOUT_MS = 80_000;
+const CLI_INTERRUPT_TIMEOUT_MS = 5_000;
+
+// 시한 안에 성공으로 답했는지. 거절도 false다: 프로세스가 이미 끝나 쓰기가 막힌 경우다.
+async function cliAnswers(request, ms) {
+  let timer;
+  const expired = new Promise((resolve) => { timer = setTimeout(resolve, ms, false); });
+  try {
+    return await Promise.race([request.then(() => true, () => false), expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 답하지 않는 CLI를 버린다. 다음 입력은 세션 없음으로 실패해 호스트가 기록에서 다시 연다.
+function dropUnresponsiveCli(session, query) {
+  if (session.closed || session.query !== query) return;
+  finishTurn(session, new Error("Claude CLI가 응답하지 않아 연결을 끊었습니다. 다음 입력에서 세션을 다시 엽니다."));
+  closeLiveSession(session);
+}
+
+// 호스트가 조용한 턴을 물어 올 때 CLI가 살아 있는지도 확인한다.
+function probeCli(session) {
+  const query = session.query;
+  if (!session.turn || !query || session.cliProbe) return;
+  session.cliProbe = cliAnswers(query.mcpServerStatus(), CLI_PROBE_TIMEOUT_MS).then((alive) => {
+    session.cliProbe = null;
+    if (!alive) dropUnresponsiveCli(session, query);
+  });
+  return session.cliProbe;
+}
+
 async function createSession(params, resumeId) {
   const id = resumeId || randomUUID();
   const queue = new AsyncQueue();
@@ -4965,6 +5000,7 @@ async function dispatch(method, params = {}) {
     // it has exited or released it. `sessionMissing` lets the host's stall probe
     // end the turn, where a bare "unknown" kept it waiting forever.
     if (!session) return { known: false, running: false, turnId: null, sessionMissing: true };
+    probeCli(session);
     return { known: true, running: Boolean(session.turn), turnId: session.turn?.id ?? null };
   }
   if (method === "session/start") {
@@ -5084,16 +5120,17 @@ async function dispatch(method, params = {}) {
     }
     if (session?.turn) {
       const turn = session.turn;
+      const query = session.query;
       turn.interruptRequested = true;
-      try {
-        // A plain interrupt keeps steers the CLI has queued, and they then ran as
-        // a new turn after the stop (measured on 0.3.309). `cancelQueued` drops
-        // them; the runtime has it (capability `interrupt_cancel_queued_v1`)
-        // though the typings do not, and older CLIs ignore the field.
-        await withSessionQuery(session, (query) => query.interrupt({ cancelQueued: true }));
-      } catch (error) {
-        if (session.turn === turn) delete turn.interruptRequested;
-        throw error;
+      // A plain interrupt keeps steers the CLI has queued, and they then ran as
+      // a new turn after the stop (measured on 0.3.309). `cancelQueued` drops
+      // them; the runtime has it (capability `interrupt_cancel_queued_v1`)
+      // though the typings do not, and older CLIs ignore the field.
+      const interrupt = withSessionQuery(session, (current) => current.interrupt({ cancelQueued: true }));
+      // 답 없는 중단을 기다리면 호스트 화면이 요청 상한(10분)까지 멈춘다.
+      if (!await cliAnswers(interrupt, CLI_INTERRUPT_TIMEOUT_MS)) {
+        dropUnresponsiveCli(session, query);
+        return {};
       }
       // Kept open for a steer whose run has not begun: nothing is running to
       // send the result that would close it.
@@ -6911,6 +6948,33 @@ async function runSelfTest() {
     } finally {
       process.stdout.write = steerWrite;
       sessions.delete(steerSession.id);
+    }
+    // A CLI that stopped answering (hung on exit, or gone with its pipe held) ends
+    // its turn on the quiet-turn probe or Esc instead of leaving the host spinning.
+    if (await cliAnswers(new Promise(() => {}), 10) || !await cliAnswers(Promise.resolve(), 10)) {
+      throw new Error("Claude CLI answer timeout self-test failed");
+    }
+    const deadNotices = [];
+    const deadWrite = process.stdout.write;
+    process.stdout.write = (chunk) => { deadNotices.push(JSON.parse(String(chunk))); return true; };
+    try {
+      const gone = () => Promise.reject(new Error("ProcessTransport is not ready for writing"));
+      for (const [method, query] of [
+        ["session/turnStatus", { mcpServerStatus: gone, close() {} }],
+        ["session/interrupt", { interrupt: gone, close() {} }],
+      ]) {
+        const deadSession = { ...steerSession, id: `dead-cli-${method}`, turn: null, query, pendingPrompts: [] };
+        sessions.set(deadSession.id, deadSession);
+        beginTurn(deadSession);
+        await dispatch(method, { sessionId: deadSession.id });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const failed = deadNotices.findLast((notice) => notice.method === "turn/completed")?.params?.turn;
+        if (deadSession.turn || sessions.has(deadSession.id) || failed?.status !== "failed") {
+          throw new Error(`Claude unresponsive CLI kept its turn after ${method}: ${JSON.stringify(failed)}`);
+        }
+      }
+    } finally {
+      process.stdout.write = deadWrite;
     }
     // The CLI's own session state reaches the host once per change, and a
     // session that closes never leaves the host spinning.
