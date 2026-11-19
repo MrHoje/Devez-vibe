@@ -23,12 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Builder 에이전트 지침을 보강했습니다. 수정 범위(호출부·테스트·설정)를 먼저 확인하고, 건너뛴 점과 위험을 한 줄로 알려줍니다.",
+    "Monitor 같은 백그라운드 이벤트로 이어지던 Claude 작업이 사용량 한도에 걸리면, 한도가 초기화된 뒤에도 자동으로 이어가지 않고 멈추던 문제를 고쳤습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Strengthened the Builder agent instructions. It checks what a change must reach (callers, tests, config) first and reports what it skipped and any risk in one line.",
+    "Fixed Claude work driven by background events such as Monitor stopping at the usage limit instead of resuming automatically after the reset.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

@@ -4038,7 +4038,9 @@ async function consumeMessage(session, message) {
       notify("claude/promptSuggestion", { threadId: session.id, suggestion: message.suggestion });
     }
   } else if (message.type === "rate_limit_event") {
+    // Monitor 등 자동 실행은 첫 응답에서 턴이 열리므로 그 전에 온 한도는 그 턴에 넘긴다.
     if (session.turn) session.turn.rateLimitInfo = message.rate_limit_info;
+    else session.pendingRateLimitInfo = message.rate_limit_info;
     notify("claude/account/updated", { threadId: session.id, rateLimitInfo: message.rate_limit_info });
   } else if (message.type === "system" && message.subtype === "api_retry") {
     notify("warning", { threadId: session.id, provider: "Claude", message: `Claude API 재시도 ${message.attempt}/${message.max_retries}` });
@@ -4293,7 +4295,9 @@ function beginTurn(session, input) {
     sawStreamText: false,
     sawVisibleText: false,
     koreanRequest,
+    rateLimitInfo: input === undefined ? session.pendingRateLimitInfo : undefined,
   };
+  session.pendingRateLimitInfo = null;
   session.lastContextUsage = null;
   notify("turn/started", { threadId: session.id, turn: { id: turnId } });
   return turnId;
@@ -6975,6 +6979,12 @@ async function runSelfTest() {
     limitSession.usageLimitWait.resetsAt = Date.now() + 10;
     await new Promise((resolve) => setTimeout(resolve, 1100));
     if (limitSession.usageLimitWait || retryInputs.length !== beforeSleep + 2) throw new Error("Usage limit timer did not resume");
+    finishTurn(limitSession, null);
+    // Monitor 이벤트 실행은 init 뒤 첫 응답에서 턴이 열려도 앞서 온 한도로 대기한다.
+    await consumeMessage(limitSession, { type: "system", subtype: "init" });
+    await rejectLimit();
+    await consumeMessage(limitSession, failedResult);
+    if (!limitSession.usageLimitWait || !limitSession.turn) throw new Error("Automatic run dropped its usage limit");
     finishTurn(limitSession, null);
     beginTurn(limitSession);
     await rejectLimit();
