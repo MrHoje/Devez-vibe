@@ -22,6 +22,14 @@ use tokio::{
 
 use crate::{app_server::ServerEvent, language::tr};
 
+/// `/api`로 켠 API 키. 브리지는 요청마다 받은 값으로 다음 CLI의 `ANTHROPIC_API_KEY`를 정한다.
+static SERVED_API_KEY: std::sync::LazyLock<StdMutex<Option<String>>> =
+    std::sync::LazyLock::new(|| StdMutex::new(crate::state::saved_claude_api_key()));
+
+pub fn set_served_api_key(key: Option<String>) {
+    *SERVED_API_KEY.lock().expect("Claude API key mutex") = key;
+}
+
 type PendingResponse = oneshot::Sender<Result<Value, String>>;
 type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
 
@@ -82,6 +90,10 @@ impl ClaudeClient {
             object.insert(
                 "claudePath".to_owned(),
                 json!(self.claude_path.to_string_lossy()),
+            );
+            object.insert(
+                "anthropicApiKey".to_owned(),
+                json!(*SERVED_API_KEY.lock().expect("Claude API key mutex")),
             );
         }
         self.ensure_started().await?;

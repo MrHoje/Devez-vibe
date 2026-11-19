@@ -444,6 +444,8 @@ pub struct StatusLineView {
     pub ultracode: bool,
     /// Codex priority service tier, shown beside the active effort.
     pub fast: bool,
+    /// Claude calls with the `/api` key, shown as `· API` beside the effort.
+    pub api: bool,
     pub context: Option<String>,
     pub five_hour_percent: Option<u8>,
     /// Countdown to the 5h window reset (`3h 33m`); absent when the provider
@@ -9704,6 +9706,14 @@ fn status_line_row(
         let span = push_status_span_after(&mut spans, separator, "Fast", Tone::ResponseCompleted);
         picks.push((span, Pick::FastMode));
     }
+    if status.api {
+        let separator = if model_shown || has_effort {
+            STATUS_PAIR_SEPARATOR
+        } else {
+            STATUS_SEPARATOR
+        };
+        push_status_span_after(&mut spans, separator, "API", Tone::ResponseCompleted);
+    }
     if let Some(context) = status.context.filter(|context| !context.is_empty()) {
         // Keep the context marker so a narrow status row can preferentially
         // remove it before the compact reset reading. It stays aligned with the
@@ -16630,6 +16640,7 @@ mod tests {
                     model: Some("GPT-5.6 Codex".to_owned()),
                     effort: Some("xhigh".to_owned()),
                     fast: false,
+                    api: false,
                     ultracode: false,
                     context: Some("ctx: 38k/1000k (3%)".to_owned()),
                     five_hour_percent: Some(97),
@@ -18208,6 +18219,7 @@ mod tests {
                 model: None,
                 effort: Some("high".to_owned()),
                 fast: false,
+                api: false,
                 ultracode: false,
                 context: None,
                 five_hour_percent: None,
@@ -20595,6 +20607,7 @@ mod tests {
                 model: None,
                 effort: None,
                 fast: false,
+                api: false,
                 ultracode: false,
                 context: None,
                 five_hour_percent: None,
@@ -21183,6 +21196,7 @@ mod tests {
                     model: None,
                     effort: None,
                     fast: false,
+                    api: false,
                     ultracode: false,
                     context: None,
                     five_hour_percent: None,
@@ -25389,6 +25403,7 @@ mod tests {
                 model: Some("GPT-5.6 Codex".to_owned()),
                 effort: Some("xhigh".to_owned()),
                 fast: false,
+                api: false,
                 ultracode: false,
                 context: Some("ctx: 45k/256k (18%)".to_owned()),
                 five_hour_percent: Some(12),
@@ -25416,6 +25431,7 @@ mod tests {
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 fast: false,
+                api: false,
                 ultracode: false,
                 context: None,
                 five_hour_percent: None,
@@ -25445,6 +25461,7 @@ mod tests {
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 fast: false,
+                api: false,
                 ultracode: false,
                 context: None,
                 five_hour_percent: None,
@@ -25464,6 +25481,33 @@ mod tests {
     }
 
     #[test]
+    fn claude_api_serving_is_shown_after_the_effort_on_the_status_line() {
+        let line = status_line_row(
+            Some(StatusLineView {
+                agent: AgentMode::Standard,
+                shell_mode: false,
+                model: Some("Opus 5.5".to_owned()),
+                effort: Some("high".to_owned()),
+                fast: false,
+                api: true,
+                ultracode: false,
+                context: None,
+                five_hour_percent: None,
+                five_hour_remaining: None,
+                weekly_percent: None,
+                notice: None,
+                update_notice: None,
+                background_tasks: None,
+            }),
+            "",
+            100,
+            false,
+        );
+
+        assert!(painted(&line).contains("Opus 5.5 · high · API"));
+    }
+
+    #[test]
     fn codex_fast_is_shown_after_model_and_effort_on_the_status_line() {
         let line = status_line_row(
             Some(StatusLineView {
@@ -25472,6 +25516,7 @@ mod tests {
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("xhigh".to_owned()),
                 fast: true,
+                api: false,
                 ultracode: false,
                 context: None,
                 five_hour_percent: None,
@@ -25500,6 +25545,7 @@ mod tests {
                 effort: Some("high".to_owned()),
                 ultracode: true,
                 fast: false,
+                api: false,
                 context: None,
                 five_hour_percent: None,
                 five_hour_remaining: None,
@@ -25527,6 +25573,7 @@ mod tests {
                 model: Some("DeepSeek V4 Flash · OpenCode Go".to_owned()),
                 effort: Some("high".to_owned()),
                 fast: false,
+                api: false,
                 ultracode: false,
                 context: None,
                 five_hour_percent: None,
@@ -25572,6 +25619,7 @@ mod tests {
                 model: Some("GPT-5.6 Codex".to_owned()),
                 effort: Some("xhigh".to_owned()),
                 fast: false,
+                api: false,
                 ultracode: false,
                 context: Some("ctx: 45k/256k (18%)".to_owned()),
                 five_hour_percent: Some(12),
@@ -25600,6 +25648,7 @@ mod tests {
                 model: Some("GPT-5.6 Codex".to_owned()),
                 effort: Some("xhigh".to_owned()),
                 fast: false,
+                api: false,
                 ultracode: false,
                 context: None,
                 five_hour_percent: None,
@@ -25632,6 +25681,7 @@ mod tests {
                 model: None,
                 effort: None,
                 fast: false,
+                api: false,
                 ultracode: false,
                 context: None,
                 five_hour_percent: Some(3),
@@ -25658,6 +25708,7 @@ mod tests {
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 fast: false,
+                api: false,
                 ultracode: false,
                 context: None,
                 five_hour_percent: None,
@@ -25688,6 +25739,7 @@ mod tests {
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 fast: false,
+                api: false,
                 ultracode: false,
                 context: Some("ctx: 45k/256k (18%)".to_owned()),
                 five_hour_percent: Some(12),
@@ -25737,6 +25789,7 @@ mod tests {
                 model: None,
                 effort: Some("high".to_owned()),
                 fast: false,
+                api: false,
                 ultracode: false,
                 context: None,
                 five_hour_percent: None,
@@ -28647,6 +28700,7 @@ mod tests {
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 fast: false,
+                api: false,
                 ultracode: false,
                 context: None,
                 five_hour_percent: None,

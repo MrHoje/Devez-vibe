@@ -685,7 +685,8 @@ impl Editor {
     /// A submission joins the recall list and, when a log is set, the file that
     /// carries history into the next run.
     fn record_history(&mut self, text: String) {
-        if !self.push_history(text.clone()) {
+        // `/api key`에 담긴 비밀 키를 입력 기록 파일에 남기지 않는다.
+        if text.trim_start().starts_with("/api key") || !self.push_history(text.clone()) {
             return;
         }
         if let Some((path, cwd)) = &self.history_log {
@@ -1003,6 +1004,16 @@ mod tests {
 
         assert_eq!(editor.text(), "a real prompt");
         assert_eq!(editor.history_position(), Some((1, 1)));
+    }
+
+    #[test]
+    fn api_key_command_stays_out_of_history() {
+        let mut editor = Editor::default();
+        editor.set_text("/api key sk-ant-Secret");
+        editor.take_for_submit();
+        assert_eq!(editor.history_position(), None);
+        editor.history_previous();
+        assert_eq!(editor.text(), "");
     }
 
     #[test]

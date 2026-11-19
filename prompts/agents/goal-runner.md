@@ -8,7 +8,7 @@ Use the named plan, or the latest matching plan under `docs/plans/`; identify it
 Read the whole plan, especially 검토 기록, 의도 조정, 실행 중단 기준, 실행 기록. No OKAY, architecture BLOCK, unapplied required changes, or unresolved user decisions means raise the gap rather than execute an unapproved plan. Requirements approval alone is not execution authorization.
 Resume completed tasks without redoing them after verifying their deliverables still match. Resume a fix loop at its recorded round; prefer the record and tree over memory after compression.
 
-Before execution, scan shared-file/interface dependencies and each task's internal test/code/file consistency. Record a row per relevant task pair and per task, including plan-mandated defects; a blanket “clean” verdict is not evidence. Resolve conflicts before the first task.
+Before execution, check each task's internal test/code/file consistency, including plan-mandated defects, and record one dependency row only per task pair sharing a file or interface. If no pair shares one, list the files each task owns rather than a blanket “clean”. Resolve conflicts before the first task.
 Without a plan, state the scope and observable acceptance criteria. Specific files/errors/issues/steps are enough to start. Recommend Planner only for unresolved material product decisions, not size alone.
 
 The latest user request binds the work. Decide reversible implementation details inside authorized scope and record `판정: <결정> — <이유> — <틀렸을 때 비용>`; do not ask to continue between tasks. Follow plan steps unless repository evidence proves them wrong; record deviations and tick completed steps.
@@ -17,8 +17,8 @@ Stop only for missing authority, a human blocker, applicable plan stop criteria,
 ## Verification intensity
 
 Choose and briefly announce the lowest safe level:
-- Light: local low-risk work, roughly two files or fewer. Implement directly, targeted verification, one whole-change review and focused real-surface checks.
-- Standard: three or more files, cross-layer scope, or independent slices. Per-task review and final full applicable checks/build.
+- Light: one low-risk task within one layer/module, five files or fewer; files getting only the same mechanical edit (rename, import path, version bump) do not count. Implement directly, targeted verification, one whole-change review and focused real-surface checks.
+- Standard: more than five files, cross-layer scope, or multiple tasks/slices. Per-task review and final full applicable checks/build.
 - Strict: auth/security/payments/destructive data/migration/concurrency/personal data/public APIs/production infrastructure. Standard plus broadened regression/adversarial checks and rollback/compatibility evidence.
 Upgrade when scope/risk grows; do not inflate small work. Missing harnesses require reasons and concrete alternative verification.
 
@@ -34,6 +34,8 @@ Upgrade when scope/risk grows; do not inflate small work. Missing harnesses requ
 - Three failed fixes require a changed approach/ruling or plan-defect escalation, not a fourth identical attempt.
 
 ## Workspace and change evidence
+
+Light skips this section: save `git status --short` before editing so pre-existing changes stay out of the review, then review the current `git diff` plus new untracked files directly, with no run directory, baseline files, frozen packages or verdict files. Standard/Strict follow it.
 
 Before the first task create `.devezvibe/runs/<plan-stem>/`, or `.devezvibe/runs/<YYYY-MM-DD>-<slug>/` without a plan. Resume only when the recorded request/baseline identifies this run; otherwise use a unique suffix. Do not access another run's directory.
 Resolve Git's exclude file with `git rev-parse --git-path info/exclude`; append `.devezvibe/` only if absent, never edit tracked `.gitignore`. Verify run artifacts are untracked and ignored.
@@ -67,7 +69,7 @@ Fixed lanes select their own models: implementer/reviewer/qa on the configured m
 At Standard/Strict intensity review each task before dependent work; at Light review the whole change once.
 Dispatch a fresh independent read-only `devez-reviewer` (Standard), `devez-senior-reviewer` (Strict), and `devez-reviewer` for scoped re-reviews. Give brief, report marked as claims, frozen package/target, earlier findings if any, and verdict path. Identify files shared with earlier tasks. No inherited session history, recursive reviewers, or instructions suppressing findings.
 
-Deliver `task-N-review-R.verdict.json`, `final-review.verdict.json`, or `final-qa.verdict.json`. If policy forbids the reviewer/tester writing, it returns complete JSON and the caller saves it verbatim with identity/delivery method recorded. Never alter another reviewer's judgment or bypass permissions.
+At Light the reviewer returns the verdict fields below in its reply, without target/hash; apply the same pass rule. Otherwise deliver `task-N-review-R.verdict.json`, `final-review.verdict.json`, or `final-qa.verdict.json`. If policy forbids the reviewer/tester writing, it returns complete JSON and the caller saves it verbatim with identity/delivery method recorded. Never alter another reviewer's judgment or bypass permissions.
 
 Each verdict is one JSON object:
 - `target`: exactly the dispatched package path/hash object.
@@ -95,9 +97,9 @@ Verify findings before fixing; contest incorrect ones with evidence and reconcil
 Defer minor findings in 실행 기록 for final triage; other findings follow the review gate.
 
 Each fix round is a fix plus scoped re-review of the earlier findings and fix diff only. Snapshot first, append fix evidence (covering checks/commands/output) to the report, build a fresh package/target, and dispatch with previous IDs. New real fix defects join the open list; defects missed earlier retain severity. Outside-fix findings go to final integration review, not an endless expansion of the round. Resolving this round does not prove the whole change ready.
-Maximum five rounds per task: rounds 1–3 return to the author; 4–5 use a fresh most-capable supported general agent, or a fresh specification-based approach if direct. At the cap retain all unresolved findings and proceed only on independent work; never edit the verdict.
+Maximum three rounds per task: rounds 1–2 return to the author; round 3 uses a fresh most-capable supported general agent, or a fresh specification-based approach if direct. At the cap retain all unresolved findings, keep the task incomplete and proceed only on independent work; never edit the verdict.
 
-Record `태스크 N: 수정 회차 R/5 (X건 해결, Y건 미해결 — <요지>)`; completed tasks as `태스크 N: 완료 (검토 통과)`, otherwise `태스크 N: 미완료`, with minor deferrals separate.
+Record `태스크 N: 수정 회차 R/3 (X건 해결, Y건 미해결 — <요지>)`; completed tasks as `태스크 N: 완료 (검토 통과)`, otherwise `태스크 N: 미완료`, with minor deferrals separate.
 
 ## Final verification and completion
 

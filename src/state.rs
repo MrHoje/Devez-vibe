@@ -447,13 +447,13 @@ impl SlashCommand {
                 provider != ModelProvider::OpenCode
             }
             "/fast" => provider != ModelProvider::Claude,
-            "/ultracode" => provider == ModelProvider::Claude,
+            "/ultracode" | "/api" => provider == ModelProvider::Claude,
             _ => true,
         }
     }
 }
 
-const SLASH_COMMANDS: [SlashCommand; 38] = [
+const SLASH_COMMANDS: [SlashCommand; 39] = [
     SlashCommand {
         name: "/provider",
         korean: "Claude·Codex provider 전환 또는 OpenCode 연결",
@@ -477,6 +477,12 @@ const SLASH_COMMANDS: [SlashCommand; 38] = [
         korean: ".knowledge 교훈 자동 기록 켜기·끄기",
         english: "Toggle auto-saving lessons to .knowledge",
         takes_argument: false,
+    },
+    SlashCommand {
+        name: "/api",
+        korean: "Claude API 키 설정과 API 서빙 켜기·끄기",
+        english: "Set the Claude API key and toggle API serving",
+        takes_argument: true,
     },
     SlashCommand {
         name: "/prompt-suggestions",
@@ -1351,6 +1357,8 @@ pub enum Action {
     PersistResponseDisplayMode(ResponseDisplayMode),
     PersistAutoKnowledge(bool),
     PersistPromptSuggestions(bool),
+    /// Save `/api`'s key and serving switch, then hand the bridge the key to use.
+    PersistClaudeApi { key: String, serving: bool },
     PersistLanguage(bool),
     /// Save the `/skin` default; empty clears it.
     PersistSkin(String),
@@ -1753,6 +1761,13 @@ enum PendingInteraction {
         destination: String,
         editor: Editor,
     },
+    /// `/api` 메뉴: 1. 키 변경, 2. 켜기·끄기.
+    ClaudeApiMenu {
+        selected: usize,
+    },
+    ClaudeApiKeyInput {
+        editor: Editor,
+    },
     VibeModePicker {
         selected: usize,
         vibe: VibeMode,
@@ -1882,6 +1897,7 @@ enum DisplaySetting {
     AutoKnowledge,
     PromptSuggestions,
     Language,
+    ClaudeApi,
 }
 
 impl DisplaySetting {
@@ -1893,6 +1909,7 @@ impl DisplaySetting {
             Self::AutoKnowledge => "Auto Knowledge",
             Self::PromptSuggestions => "Prompt Suggestions",
             Self::Language => "Language",
+            Self::ClaudeApi => "API Serving",
         }
     }
 
@@ -1900,7 +1917,7 @@ impl DisplaySetting {
         match self {
             Self::Response => &["All", "Completed"],
             Self::Shell | Self::Diff => &["Hide", "Collapse", "Expand"],
-            Self::AutoKnowledge | Self::PromptSuggestions => &["On", "Off"],
+            Self::AutoKnowledge | Self::PromptSuggestions | Self::ClaudeApi => &["On", "Off"],
             Self::Language => &["Korean", "English"],
         }
     }
@@ -1938,6 +1955,14 @@ impl DisplaySetting {
             (Self::Language, 1) => tr(
                 "설명·알림·오류를 영어로 표시합니다.",
                 "Shows descriptions, notices, and errors in English.",
+            ),
+            (Self::ClaudeApi, 0) => tr(
+                "다음 입력부터 저장한 API 키로 호출합니다.",
+                "Calls with the saved API key from the next prompt.",
+            ),
+            (Self::ClaudeApi, 1) => tr(
+                "다음 입력부터 로그인한 계정으로 호출합니다.",
+                "Uses the signed-in account from the next prompt.",
             ),
             _ => return None,
         };
@@ -3321,6 +3346,8 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
             | PendingInteraction::ClaudePermissionsPanel { .. }
             | PendingInteraction::ClaudePermissionScopePicker { .. }
             | PendingInteraction::ClaudePermissionRuleInput { .. }
+            | PendingInteraction::ClaudeApiMenu { .. }
+            | PendingInteraction::ClaudeApiKeyInput { .. }
             | PendingInteraction::VibeModePicker { .. }
             | PendingInteraction::StatusLinePicker { .. }
             | PendingInteraction::BackgroundTasks { .. }
@@ -4129,6 +4156,8 @@ pub struct AppState {
     /// Off line that lifts it.
     knowledge_on_threads: HashSet<String>,
     prompt_suggestions: bool,
+    claude_api_key: String,
+    claude_api_serving: bool,
     /// The runtime's guess at the next prompt, shown dimmed in the empty
     /// composer until → takes it or the next turn starts.
     prompt_suggestion: Option<String>,
@@ -4450,6 +4479,8 @@ impl AppState {
             auto_knowledge,
             knowledge_on_threads: HashSet::new(),
             prompt_suggestions: prompt_suggestions_enabled(),
+            claude_api_key: read_claude_api_key(),
+            claude_api_serving: claude_api_serving_enabled(),
             prompt_suggestion: None,
             prompt_suggestion_seq: 0,
             prompt_suggestion_turn: None,
@@ -4749,6 +4780,23 @@ impl AppState {
             .unwrap_or(0);
         self.pending = Some(PendingInteraction::AgentPicker { selected });
         Action::Tick(true)
+    }
+
+    fn apply_claude_api_menu(&mut self, row: usize) -> Action {
+        if row == 0 {
+            // 저장된 키를 채워 두어 그대로 고쳐 쓸 수 있게 한다.
+            let mut editor = Editor::default();
+            editor.set_text(&self.claude_api_key);
+            self.pending = Some(PendingInteraction::ClaudeApiKeyInput { editor });
+        } else {
+            self.open_setting_picker(DisplaySetting::ClaudeApi, usize::from(!self.claude_api_serving));
+        }
+        Action::None
+    }
+
+    fn save_claude_api_key(&mut self, key: String) -> Action {
+        self.claude_api_key = key;
+        Action::PersistClaudeApi { key: self.claude_api_key.clone(), serving: self.claude_api_serving }
     }
 
     fn apply_agent_choice(&mut self, index: usize) -> Action {
@@ -8575,6 +8623,7 @@ impl AppState {
             Some(PendingInteraction::ClaudePermissionRuleInput { editor, .. }) => {
                 editor.insert_str(text)
             }
+            Some(PendingInteraction::ClaudeApiKeyInput { editor }) => editor.insert_str(text.trim()),
             Some(_) => {}
             None => {
                 self.insert_composer_text(text, pasted);
@@ -9412,6 +9461,7 @@ impl AppState {
                     | PendingInteraction::EffortPicker { .. }
                     | PendingInteraction::RuntimePicker { .. }
                     | PendingInteraction::AgentPicker { .. }
+                    | PendingInteraction::ClaudeApiMenu { .. }
                     | PendingInteraction::SettingPicker { .. }
                     | PendingInteraction::ClaudePermissionsPanel { .. }
                     | PendingInteraction::ClaudePermissionScopePicker { .. }
@@ -11595,6 +11645,26 @@ impl AppState {
                 ));
                 Action::None
             }
+            "/api" if !using_claude => {
+                self.committed.push(Block::new(
+                    BlockKind::Error,
+                    "API",
+                    tr("/api는 Claude provider에서만 씁니다.", "/api works only with the Claude provider."),
+                ));
+                Action::None
+            }
+            "/api" if parts.len() == 1 => {
+                self.pending = Some(PendingInteraction::ClaudeApiMenu { selected: 0 });
+                Action::None
+            }
+            "/api" if parts.len() == 2 && matches!(parts[1], "on" | "off") => {
+                self.apply_setting_picker(DisplaySetting::ClaudeApi, usize::from(parts[1] == "off"))
+            }
+            "/api" if parts.len() == 3 && parts[1] == "key" => self.save_claude_api_key(parts[2].to_owned()),
+            "/api" => {
+                self.committed.push(Block::new(BlockKind::Error, "Usage", "/api\n/api on|off\n/api key KEY"));
+                Action::None
+            }
             "/auto-knowledge" if parts.len() == 1 => {
                 self.open_setting_picker(DisplaySetting::AutoKnowledge, usize::from(!self.auto_knowledge));
                 Action::None
@@ -12760,6 +12830,34 @@ impl AppState {
                     Action::None
                 }
             },
+            PendingInteraction::ClaudeApiMenu { mut selected } => {
+                match key.code {
+                    KeyCode::Esc => return Action::None,
+                    KeyCode::Up => selected = 0,
+                    KeyCode::Down | KeyCode::Tab => selected = 1,
+                    KeyCode::Char(ch @ '1'..='2') => return self.apply_claude_api_menu(ch as usize - '1' as usize),
+                    KeyCode::Enter => return self.apply_claude_api_menu(selected),
+                    _ => {}
+                }
+                self.pending = Some(PendingInteraction::ClaudeApiMenu { selected });
+                Action::None
+            }
+            PendingInteraction::ClaudeApiKeyInput { mut editor } => {
+                match key.code {
+                    KeyCode::Esc => return Action::None,
+                    KeyCode::Enter => {
+                        let typed = editor.text().trim().to_owned();
+                        if !typed.is_empty() {
+                            return self.save_claude_api_key(typed);
+                        }
+                    }
+                    KeyCode::Backspace => editor.backspace(),
+                    KeyCode::Char(ch) if !ctrl && !alt => editor.insert(ch),
+                    _ => {}
+                }
+                self.pending = Some(PendingInteraction::ClaudeApiKeyInput { editor });
+                Action::None
+            }
             PendingInteraction::VibeModePicker {
                 mut selected,
                 vibe,
@@ -14043,6 +14141,50 @@ impl AppState {
                 } else {
                     "Bash(npm test)"
                 },
+            }),
+            PendingInteraction::ClaudeApiMenu { selected } => {
+                let key = if self.claude_api_key.is_empty() {
+                    tr("저장된 키 없음", "No key saved")
+                } else {
+                    tr("저장된 키 바꾸기", "Replace the saved key")
+                };
+                let serving = if self.claude_api_serving { tr("현재 켜짐", "Currently on") } else { tr("현재 꺼짐", "Currently off") };
+                Some(OverlayView {
+                    closable: true,
+                    title: "Claude API".to_owned(),
+                    // The US separator splits the row into the name and description columns.
+                    lines: [("API Key", key), ("On/Off", serving)]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, (label, detail))| OverlayLine {
+                            text: format!("{}. {label}\u{1f}{detail}", index + 1),
+                            selected: index == *selected,
+                            muted: false,
+                        })
+                        .collect(),
+                    slider: None,
+                    hint: "1-2 Select  ·  ↑↓ Move  ·  Enter Use  ·  Esc Close".to_owned(),
+                    style: OverlayStyle::Picker,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
+                })
+            }
+            PendingInteraction::ClaudeApiKeyInput { editor } => Some(OverlayView {
+                closable: true,
+                title: "Claude API · API Key".to_owned(),
+                // 질문 카드 모양을 빌려 키를 패널 안 입력 줄에서 받는다.
+                lines: vec![OverlayLine {
+                    text: tr("Claude API 키를 입력하세요.", "Enter the Claude API key.").to_owned(),
+                    selected: false,
+                    muted: false,
+                }],
+                slider: None,
+                hint: "Enter next  ·  Esc cancel".to_owned(),
+                style: OverlayStyle::Question,
+                input: Some(editor),
+                input_label: "",
+                input_placeholder: "",
             }),
             PendingInteraction::VibeModePicker { selected, .. } => {
                 let vibe = VibeMode::PICKER_CHOICES[*selected];
@@ -15448,6 +15590,10 @@ impl AppState {
             fast: self.status_line_settings.enabled(StatusLineField::Model)
                 && self.selected_provider() == ModelProvider::Codex
                 && self.effective_fast_mode(),
+            api: self.status_line_settings.enabled(StatusLineField::Model)
+                && self.selected_provider() == ModelProvider::Claude
+                && self.claude_api_serving
+                && !self.claude_api_key.is_empty(),
             context: self
                 .status_line_settings
                 .enabled(StatusLineField::Context)
@@ -16567,6 +16713,7 @@ impl AppState {
             Some(PendingInteraction::AgentPicker { .. }) if row < agent::choices().len() => {
                 self.apply_agent_choice(row)
             }
+            Some(PendingInteraction::ClaudeApiMenu { .. }) if row < 2 => self.apply_claude_api_menu(row),
             Some(PendingInteraction::SkillsPicker {
                 provider,
                 selected,
@@ -16975,6 +17122,18 @@ impl AppState {
 
     fn apply_setting_picker(&mut self, setting: DisplaySetting, selected: usize) -> Action {
         match setting {
+            DisplaySetting::ClaudeApi => {
+                if selected == 0 && self.claude_api_key.is_empty() {
+                    self.committed.push(Block::new(
+                        BlockKind::Error,
+                        "API",
+                        tr("먼저 /api에서 API 키를 입력하세요.", "Enter an API key in /api first."),
+                    ));
+                    return Action::None;
+                }
+                self.claude_api_serving = selected == 0;
+                Action::PersistClaudeApi { key: self.claude_api_key.clone(), serving: self.claude_api_serving }
+            }
             DisplaySetting::AutoKnowledge => {
                 self.auto_knowledge = selected == 0;
                 Action::PersistAutoKnowledge(self.auto_knowledge)
@@ -19905,6 +20064,34 @@ fn read_vibe_config_value(key: &str) -> Option<String> {
 }
 
 pub(crate) const PROMPT_SUGGESTIONS_KEY: &str = "prompt_suggestions";
+pub(crate) const CLAUDE_API_KEY_KEY: &str = "claude_api_key";
+pub(crate) const CLAUDE_API_SERVING_KEY: &str = "claude_api_serving";
+
+fn claude_api_serving_enabled() -> bool {
+    read_vibe_setting(CLAUDE_API_SERVING_KEY).as_deref() == Some("true")
+}
+
+/// API 키는 대소문자를 가리므로 값을 소문자로 바꾸는 `config_value`를 거치지 않는다.
+fn read_claude_api_key() -> String {
+    if cfg!(test) {
+        return String::new();
+    }
+    vibe_settings_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|config| {
+            config.lines().find_map(|line| {
+                let (found, value) = line.split_once('=')?;
+                (found.trim() == CLAUDE_API_KEY_KEY).then(|| serde_json::from_str::<String>(value.trim()).ok())?
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// 저장된 `/api` 설정 중 브리지에 넘길 키. 꺼져 있으면 로그인한 계정을 쓴다.
+pub(crate) fn saved_claude_api_key() -> Option<String> {
+    let key = read_claude_api_key();
+    (claude_api_serving_enabled() && !key.is_empty()).then_some(key)
+}
 /// A suggestion is one composer row's worth; anything longer is not a guess.
 const PROMPT_SUGGESTION_CHARS: usize = 200;
 
@@ -28114,6 +28301,54 @@ mod tests {
         assert_eq!(clean_prompt_suggestion("\n  `run the tests`  \nmore"), Some("run the tests".to_owned()));
         assert_eq!(clean_prompt_suggestion("   \n"), None);
         assert_eq!(clean_prompt_suggestion(&"x".repeat(201)), None);
+    }
+
+    #[test]
+    fn api_command_saves_the_key_and_serving_switch_only_on_claude() {
+        let mut state = claude_test_state();
+        let blocks = state.committed.len();
+        assert!(matches!(state.run_slash_command("/api on"), Action::None));
+        assert_eq!(state.committed.len(), blocks + 1, "serving needs a key first");
+        assert!(matches!(
+            state.run_slash_command("/api key sk-ant-Secret"),
+            Action::PersistClaudeApi { ref key, serving: false } if key == "sk-ant-Secret"
+        ));
+        assert!(matches!(
+            state.run_slash_command("/api on"),
+            Action::PersistClaudeApi { serving: true, .. }
+        ));
+        assert!(matches!(state.run_slash_command("/api off"), Action::PersistClaudeApi { serving: false, .. }));
+
+        // `/api` alone opens a menu: 1. API Key, 2. On/Off.
+        let press = |state: &mut AppState, code| state.handle_key(key(code, KeyModifiers::NONE));
+        state.run_slash_command("/api");
+        assert_eq!(state.overlay_view().unwrap().lines.len(), 2);
+        press(&mut state, KeyCode::Char('1'));
+        assert_eq!(state.overlay_view().unwrap().input.unwrap().text(), "sk-ant-Secret");
+        for _ in "sk-ant-Secret".chars() {
+            press(&mut state, KeyCode::Backspace);
+        }
+        assert!(matches!(press(&mut state, KeyCode::Enter), Action::None), "an empty key is not saved");
+        for ch in "sk-ant-Next".chars() {
+            press(&mut state, KeyCode::Char(ch));
+        }
+        assert!(matches!(
+            press(&mut state, KeyCode::Enter),
+            Action::PersistClaudeApi { ref key, serving: false } if key == "sk-ant-Next"
+        ));
+        assert!(state.pending.is_none());
+        state.run_slash_command("/api");
+        press(&mut state, KeyCode::Down);
+        press(&mut state, KeyCode::Enter);
+        press(&mut state, KeyCode::Left);
+        assert!(matches!(
+            press(&mut state, KeyCode::Enter),
+            Action::PersistClaudeApi { ref key, serving: true } if key == "sk-ant-Next"
+        ));
+        assert!(state.committed.iter().all(|block| !block.body.contains("sk-ant")));
+
+        let mut codex = test_state();
+        assert!(matches!(codex.run_slash_command("/api key sk-ant-Secret"), Action::None));
     }
 
     fn claude_test_state() -> AppState {

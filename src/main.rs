@@ -1074,6 +1074,7 @@ fn hold_until_thread(
         | Action::SetTheme(_)
         | Action::PersistAutoKnowledge(_)
         | Action::PersistPromptSuggestions(_)
+        | Action::PersistClaudeApi { .. }
         | Action::PersistLanguage(_)
         | Action::PersistSkin(_)
         | Action::PersistModelFavorites(_)
@@ -3438,6 +3439,14 @@ async fn run_action(
                 if enabled { "true" } else { "false" },
             ) {
                 state.push_notice(BlockKind::Warning, "Prompt suggestion setting save failed", error.to_string());
+            }
+        }
+        Action::PersistClaudeApi { key, serving } => {
+            claude::set_served_api_key((serving && !key.is_empty()).then(|| key.clone()));
+            if let Err(error) = state::write_vibe_config_value(state::CLAUDE_API_KEY_KEY, &key).and_then(|()| {
+                state::write_vibe_config_value(state::CLAUDE_API_SERVING_KEY, if serving { "true" } else { "false" })
+            }) {
+                state.push_notice(BlockKind::Warning, "API setting save failed", error.to_string());
             }
         }
         Action::PersistLanguage(english) => {

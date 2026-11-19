@@ -141,10 +141,14 @@ function hostRequest(method, params, signal, sessionId) {
   });
 }
 
+// `/api`로 켠 API 키. 호스트가 요청마다 보내며, 비어 있으면 로그인한 계정을 쓴다.
+let servedApiKey = "";
+
 function sanitizedEnvironment() {
   const env = { ...process.env };
   delete env.ANTHROPIC_API_KEY;
   delete env.ANTHROPIC_AUTH_TOKEN;
+  if (servedApiKey) env.ANTHROPIC_API_KEY = servedApiKey;
   env.CLAUDE_AGENT_SDK_CLIENT_APP = `dvz/${VERSION}`;
   // Claude Code leaves the Artifact tool off for SDK hosts unless asked; the
   // account flag and admin policy still decide whether it actually appears.
@@ -2127,6 +2131,7 @@ async function createSession(params, resumeId) {
   await ensureClaudeExecutableChoice(params);
   const agentQuery = await startAgentQuery(queue, makeOptions(params, id, resumeId, () => session.id));
   session.query = agentQuery;
+  session.apiKey = servedApiKey;
   sessions.set(id, session);
   const consumer = consume(session)
     .catch((error) => {
@@ -4879,6 +4884,16 @@ async function claudeSessionList(params) {
 }
 
 async function dispatch(method, params = {}) {
+  if (params && "anthropicApiKey" in params) {
+    servedApiKey = String(params.anthropicApiKey || "");
+    // A running CLI keeps the key it started with. Closing an idle one on another
+    // key makes the next prompt miss it, and the host resumes it with this key.
+    for (const session of [...sessions.values()]) {
+      if (session.apiKey !== undefined && session.apiKey !== servedApiKey && !sessionHasLiveWork(session)) {
+        closeLiveSession(session);
+      }
+    }
+  }
   if (method === "model/list") return loadModelCatalog(params);
   if (method === "mcpServerStatus/list") return claudeMcpStatus(params);
   if (method === "mcp/reconnect" || method === "mcp/login") {
@@ -6991,6 +7006,15 @@ async function runSelfTest() {
     } finally {
       process.stdout.write = stateWrite;
     }
+    // `/api` changes reach an idle session on its next prompt, not on /new.
+    const keySession = { id: "api-key-self-test", subagents: new Map(), query: { close() {} }, apiKey: "" };
+    sessions.set(keySession.id, keySession);
+    await dispatch("app/list", { anthropicApiKey: "sk-self-test" });
+    if (sessions.has(keySession.id) || sanitizedEnvironment().ANTHROPIC_API_KEY !== "sk-self-test") {
+      throw new Error("Claude API key change kept the idle session or its old key");
+    }
+    await dispatch("app/list", { anthropicApiKey: null });
+    if (sanitizedEnvironment().ANTHROPIC_API_KEY) throw new Error("Claude API key stayed after serving was turned off");
     const noticed = (method, field) => stateNotices
       .filter((notice) => notice.method === method)
       .map((notice) => notice.params[field])

@@ -116,6 +116,7 @@ dvz update
 - 모델 카탈로그 기반 `/model` 선택과 `/effort`에서 서버가 지원하는 수준만 노출
 - `/model sol`, `/model terra`, `/model luna`, `/model spark` 등 짧은 별칭과 숫자키 선택
 - `/provider`로 Claude·Codex·OpenCode 전환, `/fast`로 fast 서비스 등급 전환
+- Claude provider에서 `/api`에서 API 키 변경과 API 키 호출 켜고 끄기 선택(`/api key KEY`, `/api on|off`도 가능)
 
 ### 스트리밍과 승인
 

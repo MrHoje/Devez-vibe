@@ -23,12 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude CLI가 충돌한 뒤 응답하지 않으면 작업 중 표시가 끝없이 이어지고, Esc를 누르면 화면이 멈추던 문제를 고쳤습니다. 이제 약 100초 뒤(Esc를 누르면 5초 뒤) 작업을 오류로 끝내고, 다음 입력에서 세션을 다시 엽니다.",
+    "Claude provider에서 `/api`에서 API 키 변경과 켜기·끄기를 골라, 구독 계정 대신 API 키로 호출할 수 있습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Fixed an endless working indicator, and a frozen screen on Esc, when the Claude CLI stopped responding after a crash. The turn now ends with an error after about 100 seconds (5 seconds after Esc), and the next prompt reopens the session.",
+    "In the Claude provider, use `/api` to change your API key or turn it on and off, so calls use an API key instead of your subscription account.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");
