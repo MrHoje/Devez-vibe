@@ -138,7 +138,7 @@ TUI를 띄우지 않고 실제 에이전트 동작을 확인할 때는 브리지
 
 ## 확인 기록
 
-### 2026-11-20 SDK 0.3.329(Claude Code 2.1.329) 상향
+### 2026-11-20 SDK 0.3.329(Claude Code 2.1.329) 상향 — 1.11.22 배포
 
 - 0.3.327→0.3.329 `sdk.d.ts` 차이: 호스트 전용 설정 `workingDirectoriesExclude`, 훅 `onFailure`, 데스크톱 전용 `desktopMcpServersListScope`, `SpawnedProcess.signalCode`, 대기 예비 프로세스 claim 거부 조건(프로젝트 설정의 `env`·`model`·`fallbackModel`·`.claude/agents`) 추가와 주석 변경이다. 브리지는 `startup()` 직후 바로 `query`해 claim 경로가 아니고 새 필드도 쓰지 않아 코드 변경이 없다.
 - 번들 CLI로 들어오는 수정: 자동 압축이 예전 시스템 프롬프트를 재사용하던 문제, 재시도 응답 토큰 이중 계산, SDK 중단 뒤 백그라운드 에이전트가 실행 중이라고 말하던 문제, 긴 SDK 세션 메모리, `~/.claude.json` 초기화, `application/octet-stream` 파일의 .bin 저장.
