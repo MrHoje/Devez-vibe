@@ -84,6 +84,12 @@ Codex 0.x.y 기준으로 호환성 업데이트해
 
 ## 확인 기록
 
+### 2026-11-20 Codex 0.170.0 기준 갱신 — 코드 변경 없음
+
+- 0.169.1→0.170.0 스키마 차이: `AgentMessageDisplay`가 `mode`(`show`·`hide`·`block`)·`version` 유니온으로 바뀌고(웰빙 안내 대체, 보안 차단), `UserVerificationVerifyResponse.biometricType`과 Guardian 설명이 추가됐다. DevezVibe는 둘 다 해석하지 않는다. 기록 복원 때 숨김·차단 표시 반영은 사용자 요청이 없어 넣지 않았다.
+- 릴리스 신기능(TUI 실시간 음성, OTLP 헤더 갱신, 환경별 동명 MCP 서버)은 app-server 계약 밖이다. `thread/prediction/request`는 스키마에 계속 있으나 실제 호출은 하지 않았고 제안은 `thread/sample`을 유지한다.
+- 실제 app-server 모델 목록 10개는 0.169.1과 같고 모두 단가 표에 있다.
+
 ### 2026-11-18 Codex 0.169.1 기준 갱신 — 단가만 추가
 
 - 0.169.1 릴리스 노트는 변경 요약이 없고, `generate-ts --experimental` 스키마는 0.169.0과 SHA-256까지 같다. 기준 버전만 0.169.1로 갱신했다. `thread/prediction/request`는 여전히 없으므로 제안은 `thread/sample`을 유지한다.

@@ -23,14 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "`/api`의 API 키 입력 창에서 Ctrl+V 붙여넣기, Ctrl+A 전체 선택, Ctrl+Z·Ctrl+Y 되돌리기 등 입력창 편집 키를 쓸 수 있습니다.",
-    "API 키가 잘못되면 로그인 만료 대신 `/api`에서 키를 확인하라는 안내를 표시합니다.",
+    "Claude Code 2.1.329를 적용해 자동 압축, 토큰 집계, 중단 뒤 백그라운드 에이전트 안내 오류가 고쳐집니다. Codex 0.170.0 호환도 확인했습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "The `/api` key field now supports composer editing keys: Ctrl+V paste, Ctrl+A select all, Ctrl+Z/Ctrl+Y undo and redo, and more.",
-    "A rejected API key now asks you to check the key in `/api` instead of reporting an expired login.",
+    "Applied Claude Code 2.1.329, fixing auto-compaction, token counting, and background agent status after an interrupt. Also confirmed compatibility with Codex 0.170.0.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

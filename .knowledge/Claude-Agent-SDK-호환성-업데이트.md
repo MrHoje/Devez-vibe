@@ -138,6 +138,14 @@ TUI를 띄우지 않고 실제 에이전트 동작을 확인할 때는 브리지
 
 ## 확인 기록
 
+### 2026-11-20 SDK 0.3.329(Claude Code 2.1.329) 상향
+
+- 0.3.327→0.3.329 `sdk.d.ts` 차이: 호스트 전용 설정 `workingDirectoriesExclude`, 훅 `onFailure`, 데스크톱 전용 `desktopMcpServersListScope`, `SpawnedProcess.signalCode`, 대기 예비 프로세스 claim 거부 조건(프로젝트 설정의 `env`·`model`·`fallbackModel`·`.claude/agents`) 추가와 주석 변경이다. 브리지는 `startup()` 직후 바로 `query`해 claim 경로가 아니고 새 필드도 쓰지 않아 코드 변경이 없다.
+- 번들 CLI로 들어오는 수정: 자동 압축이 예전 시스템 프롬프트를 재사용하던 문제, 재시도 응답 토큰 이중 계산, SDK 중단 뒤 백그라운드 에이전트가 실행 중이라고 말하던 문제, 긴 SDK 세션 메모리, `~/.claude.json` 초기화, `application/octet-stream` 파일의 .bin 저장.
+- Code Mode(`CLAUDE_CODE_EXPERIMENTAL_CODE_MODE`)는 번들 CLI의 허용 판정이 진입점 `cli`·대화형만 받는다. SDK는 진입점 `sdk-ts`·비대화형이라 환경변수를 넘겨도 켜지지 않는다.
+- 번들 CLI 실시간 모델 목록 12개는 그대로이고 새 모델은 없다.
+- 검증: 브리지 자체 검사, Rust 전체 1,690개 통과·27개 기본 제외. 실제 대화 턴은 확인하지 않았다.
+
 ### 2026-11-18 SDK 0.3.327(Claude Code 2.1.327) 상향 — 미배포
 
 - 0.3.325→0.3.327 `sdk.d.ts` 차이: `mcpServersDelivery`(`argv`/`initialize`)와 초기화 요청의 `mcpServers`·`mcp_servers_applied`, 시작 실패 사유 `initialize_fields_not_delivered`, `task_started.prompt` 설명(재개된 하위 에이전트 실행에는 없음), `BUILTIN_TOOL_NAMES`의 `ProposeGoal`→`SetGoal`, `modelUsage`·`total_cost_usd`에 과금되는 자동 모드 분류기 호출과 중단된 호출 포함, 설정 주석 변경이다.
