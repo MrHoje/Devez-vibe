@@ -84,6 +84,11 @@ Codex 0.x.y 기준으로 호환성 업데이트해
 
 ## 확인 기록
 
+### 2026-11-21 `agentMessage.moderation.display` 반영
+
+- `src/state.rs`의 `moderated_answer_text`가 `version` 1의 `hide`·`block`이면 답변 본문을 숨김·차단 안내로 바꾼다. `show`, `null`, 모르는 모드나 버전은 서버 `text`를 그대로 쓴다. 완료 항목과 기록 복원이 모두 `active_item_block`을 거치므로 두 경로에 적용되고, 복사용 마지막 답변도 안내 문구가 된다.
+- 실시간 delta는 완료 전까지 받은 글자를 그대로 보이고, 완료 항목이 오면 안내로 바뀐다. `hide`·`block`일 때 서버가 `text`에 원문을 넣는지는 실제 응답으로 확인하지 않았다. `show`의 `annotation`(상담 안내)은 표시하지 않는다.
+
 ### 2026-11-20 Codex 0.170.0 기준 갱신 — 코드 변경 없음, 1.11.22 배포
 
 - 0.169.1→0.170.0 스키마 차이: `AgentMessageDisplay`가 `mode`(`show`·`hide`·`block`)·`version` 유니온으로 바뀌고(웰빙 안내 대체, 보안 차단), `UserVerificationVerifyResponse.biometricType`과 Guardian 설명이 추가됐다. DevezVibe는 둘 다 해석하지 않는다. 기록 복원 때 숨김·차단 표시 반영은 사용자 요청이 없어 넣지 않았다.

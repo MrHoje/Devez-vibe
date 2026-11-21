@@ -18472,6 +18472,26 @@ fn assistant_phase(item: &Value) -> AssistantPhase {
     }
 }
 
+/// The notice Codex's `moderation.display` asks to show in place of a hidden or
+/// blocked answer. `show` and unknown modes or versions keep the server text.
+fn moderated_answer_text(item: &Value) -> Option<&'static str> {
+    let display = item.pointer("/moderation/display")?;
+    if display.get("version").and_then(Value::as_u64) != Some(1) {
+        return None;
+    }
+    match display.get("mode")?.as_str()? {
+        "hide" => Some(crate::language::tr(
+            "이 답변은 Codex 안전 정책에 따라 숨겨졌습니다.",
+            "This answer was hidden by Codex safety policy.",
+        )),
+        "block" => Some(crate::language::tr(
+            "이 답변은 Codex 보안 정책에 따라 차단되었습니다.",
+            "This answer was blocked by Codex security policy.",
+        )),
+        _ => None,
+    }
+}
+
 fn active_item_block(cwd: &str, item: &Value) -> Option<Block> {
     match item.get("type")?.as_str()? {
         "agentMessage" if item.get("delivery").and_then(Value::as_str) == Some("async")
@@ -18482,7 +18502,8 @@ fn active_item_block(cwd: &str, item: &Value) -> Option<Block> {
                 item.get("provider")
                     .and_then(Value::as_str)
                     .unwrap_or("Codex"),
-                item.get("text").and_then(Value::as_str).unwrap_or_default(),
+                moderated_answer_text(item)
+                    .unwrap_or_else(|| item.get("text").and_then(Value::as_str).unwrap_or_default()),
             )
             .with_assistant_phase(assistant_phase(item)),
         ),
@@ -21079,6 +21100,25 @@ mod tests {
         assert!(block.title.starts_with("Failed · "));
         let block = completed_item_block("cwd", &applied).unwrap();
         assert!(matches!(block.kind, BlockKind::FileChange));
+    }
+
+    #[test]
+    fn a_moderated_codex_answer_follows_its_display_mode() {
+        let answer = |display: Value| {
+            let item = json!({
+                "type": "agentMessage", "id": "a", "text": "원문",
+                "moderation": { "moderated": true, "display": display },
+            });
+            completed_item_block("cwd", &item).unwrap().body
+        };
+
+        assert_eq!(answer(json!({ "mode": "show", "version": 1, "trustedContacts": null })), "원문");
+        assert_eq!(answer(Value::Null), "원문");
+        assert_eq!(answer(json!({ "mode": "hide", "version": 2 })), "원문");
+        assert!(answer(json!({ "mode": "hide", "version": 1, "replacement": { "kind": "wellbeingPromptHelpline" } }))
+            .contains("숨겨졌습니다"));
+        assert!(answer(json!({ "mode": "block", "version": 1, "reason": { "kind": "cyber" } }))
+            .contains("차단되었습니다"));
     }
 
     #[test]
