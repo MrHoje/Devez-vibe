@@ -138,6 +138,13 @@ TUI를 띄우지 않고 실제 에이전트 동작을 확인할 때는 브리지
 
 ## 확인 기록
 
+### 2026-11-23 SDK 0.3.330(Claude Code 2.1.330) 상향 — 미배포
+
+- 0.3.329→0.3.330 `sdk.d.ts` 차이는 메시지 출처 `subkind`의 `external-event` 추가와 주석 변경, `sdk-tools.d.ts`는 도구 입력 `maxAgeMs` 추가뿐이다. 브리지는 출처 `subkind`를 해석하지 않아 코드 변경이 없다.
+- 0.3.325 이후 생긴 `mcpServersDelivery` 미지정 경고는 외부 CLI 실행이면서 SDK 내장이 아닌 MCP 서버를 넘길 때만 난다(`sdk.mjs` 조건 확인). 브리지는 `createSdkMcpServer` Computer 서버만 넘겨 해당 없다.
+- 2.1.330 변경 이력에 신모델·단가 변경은 없다. 번들 CLI로 압축 직후 멈춤, WebFetch 멈춤, 동시 저장 시 사용자 설정 유실, 마지막 메시지 시각 오류 때 `--resume` 실패, 중지된 백그라운드 에이전트 대기 수정이 들어온다.
+- 검증: 브리지 자체 검사, Rust 전체 1,691개 통과·27개 기본 제외, `git diff --check` 통과. 실제 대화와 실시간 모델 목록은 확인하지 않았다.
+
 ### 2026-11-20 SDK 0.3.329(Claude Code 2.1.329) 상향 — 1.11.22 배포
 
 - 0.3.327→0.3.329 `sdk.d.ts` 차이: 호스트 전용 설정 `workingDirectoriesExclude`, 훅 `onFailure`, 데스크톱 전용 `desktopMcpServersListScope`, `SpawnedProcess.signalCode`, 대기 예비 프로세스 claim 거부 조건(프로젝트 설정의 `env`·`model`·`fallbackModel`·`.claude/agents`) 추가와 주석 변경이다. 브리지는 `startup()` 직후 바로 `query`해 claim 경로가 아니고 새 필드도 쓰지 않아 코드 변경이 없다.

@@ -84,6 +84,12 @@ Codex 0.x.y 기준으로 호환성 업데이트해
 
 ## 확인 기록
 
+### 2026-11-23 Codex 0.171.0 기준 갱신 — 코드 변경 없음
+
+- 0.170.0→0.171.0 스키마는 `modelProvider/default/set`·`thread/realtime/list`·`thread/search/cancel`·`thread/search/stream`(취소 포함) 요청, `thread/search/partial` 알림, 오류 값 `bioPolicy`, 선택 필드(`environmentId`, `AccountUpdatedNotification.reason` 등) 추가와 서버 요청 `currentTime/read` 제거다. DevezVibe는 제거·추가 항목을 쓰지 않고 `thread/sample`도 그대로다.
+- 릴리스 신기능(TUI 작업 공간 기본 켬, `codex exec --remote`, `/rc`)은 app-server 계약 밖이다. 새 GPT-6.2 Sol(기본)·Astra는 0.169.1 기록대로 이미 단가 표에 있다.
+- 실제 0.171.0 app-server 모델 목록 10개는 0.170.0과 같고 모두 단가 표에 있다.
+
 ### 2026-11-21 `agentMessage.moderation.display` 반영
 
 - `src/state.rs`의 `moderated_answer_text`가 `version` 1의 `hide`·`block`이면 답변 본문을 숨김·차단 안내로 바꾼다. `show`, `null`, 모르는 모드나 버전은 서버 `text`를 그대로 쓴다. 완료 항목과 기록 복원이 모두 `active_item_block`을 거치므로 두 경로에 적용되고, 복사용 마지막 답변도 안내 문구가 된다.
