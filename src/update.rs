@@ -23,12 +23,16 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude Code 2.1.329를 적용해 자동 압축, 토큰 집계, 중단 뒤 백그라운드 에이전트 안내 오류가 고쳐집니다. Codex 0.170.0 호환도 확인했습니다.",
+    "Codex가 안전·보안 정책으로 숨기거나 차단한 답변은 원문 대신 숨김·차단 안내를 표시합니다.",
+    "Claude Code 2.1.330을 적용해 압축 직후 멈춤, 동시 저장 시 설정 유실, 세션 재개 실패 등이 고쳐집니다.",
+    "답변 속 표 앞뒤에 빈 줄을 하나씩 더 넣고 마지막 행 아래에도 가로선을 그어 표와 주변 문장이 구분되어 보입니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Applied Claude Code 2.1.329, fixing auto-compaction, token counting, and background agent status after an interrupt. Also confirmed compatibility with Codex 0.170.0.",
+    "Codex responses hidden or blocked by safety or security policy now show a hidden/blocked notice instead of the original text.",
+    "Applies Claude Code 2.1.330, fixing stalls right after compaction, settings lost on concurrent saves, session resume failures, and more.",
+    "Tables in responses now have an extra blank line before and after and a closing rule under the last row, so they stand apart from the surrounding text.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");
