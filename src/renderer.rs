@@ -12192,6 +12192,7 @@ fn block_lines_with_mode_at(
             && let Some(alignments) = markdown_table_alignments(separator, header.len())
         {
             let table_start = line_index;
+            let table_first = first_content;
             let mut rows = vec![header];
             line_index += 2;
             while let Some(row) = raw_lines
@@ -12214,7 +12215,17 @@ fn block_lines_with_mode_at(
                 content_tone,
                 conversational_width,
             ) {
+                // One extra row on each side so a table stands apart from the surrounding text.
+                if !table_first {
+                    lines.push(PaintLine::blank());
+                }
                 lines.extend(table);
+                if raw_lines[line_index..]
+                    .iter()
+                    .any(|line| !line.trim().is_empty())
+                {
+                    lines.push(PaintLine::blank());
+                }
                 continue;
             }
             lines.extend(markdown_line(
@@ -12414,14 +12425,12 @@ fn markdown_table_lines(
                 COLUMN_GAP,
             ));
         }
-        if row_index + 1 < rows.len() {
-            output.push(table_rule_line(
-                &continuation_prefix,
-                prefix_tone,
-                &widths,
-                COLUMN_GAP,
-            ));
-        }
+        output.push(table_rule_line(
+            &continuation_prefix,
+            prefix_tone,
+            &widths,
+            COLUMN_GAP,
+        ));
     }
     Some(output)
 }
@@ -18848,7 +18857,9 @@ mod tests {
                 .all(|span| span.tone != Tone::AssistantBubble)
         );
         assert!(lines[1].text.chars().all(|ch| ch == '─'));
-        assert!(lines.last().expect("data row").text.contains("릴리즈 빌드"));
+        assert!(lines[lines.len() - 2].text.contains("릴리즈 빌드"));
+        let closing_rule = lines.last().expect("closing rule");
+        assert!(closing_rule.text.chars().all(|ch| ch == '─'));
     }
 
     #[test]
@@ -18909,6 +18920,32 @@ mod tests {
         assert!(lines.iter().any(|line| line.tone == Tone::MarkdownHeading));
         assert!(!lines.iter().any(|line| line.text.contains("| 항목 |")));
         assert!(lines.iter().any(|line| line.text.contains("릴리즈 빌드")));
+    }
+
+    #[test]
+    fn markdown_table_gets_an_extra_blank_row_on_each_side() {
+        set_chat_layout(false);
+        let block = Block::new(
+            BlockKind::Assistant,
+            "Codex",
+            "앞 문장\n\n| 항목 | 상태 |\n|---|---|\n| 빌드 | 성공 |\n\n뒤 문장",
+        );
+
+        let texts = block_lines_with_expansion(&block, 80, false)
+            .iter()
+            .map(|line| painted(line).trim().to_owned())
+            .collect::<Vec<_>>();
+        let row = |needle: &str| {
+            texts
+                .iter()
+                .position(|text| text.contains(needle))
+                .expect(needle)
+        };
+        let (before, header) = (row("앞 문장"), row("항목"));
+        let (last_row, after) = (row("빌드"), row("뒤 문장"));
+        assert_eq!(header - before, 3);
+        assert_eq!(after - last_row, 4);
+        set_chat_layout(true);
     }
 
     #[test]
