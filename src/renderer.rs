@@ -6655,6 +6655,8 @@ const WORKING_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
 /// Activity labels that carry the loader glyph and the shimmer sweep.
 const SPINNING_ACTIVITY_LABELS: [&str; 2] = ["Working..", "Compacting.."];
 
+pub(crate) const SUBAGENT_ACTIVITY_PREFIX: &str = "• Subagents ";
+
 /// Glyphs that head an activity row which is already over. A shimmer on these
 /// reads as work still running, so they paint flat.
 const SETTLED_ACTIVITY_GLYPHS: [&str; 2] = ["✓", "X"];
@@ -6729,6 +6731,16 @@ fn activity_lines_with_progress(
     width: u16,
 ) -> Vec<PaintLine> {
     let tone = activity_model.and_then(chrome_model_tone).unwrap_or(Tone::Plain);
+    if activity.starts_with(SUBAGENT_ACTIVITY_PREFIX) {
+        let single_line = activity.replace(['\r', '\n', '\t'], " ");
+        let text = without_control_characters(&single_line);
+        return vec![PaintLine {
+            prefix: " ".to_owned(),
+            prefix_tone: tone,
+            tone,
+            ..PaintLine::plain(compact_right(&text, usize::from(width.saturating_sub(2))))
+        }];
+    }
     if UnicodeWidthStr::width(activity) > width.saturating_sub(2) as usize {
         return wrapped_line(" ", tone, activity, tone, false, width);
     }
@@ -20418,6 +20430,22 @@ mod tests {
 
         assert_eq!(line.tone, Tone::Plain);
         assert_eq!(line.text, "• ");
+    }
+
+    #[test]
+    fn subagent_activity_stays_on_one_safe_row() {
+        let activity = format!(
+            "{SUBAGENT_ACTIVITY_PREFIX}2 Running (8m 58s) · [Read] 결과\n검증\u{1b}[31m 진행"
+        );
+        let wide = activity_lines(&activity, Some("claude:sonnet"), 0.5, 100);
+        assert_eq!(wide.len(), 1);
+        assert!(painted_line_text(&wide[0]).contains("[Read] 결과 검증"));
+        assert!(!painted_line_text(&wide[0]).chars().any(char::is_control));
+
+        let narrow = activity_lines(&activity, Some("claude:sonnet"), 0.5, 38);
+        assert_eq!(narrow.len(), 1);
+        assert!(painted_line_text(&narrow[0]).contains("Subagents 2 Running (8m 58s)"));
+        assert!(painted_line_width(&narrow[0]) < 38);
     }
 
     /// A row too narrow for the whole line wraps plainly rather than shimmering

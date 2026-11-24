@@ -34,7 +34,7 @@ use crate::{
         HIDDEN_STATUS_LINE, IntegrationItemState, IntegrationItemView, LiveBlockView, ModeAccent,
         OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS, PanelFileDiff, PlanStep, PlanStepStatus,
         PlanSummary,
-        ProviderHandoffBlock, ProviderIntegrationView, StatusLineView,
+        ProviderHandoffBlock, ProviderIntegrationView, SUBAGENT_ACTIVITY_PREFIX, StatusLineView,
         SteeredPromptView, SubagentTranscript, SubagentView, SuggestionView, VibeTone, View, WelcomeView,
         WorkflowRun,
         format_clock_time, format_elapsed, visible_window,
@@ -15496,6 +15496,9 @@ impl AppState {
             // supplies an indeterminate bar while this elapsed clock is running.
             return Some(format!("Compacting.. ({elapsed_label})"));
         }
+        if !self.turn_interrupted && let Some(activity) = self.subagent_activity() {
+            return Some(activity);
+        }
         if self.busy {
             let elapsed = self
                 .turn_started_at
@@ -15516,6 +15519,27 @@ impl AppState {
                 None => format!("❖ Completed ({elapsed})"),
             }
         })
+    }
+
+    fn subagent_activity(&self) -> Option<String> {
+        let agents = self.subagents.iter().filter(|agent| !agent.is_background_task);
+        let oldest = agents.clone().map(|agent| agent.started_at).min()?;
+        let elapsed = format_elapsed(oldest.elapsed().as_secs());
+        let count = agents.clone().count();
+        let mut activity = format!("{SUBAGENT_ACTIVITY_PREFIX}{count} Running ({elapsed})");
+        for agent in agents {
+            let description = agent.description.trim();
+            let detail = if description.is_empty() { &agent.name } else { description };
+            let tool = agent.tool.trim().split([' ', '(']).next().unwrap_or_default();
+            activity.push_str(" · ");
+            if !tool.is_empty() {
+                activity.push('[');
+                activity.push_str(if tool == "$" { "Shell" } else { tool });
+                activity.push_str("] ");
+            }
+            activity.push_str(detail);
+        }
+        Some(activity)
     }
 
     /// `/compact` was accepted by the runtime: run the activity spinner until the
@@ -24610,6 +24634,41 @@ mod tests {
 
         assert!(running_rows(&state).is_empty());
         assert!(!state.host_children_busy());
+    }
+
+    #[test]
+    fn subagent_activity_updates_after_the_parent_turn_finishes() {
+        let mut state = test_state();
+        let child = |description: &str, tool: &str| {
+            json!({ "id": "review", "name": "Reviewer", "description": description, "tool": tool })
+        };
+        let second = json!({ "id": "other", "name": "Researcher", "tool": "$ opaque-command" });
+        let shell = json!({ "id": "shell", "name": "Bash", "backgroundTask": true });
+
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "main" } }));
+        state.handle_notification("turn/subagents/updated", &json!({
+            "subagents": [child("결과 확인", "Read(private-file)"), &second, &shell],
+        }));
+        assert!(state.view().activity.unwrap().contains("Subagents 2 Running"));
+        state.handle_notification("turn/completed", &json!({ "turn": { "id": "main" } }));
+        state.subagents[0].started_at = Instant::now() - Duration::from_secs(538);
+        let activity = state.view().activity.unwrap();
+        assert!(!state.busy);
+        assert!(activity.contains("Subagents 2 Running (8m 58s) · [Read] 결과 확인"));
+        assert!(activity.contains("[Shell] Researcher"));
+        assert!(!activity.contains("private-file") && !activity.contains("opaque-command"));
+        assert!(state.render_tick().redraw);
+
+        state.handle_notification("turn/subagents/updated", &json!({
+            "subagents": [child("보고서 작성", "Write"), &shell],
+        }));
+        let activity = state.view().activity.unwrap();
+        assert!(activity.contains("Subagents 1 Running"));
+        assert!(activity.contains("[Write] 보고서 작성"));
+
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [&shell] }));
+        assert!(state.view().activity.unwrap().starts_with("❖ Completed"));
+        assert!(state.host_children_busy());
     }
 
     /// The order measured on the real bridge: the main turn ends, the child's

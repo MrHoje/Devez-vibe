@@ -578,10 +578,24 @@ fn elevated_computer_use_overrides(config: &str, home: &Path) -> Vec<String> {
                 && server.pointer("/env/SKY_CUA_NATIVE_PIPE").and_then(Value::as_str) == Some("1"))
         else { return Vec::new(); };
         cua["env"]["SKY_CUA_NATIVE_PIPE"] = json!("0");
-        let Ok(cua) = toml::Value::try_from(cua) else { return Vec::new(); };
+        let Some(cua) = inline_toml(&cua) else { return Vec::new(); };
         overrides.push(format!("mcp_servers.cua_repl={cua}"));
     }
     overrides
+}
+
+/// One-line TOML for a `-c` value: Rust refuses a line break in a `.cmd`
+/// argument, and toml's Display writes multi-line strings. JSON string escapes
+/// are valid TOML basic-string escapes.
+fn inline_toml(value: &Value) -> Option<String> {
+    Some(match value {
+        Value::Null => return None,
+        Value::Object(map) => format!("{{{}}}", map.iter()
+            .map(|(key, value)| Some(format!("{}={}", Value::from(key.as_str()), inline_toml(value)?)))
+            .collect::<Option<Vec<_>>>()?.join(",")),
+        Value::Array(items) => format!("[{}]", items.iter().map(inline_toml).collect::<Option<Vec<_>>>()?.join(",")),
+        other => other.to_string(),
+    })
 }
 
 async fn refresh_computer_use(
@@ -2127,7 +2141,8 @@ mod tests {
             "enabled": true, "enabled_tools": ["js", "js_reset", "turn_ended"],
             "env_vars": ["BROWSER_USE_ACCESS_PIPE_PATH", "CODEX_WINDOWS_REGISTERED_CORE"],
             "env": {"SKY_CUA_NATIVE_PIPE": "1", "SKY_CUA_NATIVE_PIPE_DIRECTORY": "desktop-pipe",
-                "BROWSER_USE_AVAILABLE_BACKENDS": "chrome,iab,mcpapps", "CUA_REPL_ENABLED_SURFACES": "browser,computer"}
+                "BROWSER_USE_AVAILABLE_BACKENDS": "chrome,iab,mcpapps", "CUA_REPL_ENABLED_SURFACES": "browser,computer",
+                "NODE_REPL_JS_BANNER": "line one\nline \"two\"\r\n"}
         });
         let file = plugin.join(".mcp.json");
         std::fs::write(&file, json!({"mcpServers": {"cua_repl": original}}).to_string()).unwrap();
@@ -2136,6 +2151,7 @@ mod tests {
         assert_eq!(overrides.len(), 2);
         let (key, table) = overrides[1].split_once('=').unwrap();
         assert_eq!(key, "mcp_servers.cua_repl");
+        assert!(!table.contains(['\n', '\r']), "batch arguments can't carry line breaks");
         let table: toml::Value = format!("value={table}").parse().expect("Codex -c requires a TOML value");
         let mut expected = original;
         expected["env"]["SKY_CUA_NATIVE_PIPE"] = json!("0");
