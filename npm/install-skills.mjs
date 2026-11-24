@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -58,12 +59,20 @@ for (const skill of skillNames) {
     console.error(`스킬 원본(${skill})을 찾지 못했습니다: ${sourceRoot}`);
     continue;
   }
+  // 한쪽 스킬 폴더가 다른 쪽을 가리키는 링크·정션이면 같은 폴더에 다시 쓰다 EPERM이 난다.
+  const installed = new Set();
   for (const home of homes) {
     const target = join(home.root, skill);
     try {
+      const real = existsSync(target) ? realpathSync.native(target).toLowerCase() : null;
+      if (real && installed.has(real)) {
+        console.log(`스킬 설치 완료 (${home.name}/${skill}): ${target} (같은 폴더 연결)`);
+        continue;
+      }
       copyTree(sourceRoot, target);
       pruneTree(sourceRoot, target);
       writeFileSync(join(target, bundledMarker), `${skill}\n`, "utf8");
+      installed.add(realpathSync.native(target).toLowerCase());
       console.log(`스킬 설치 완료 (${home.name}/${skill}): ${target}`);
     } catch (error) {
       failed = true;

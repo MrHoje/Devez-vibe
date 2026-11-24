@@ -192,14 +192,16 @@ impl AppServer {
             let _ = crate::cursor_recovery::restore_if_idle();
         }
         let resolved_codex = resolve_command(codex_path);
-        let mut command = codex_command(&resolved_codex);
-        if current_process_is_elevated()
-            && let Some(path) = &config_path
-            && let (Some(home), Ok(config)) = (path.parent(), std::fs::read_to_string(path))
-        {
-            for override_value in elevated_computer_use_overrides(&config, home) {
-                command.arg("-c").arg(override_value);
-            }
+        let elevated_overrides = match &config_path {
+            Some(path) if current_process_is_elevated() => match (path.parent(), std::fs::read_to_string(path)) {
+                (Some(home), Ok(config)) => elevated_computer_use_overrides(&config, home),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        let (mut command, elevated_overrides) = codex_launch(&resolved_codex, elevated_overrides);
+        for override_value in elevated_overrides {
+            command.arg("-c").arg(override_value);
         }
         apply_originator_override(&mut command);
         apply_mcp_2026_protocol_override(&mut command);
@@ -582,6 +584,38 @@ fn elevated_computer_use_overrides(config: &str, home: &Path) -> Vec<String> {
         overrides.push(format!("mcp_servers.cua_repl={cua}"));
     }
     overrides
+}
+
+/// cmd.exe refuses a command line over 8,191 characters, and a copied bundled
+/// `cua_repl` can exceed that alone, so Codex would exit at once. The official
+/// npm shim only runs `node codex.js`, so run that directly when the overrides
+/// would not fit. A custom batch launcher stays authoritative: the overrides
+/// are dropped instead, all together so the pipe is never half-switched.
+fn codex_launch(launcher: &Path, overrides: Vec<String>) -> (Command, Vec<String>) {
+    let batch = launcher.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
+    // Headroom for the launcher path, the other -c flags and batch quoting.
+    let too_long = overrides.iter().map(|value| value.len() + value.matches('"').count()).sum::<usize>() > 5_000;
+    if !(batch && too_long) {
+        return (codex_command(launcher), overrides);
+    }
+    let Some((node, script)) = npm_shim_entry(launcher) else {
+        return (codex_command(launcher), Vec::new());
+    };
+    let mut command = Command::new(node);
+    command.arg(script).args(["app-server", "--listen", "stdio://"]);
+    (command, overrides)
+}
+
+/// The node and `codex.js` an unmodified npm `codex.cmd` shim would run.
+fn npm_shim_entry(shim: &Path) -> Option<(PathBuf, PathBuf)> {
+    let dir = shim.parent()?;
+    let script = dir.join("node_modules").join("@openai").join("codex").join("bin").join("codex.js");
+    let text = std::fs::read_to_string(shim).ok()?;
+    if !script.is_file() || !text.contains(r#""%dp0%\node_modules\@openai\codex\bin\codex.js" %*"#) {
+        return None;
+    }
+    let node = dir.join("node.exe");
+    Some((if node.is_file() { node } else { PathBuf::from("node") }, script))
 }
 
 /// One-line TOML for a `-c` value: Rust refuses a line break in a `.cmd`
@@ -2128,6 +2162,35 @@ mod tests {
             "mcp_servers.node_repl.env.SKY_CUA_NATIVE_PIPE=\"0\"",
             "mcp_servers.cua_repl.env.SKY_CUA_NATIVE_PIPE=\"0\"",
         ]);
+    }
+
+    #[test]
+    fn overflowing_overrides_bypass_only_the_official_npm_shim() {
+        let small = vec!["a=\"0\"".to_owned()];
+        let huge = vec!["a=\"0\"".to_owned(), format!("b=\"{}\"", "x".repeat(9_000))];
+        let fixture = CodexLauncherFixture::new();
+        let script = fixture.write("node_modules/@openai/codex/bin/codex.js", "// entry");
+        let official = fixture.write("codex.cmd",
+            "@ECHO off\r\n\"%_prog%\"  \"%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js\" %*\r\n");
+        let custom = fixture.write("custom.cmd", "@echo off\r\nset CUSTOM_LAUNCHER=1\r\n");
+
+        let (command, kept) = codex_launch(&official, small.clone());
+        assert_eq!(command.as_std().get_program(), official.as_os_str());
+        assert_eq!(kept, small);
+
+        let (command, kept) = codex_launch(&official, huge.clone());
+        assert_eq!(command.as_std().get_program(), "node");
+        assert_eq!(command.as_std().get_args().collect::<Vec<_>>(),
+            [script.components().collect::<PathBuf>().as_os_str(), "app-server".as_ref(), "--listen".as_ref(), "stdio://".as_ref()]);
+        assert_eq!(kept, huge);
+
+        let (command, kept) = codex_launch(&custom, huge.clone());
+        assert_eq!(command.as_std().get_program(), custom.as_os_str());
+        assert!(kept.is_empty());
+
+        let (command, kept) = codex_launch(Path::new("codex.exe"), huge.clone());
+        assert_eq!(command.as_std().get_program(), "codex.exe");
+        assert_eq!(kept, huge);
     }
 
     #[test]

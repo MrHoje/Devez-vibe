@@ -23,14 +23,14 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "서브에이전트가 실행 중이면 대화 본문 아래에 실행 수, 경과 시간과 작업 내용을 표시합니다.",
-    "관리자 권한으로 실행할 때 Codex 컴퓨터 사용 설정 때문에 Codex가 시작되지 않던 오류를 고쳤습니다.",
+    "관리자 권한으로 실행할 때 Codex가 시작 직후 `app-server 연결이 종료되었습니다`로 끊기던 오류를 고쳤습니다.",
+    "Claude 스킬 폴더가 Codex 스킬 폴더에 연결된 PC에서 `dvz update`가 스킬 설치 중 권한 오류로 실패하던 문제를 고쳤습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Shows the number of running subagents, elapsed time, and their work below the conversation while they run.",
-    "Fixed Codex failing to start when run as administrator with Codex computer use configured.",
+    "Fixed Codex disconnecting with \"app-server connection closed\" right after starting when run as administrator.",
+    "Fixed `dvz update` failing with a permission error during skill installation on PCs where the Claude skills folder links to the Codex skills folder.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");
