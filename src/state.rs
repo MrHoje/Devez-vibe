@@ -15542,18 +15542,18 @@ impl AppState {
             // supplies an indeterminate bar while this elapsed clock is running.
             return Some(format!("Compacting.. ({elapsed_label})"));
         }
-        if self.busy && self.turn_interrupted {
-            return Some("X Interrupted".to_owned());
-        }
-        if let Some(activity) = self.subagent_activity() {
-            return Some(activity);
-        }
         if self.busy {
+            if self.turn_interrupted {
+                return Some("X Interrupted".to_owned());
+            }
             let elapsed = self
                 .turn_started_at
                 .map(|started| started.elapsed().as_secs())
                 .unwrap_or(0);
             return Some(format!("Working.. ({})", format_elapsed(elapsed)));
+        }
+        if let Some(activity) = self.subagent_activity() {
+            return Some(activity);
         }
         if self.turn_interrupted && self.last_completed_duration.is_some() {
             return Some("X Interrupted".to_owned());
@@ -24682,7 +24682,7 @@ mod tests {
         state.handle_notification("turn/subagents/updated", &json!({
             "subagents": [child("결과 확인", "Read(private-file)"), &second, &shell],
         }));
-        assert!(state.view().activity.unwrap().contains("Subagents 2 Running"));
+        assert!(state.view().activity.unwrap().starts_with("Working.. ("));
         state.handle_notification("turn/completed", &json!({ "turn": { "id": "main" } }));
         state.subagents[0].started_at = Instant::now() - Duration::from_secs(538);
         let activity = state.view().activity.unwrap();
@@ -24698,6 +24698,13 @@ mod tests {
         let activity = state.view().activity.unwrap();
         assert!(activity.contains("Subagents 1 Running"));
         assert!(!activity.contains(" · "));
+
+        state.editor.set_text("후속 요청");
+        assert!(matches!(state.submit_editor(), Action::Submit(_)));
+        assert!(state.view().activity.unwrap().starts_with("Working.. ("));
+        state.set_turn_started("follow-up".to_owned());
+        state.handle_notification("turn/completed", &json!({ "turn": { "id": "follow-up" } }));
+        assert!(state.view().activity.unwrap().starts_with("• Subagents 1 Running ("));
 
         state.handle_notification("turn/subagents/updated", &json!({ "subagents": [&shell] }));
         assert!(state.view().activity.unwrap().starts_with("❖ Completed"));
@@ -24929,14 +24936,15 @@ mod tests {
         let second = "00000000-0000-0000-0000-000000000115";
         state.handle_notification("item/started", &codex_activity(first, "started"));
         state.handle_notification("item/started", &codex_activity(second, "started"));
-        assert!(state.activity().unwrap().starts_with("• Subagents 2 Running ("));
+        assert_eq!(state.subagents.len(), 2);
 
         state.handle_notification("item/started", &codex_activity(first, "completed"));
         state.handle_notification("item/completed", &codex_activity(first, "completed"));
         assert_eq!(state.subagents.len(), 1);
         assert_eq!(state.subagents[0].id, second);
+        assert!(state.activity().unwrap().starts_with("Working.. ("));
+        state.handle_notification("turn/completed", &json!({ "turn": { "id": "parent" } }));
         assert!(state.activity().unwrap().starts_with("• Subagents 1 Running ("));
-        assert!(state.busy);
     }
 
     #[test]
