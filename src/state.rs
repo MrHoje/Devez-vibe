@@ -3964,6 +3964,8 @@ pub struct AppState {
     unsent_prompt: Vec<(String, Vec<String>)>,
     /// `unsent_prompt`가 `submit_prompt`가 남긴 원문뿐이라 첨부가 아직 컴포저에 있는 동안 참.
     unsent_provisional: bool,
+    /// 이번 실행에서 첨부와 함께 보낸 프롬프트 원문별 첨부. ↑로 불러올 때 되살린다.
+    history_images: HashMap<String, Vec<String>>,
     /// Keep an async answer separate from the unsent composer until turn/start succeeds.
     pending_async_answer: Option<String>,
     /// Async notifications may be repeated after their answer starts a new turn.
@@ -4388,6 +4390,7 @@ impl AppState {
             blocked_prompt: None,
             unsent_prompt: Vec::new(),
             unsent_provisional: false,
+            history_images: HashMap::new(),
             handled_async_questions: HashSet::new(),
             codex_permission_mode: PermissionMode::FullAccess,
             handoff_prompt: None,
@@ -5884,6 +5887,11 @@ impl AppState {
         } else {
             std::mem::take(&mut self.composer_images)
         };
+        if images.is_empty() {
+            self.history_images.remove(&sent_text);
+        } else {
+            self.history_images.insert(sent_text.clone(), images.clone());
+        }
         self.unsent_prompt.push((sent_text, images.clone()));
         for path in images {
             input.push(json!({ "type": "localImage", "path": path }));
@@ -7454,6 +7462,21 @@ impl AppState {
         }
     }
 
+    /// 답이 보이기 시작한 턴을 사용자가 멈추면 카드는 기록에 두고, 고쳐 보낼 수 있게
+    /// 보낸 입력과 첨부를 컴포저에 되돌린다. 완료 알림이 글자 뒤에 묶인 턴은 이미 끝났다.
+    fn restore_answered_turn_prompt(&mut self) {
+        let completed = self.held_notifications.iter().any(|(method, _)| method == "turn/completed");
+        if !self.turn_response_visible || completed || self.turn_prompts.is_empty() {
+            return;
+        }
+        self.early_steers.clear();
+        if self.restore_unsent_prompt() {
+            self.set_composer_notice(
+                tr("중단한 입력을 입력창에 되돌렸습니다.", "Put the stopped input back in the composer.").to_owned(),
+            );
+        }
+    }
+
     pub fn take_discarded_prompt_ids(&mut self) -> Vec<u64> {
         std::mem::take(&mut self.discarded_prompt_ids)
     }
@@ -7500,7 +7523,12 @@ impl AppState {
         };
         self.editor.set_text(text);
         self.shell_mode = shell;
-        self.composer_images.clear();
+        self.composer_images = if shell {
+            Vec::new()
+        } else {
+            self.history_images.get(text).cloned().unwrap_or_default()
+        };
+        self.editor.prepend_attachments(self.composer_images.len());
         self.selected_completion_bindings.clear();
         self.suggestions_dismissed_text = None;
         self.command_selection = 0;
@@ -8827,6 +8855,13 @@ impl AppState {
     }
 
     fn sync_composer_images_after_history_navigation(&mut self) {
+        if self.editor.history_position().is_some() && !self.shell_mode {
+            if let Some(images) = self.history_images.get(&self.editor.text()) {
+                self.editor.prepend_attachments(images.len());
+                self.composer_images = images.clone();
+                return;
+            }
+        }
         let placeholders = self
             .editor
             .chars()
@@ -9244,6 +9279,7 @@ impl AppState {
                         Action::Quit
                     } else {
                         self.arm_quit();
+                        self.restore_answered_turn_prompt();
                         self.request_interrupt()
                     }
                 } else if self.editor.is_empty()
@@ -9349,6 +9385,7 @@ impl AppState {
             }
             KeyCode::Enter => self.submit_editor(),
             KeyCode::Esc if self.busy => {
+                self.restore_answered_turn_prompt();
                 let action = self.request_interrupt();
                 self.resume_queue_after_interrupt = !self.queued_prompts.is_empty();
                 action
@@ -10246,7 +10283,7 @@ impl AppState {
                     // Matches Codex's own TUI: interaction is activity copy, not
                     // a liveness transition.
                     Some("interacted") => {}
-                    Some("interrupted") => self.finish_codex_subagent(id),
+                    Some("interrupted" | "completed") => self.finish_codex_subagent(id),
                     _ => {}
                 }
             }
@@ -13744,6 +13781,7 @@ impl AppState {
                 let last = usize::from(switch); // 1 when a switch row exists, else 0
                 let choose = |this: &mut Self, index: usize| -> Action {
                     let (text, display) = this.blocked_prompt.clone().unwrap_or_default();
+                    let images = this.history_images.get(&text).cloned().unwrap_or_default();
                     if switch && index == 0 {
                         if let Some((model_id, _)) = &alternate
                             && let Some(model_index) = this
@@ -13753,11 +13791,19 @@ impl AppState {
                         {
                             this.apply_model(model_index, None);
                         }
-                        this.submit_text(text, display)
+                        // 줄에서 온 프롬프트처럼 첨부를 따로 들려 보내 컴포저 초안과 섞지 않는다.
+                        this.start_queued_prompt(QueuedPrompt {
+                            text,
+                            display,
+                            images,
+                            bindings: Vec::new(),
+                        })
                     } else {
                         // Edit-and-retry: hand the prompt back to the composer on
                         // the current model and let the user change it.
                         this.editor.set_text(text);
+                        this.editor.prepend_attachments(images.len());
+                        this.composer_images = images;
                         Action::None
                     }
                 };
@@ -15496,7 +15542,10 @@ impl AppState {
             // supplies an indeterminate bar while this elapsed clock is running.
             return Some(format!("Compacting.. ({elapsed_label})"));
         }
-        if !self.turn_interrupted && let Some(activity) = self.subagent_activity() {
+        if self.busy && self.turn_interrupted {
+            return Some("X Interrupted".to_owned());
+        }
+        if let Some(activity) = self.subagent_activity() {
             return Some(activity);
         }
         if self.busy {
@@ -15504,9 +15553,6 @@ impl AppState {
                 .turn_started_at
                 .map(|started| started.elapsed().as_secs())
                 .unwrap_or(0);
-            if self.turn_interrupted {
-                return Some("X Interrupted".to_owned());
-            }
             return Some(format!("Working.. ({})", format_elapsed(elapsed)));
         }
         if self.turn_interrupted && self.last_completed_duration.is_some() {
@@ -15525,21 +15571,8 @@ impl AppState {
         let agents = self.subagents.iter().filter(|agent| !agent.is_background_task);
         let oldest = agents.clone().map(|agent| agent.started_at).min()?;
         let elapsed = format_elapsed(oldest.elapsed().as_secs());
-        let count = agents.clone().count();
-        let mut activity = format!("{SUBAGENT_ACTIVITY_PREFIX}{count} Running ({elapsed})");
-        for agent in agents {
-            let description = agent.description.trim();
-            let detail = if description.is_empty() { &agent.name } else { description };
-            let tool = agent.tool.trim().split([' ', '(']).next().unwrap_or_default();
-            activity.push_str(" · ");
-            if !tool.is_empty() {
-                activity.push('[');
-                activity.push_str(if tool == "$" { "Shell" } else { tool });
-                activity.push_str("] ");
-            }
-            activity.push_str(detail);
-        }
-        Some(activity)
+        let count = agents.count();
+        Some(format!("{SUBAGENT_ACTIVITY_PREFIX}{count} Running ({elapsed})"))
     }
 
     /// `/compact` was accepted by the runtime: run the activity spinner until the
@@ -24654,9 +24687,9 @@ mod tests {
         state.subagents[0].started_at = Instant::now() - Duration::from_secs(538);
         let activity = state.view().activity.unwrap();
         assert!(!state.busy);
-        assert!(activity.contains("Subagents 2 Running (8m 58s) · [Read] 결과 확인"));
-        assert!(activity.contains("[Shell] Researcher"));
-        assert!(!activity.contains("private-file") && !activity.contains("opaque-command"));
+        assert!(activity.starts_with("• Subagents 2 Running (8m "));
+        assert!(activity.ends_with("s)"));
+        assert!(!activity.contains(" · "));
         assert!(state.render_tick().redraw);
 
         state.handle_notification("turn/subagents/updated", &json!({
@@ -24664,11 +24697,30 @@ mod tests {
         }));
         let activity = state.view().activity.unwrap();
         assert!(activity.contains("Subagents 1 Running"));
-        assert!(activity.contains("[Write] 보고서 작성"));
+        assert!(!activity.contains(" · "));
 
         state.handle_notification("turn/subagents/updated", &json!({ "subagents": [&shell] }));
         assert!(state.view().activity.unwrap().starts_with("❖ Completed"));
         assert!(state.host_children_busy());
+    }
+
+    #[test]
+    fn subagent_activity_remains_after_interrupting_only_the_parent() {
+        let mut state = test_state();
+        state.set_turn_started("main".to_owned());
+        state.handle_notification("turn/subagents/updated", &json!({
+            "subagents": [{ "id": "child", "name": "Reviewer" }],
+        }));
+
+        assert!(matches!(state.handle_key(KeyEvent::from(KeyCode::Esc)), Action::Interrupt));
+        assert_eq!(state.activity().as_deref(), Some("X Interrupted"));
+        state.handle_notification("turn/completed", &json!({
+            "turn": { "id": "main", "status": "interrupted" },
+        }));
+        assert!(state.activity().unwrap().starts_with("• Subagents 1 Running ("));
+
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
+        assert_eq!(state.activity().as_deref(), Some("X Interrupted"));
     }
 
     /// The order measured on the real bridge: the main turn ends, the child's
@@ -24867,6 +24919,24 @@ mod tests {
                 "agentPath": "/root/auth-explorer"
             }
         })
+    }
+
+    #[test]
+    fn codex_completed_activity_leaves_only_the_other_running_child() {
+        let mut state = test_state();
+        state.set_turn_started("parent".to_owned());
+        let first = "00000000-0000-0000-0000-000000000110";
+        let second = "00000000-0000-0000-0000-000000000115";
+        state.handle_notification("item/started", &codex_activity(first, "started"));
+        state.handle_notification("item/started", &codex_activity(second, "started"));
+        assert!(state.activity().unwrap().starts_with("• Subagents 2 Running ("));
+
+        state.handle_notification("item/started", &codex_activity(first, "completed"));
+        state.handle_notification("item/completed", &codex_activity(first, "completed"));
+        assert_eq!(state.subagents.len(), 1);
+        assert_eq!(state.subagents[0].id, second);
+        assert!(state.activity().unwrap().starts_with("• Subagents 1 Running ("));
+        assert!(state.busy);
     }
 
     #[test]
@@ -28869,11 +28939,12 @@ mod tests {
     #[test]
     fn safeguard_block_switches_model_and_resends_the_prompt() {
         let mut state = claude_test_state();
-        let Action::Submit(_) =
-            state.submit_text("전역 키 후킹 방법".to_owned(), "전역 키 후킹 방법".to_owned())
-        else {
+        state.attach_local_image(r"C:\Temp.png".to_owned());
+        state.handle_paste("전역 키 후킹 방법");
+        let Action::Submit(text) = state.submit_editor() else {
             panic!("프롬프트가 나가야 한다");
         };
+        state.turn_input(text);
 
         state.handle_notification(
             "turn/completed",
@@ -28892,7 +28963,11 @@ mod tests {
         assert_eq!(id, "claude:claude-opus-5");
 
         let action = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(action, Action::Submit(text) if text == "전역 키 후킹 방법"));
+        let Action::Submit(text) = action else {
+            panic!("다시 보내야 한다");
+        };
+        assert_eq!(text, "전역 키 후킹 방법");
+        assert!(state.turn_input(text).iter().any(|item| item["path"] == r"C:\Temp.png"));
         assert_eq!(state.selected_model_name(), "claude:claude-opus-5");
         assert!(state.pending.is_none());
     }
@@ -28900,7 +28975,12 @@ mod tests {
     #[test]
     fn safeguard_block_edit_restores_the_prompt_and_keeps_the_model() {
         let mut state = claude_test_state();
-        let _ = state.submit_text("차단될 프롬프트".to_owned(), "차단될 프롬프트".to_owned());
+        state.attach_local_image(r"C:\Temp.png".to_owned());
+        state.handle_paste("차단될 프롬프트");
+        let Action::Submit(text) = state.submit_editor() else {
+            panic!("프롬프트가 나가야 한다");
+        };
+        state.turn_input(text);
 
         state.handle_notification(
             "turn/completed",
@@ -28916,6 +28996,8 @@ mod tests {
 
         assert!(matches!(action, Action::None));
         assert_eq!(state.editor.text(), "차단될 프롬프트");
+        assert_eq!(state.composer_images, vec![r"C:\Temp.png".to_owned()]);
+        assert_eq!(placeholder_count(&state), 1);
         assert_eq!(state.selected_model_name(), "claude:opus");
         assert!(state.pending.is_none());
     }
@@ -32238,8 +32320,12 @@ mod tests {
     #[test]
     fn interrupt_after_assistant_text_keeps_the_sent_prompt() {
         let mut state = test_state();
-        state.editor.set_text("표시할 요청");
-        assert!(matches!(state.submit_editor(), Action::Submit(_)));
+        state.attach_local_image(r"C:\Temp.png".to_owned());
+        state.handle_paste("표시할 요청");
+        let Action::Submit(text) = state.submit_editor() else {
+            panic!("제출돼야 한다");
+        };
+        state.turn_input(text);
         let prompt = state.drain_committed().pop().expect("submitted prompt");
         state.set_turn_started("turn-1".to_owned());
         state.handle_notification(
@@ -32258,6 +32344,74 @@ mod tests {
 
         assert!(state.take_discarded_prompt_ids().is_empty());
         assert_eq!(state.turn_prompts.last().map(Block::id), Some(prompt.id()));
+        assert_eq!(state.editor.text(), "표시할 요청");
+        assert_eq!(state.composer_images, vec![r"C:\Temp.png".to_owned()]);
+        assert_eq!(placeholder_count(&state), 1);
+    }
+
+    #[test]
+    fn history_recall_drops_images_once_the_same_text_is_resent_without_them() {
+        let mut state = test_state();
+        state.attach_local_image(r"C:\Temp.png".to_owned());
+        state.handle_paste("고쳐줘");
+        let Action::Submit(text) = state.submit_editor() else {
+            panic!("제출돼야 한다");
+        };
+        state.turn_input(text);
+        state.editor.set_text("고쳐줘");
+        state.submit_editor();
+        state.turn_input("고쳐줘".to_owned());
+
+        state.handle_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(state.editor.text(), "고쳐줘");
+        assert!(state.composer_images.is_empty() && placeholder_count(&state) == 0);
+    }
+
+    #[test]
+    fn a_stop_the_user_did_not_ask_for_leaves_an_answered_prompt_out_of_the_composer() {
+        let mut state = test_state();
+        state.handle_paste("표시할 요청");
+        let Action::Submit(text) = state.submit_editor() else {
+            panic!("제출돼야 한다");
+        };
+        state.turn_input(text);
+        state.set_turn_started("turn-1".to_owned());
+        state.handle_notification(
+            "item/agentMessage/delta",
+            &json!({ "itemId": "answer", "delta": "응답" }),
+        );
+        for _ in 0..10 {
+            state.drain_stream_text(Duration::from_millis(40));
+        }
+        state.note_response_frame_rendered(&[]);
+
+        assert!(matches!(state.request_interrupt(), Action::Interrupt));
+        assert!(state.editor.is_empty());
+    }
+
+    #[test]
+    fn history_recall_brings_back_the_sent_images() {
+        let mut state = test_state();
+        state.attach_local_image(r"C:\Temp.png".to_owned());
+        state.handle_paste("이미지 요청");
+        let Action::Submit(text) = state.submit_editor() else {
+            panic!("제출돼야 한다");
+        };
+        state.turn_input(text);
+        state.editor.set_text("글자만");
+        state.submit_editor();
+        state.editor.clear();
+
+        state.handle_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(state.editor.text(), "글자만");
+        assert!(state.composer_images.is_empty());
+        state.handle_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(state.editor.text(), "이미지 요청");
+        assert_eq!(state.composer_images, vec![r"C:\Temp.png".to_owned()]);
+        assert_eq!(placeholder_count(&state), 1);
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(state.editor.text(), "글자만");
+        assert!(state.composer_images.is_empty() && placeholder_count(&state) == 0);
     }
 
     #[test]

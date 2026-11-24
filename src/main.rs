@@ -889,8 +889,9 @@ async fn await_thread(
                         }
                         }
                     }
-                    Some(Ok(Event::Resize(_, _))) => {
+                    Some(Ok(Event::Resize(columns, rows))) => {
                         renderer.clear_selection();
+                        renderer.set_terminal_size((columns, rows));
                         renderer.relayout()?;
                         Action::None
                     }
@@ -1325,8 +1326,9 @@ async fn choose_startup_session(
                 composer_notice = None;
                 picker.handle_paste(&text);
             }
-            Some(Ok(Event::Resize(_, _))) => {
+            Some(Ok(Event::Resize(columns, rows))) => {
                 renderer.clear_selection();
+                renderer.set_terminal_size((columns, rows));
                 renderer.relayout()?;
             }
             Some(Ok(_)) => {}
@@ -1810,10 +1812,11 @@ async fn event_loop(
     stream_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_stream_reveal = Instant::now();
     let mut handoff_to_save: Option<String> = None;
+    let mut notification_redraw = false;
     // The Codex guess still running and the turn it answers; a newer turn or
     // thread kills it rather than leaving it to finish and be thrown away.
     let mut prompt_suggestion_run: Option<(u64, tokio::task::JoinHandle<()>)> = None;
-    let mut resize = ResizeTracker::new();
+    let mut resize = ResizeTracker::new(renderer.terminal_size());
     let (workspace_tx, mut workspace_rx) = mpsc::channel(1);
     let (management_tx, mut management_rx) = mpsc::unbounded_channel();
     let mut cost_restore_rx = None;
@@ -2180,6 +2183,7 @@ async fn event_loop(
                     }
                     Some(Ok(Event::Resize(columns, rows))) => {
                         renderer.clear_selection();
+                        renderer.set_terminal_size((columns, rows));
                         resize.observe_announced((columns, rows));
                         // The relayout lands on the settle tick, not here.
                         Action::Tick(false)
@@ -2214,6 +2218,8 @@ async fn event_loop(
                             action
                         } else {
                             target.handle_notification(&method, &params);
+                            // 알림 상태는 바로 반영하고, 연속된 알림은 다음 화면 틱에서 함께 그린다.
+                            notification_redraw |= !is_paced_text_delta(&method);
                             if method == "turn/completed" && !target_is_btw {
                                 handoff_to_save = Some(target.thread_id.clone());
                             }
@@ -2248,15 +2254,11 @@ async fn event_loop(
                                 target
                                     .take_queued_prompt()
                                     .map(|queued| target.start_queued_prompt(queued))
-                                    .unwrap_or(Action::None)
+                                    .unwrap_or(Action::Tick(false))
                             } else if method == "skills/changed" {
                                 Action::RefreshSkills
-                            } else if is_paced_text_delta(&method) {
-                                // The frame tick paints this; drawing on arrival would
-                                // put the provider's cadence back on screen.
-                                Action::Tick(false)
                             } else {
-                                Action::None
+                                Action::Tick(false)
                             }
                         }
                     }
@@ -2401,16 +2403,17 @@ async fn event_loop(
                 sync_host_state(state);
                 let main_tick = state.render_tick();
                 let btw_tick = btw_state.as_mut().map(AppState::render_tick);
-                let mut redraw = main_tick.redraw
+                let mut redraw = notification_redraw
+                    || main_tick.redraw
                     || btw_tick.as_ref().is_some_and(|tick| tick.redraw);
-                animation_tick = btw_state.is_none() && main_tick.animation_only;
-                if renderer.recover_external_screen_write() {
+                animation_tick = !notification_redraw && btw_state.is_none() && main_tick.animation_only;
+                if renderer.poll_terminal() {
                     redraw = true;
                     animation_tick = false;
                 }
                 // Ctrl+wheel font zoom changes the cell grid without always
                 // sending a `Resize`, so the size is polled here as well.
-                resize.observe(terminal_size());
+                resize.observe(renderer.terminal_size());
                 if resize.settled() {
                     input_hub::query_graphics().await;
                     renderer.relayout()?;
@@ -2504,13 +2507,14 @@ async fn event_loop(
             }
             if !animated {
                 draw_conversations(state, &mut btw_state, split_focus, renderer)?;
+                notification_redraw = false;
             }
         }
         // Save after deferred completion reached the renderer, otherwise the
         // sidecar can miss the final answer that was still in the reveal queue.
         if handoff_to_save.as_deref() != Some(state.thread_id.as_str()) {
             handoff_to_save = None;
-        } else if !state.stream_events_pending() {
+        } else if !notification_redraw && !state.stream_events_pending() {
             server.persist_provider_handoff(
                 &state.thread_id,
                 provider_handoff_snapshot(state, renderer),
@@ -2896,9 +2900,9 @@ impl ResizeTracker {
     /// Short enough that a single resize still feels immediate.
     const SETTLE: Duration = Duration::from_millis(80);
 
-    fn new() -> Self {
+    fn new(size: (u16, u16)) -> Self {
         Self {
-            size: terminal_size(),
+            size,
             settle_at: None,
         }
     }
@@ -11030,7 +11034,7 @@ mod tests {
 
     #[test]
     fn a_resize_burst_lays_out_once_after_the_grid_stops_moving() {
-        let mut resize = ResizeTracker::new();
+        let mut resize = ResizeTracker::new((100, 30));
         let (columns, rows) = resize.size;
 
         resize.observe((columns, rows));
@@ -11050,7 +11054,7 @@ mod tests {
 
     #[test]
     fn an_announced_resize_relayouts_even_when_the_grid_lands_back_where_it_was() {
-        let mut resize = ResizeTracker::new();
+        let mut resize = ResizeTracker::new((100, 30));
         let (columns, rows) = resize.size;
 
         // The host's reattach kick: rows down one, then straight back.

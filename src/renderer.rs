@@ -6,6 +6,7 @@ use std::{
     ops::Range,
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
+    sync::mpsc::{self, Receiver, SyncSender},
     time::{Duration, Instant},
 };
 
@@ -810,6 +811,7 @@ const FRAME_BUFFER_BYTES: usize = 512 * 1024;
 pub struct ScreenLog {
     inner: Stdout,
     log: Option<std::fs::File>,
+    write_revision: u64,
 }
 
 impl ScreenLog {
@@ -824,6 +826,7 @@ impl ScreenLog {
         Self {
             inner: stdout(),
             log,
+            write_revision: 0,
         }
     }
 }
@@ -831,6 +834,9 @@ impl ScreenLog {
 impl Write for ScreenLog {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let written = self.inner.write(buf)?;
+        if written != 0 {
+            self.write_revision = self.write_revision.wrapping_add(1);
+        }
         if let Some(log) = self.log.as_mut() {
             let _ = log.write_all(&buf[..written]);
         }
@@ -845,9 +851,59 @@ impl Write for ScreenLog {
     }
 }
 
+#[derive(Clone, Copy)]
+struct TerminalProbeRequest {
+    resize_revision: u64,
+    screen_revision: Option<u64>,
+}
+
+struct TerminalReading {
+    request: TerminalProbeRequest,
+    size: Option<(u16, u16)>,
+    cursor: Option<(u16, u16)>,
+}
+
+struct TerminalProbe {
+    requests: SyncSender<TerminalProbeRequest>,
+    readings: Receiver<TerminalReading>,
+    pending: bool,
+}
+
+impl TerminalProbe {
+    fn new() -> Self {
+        let (requests, work) = mpsc::sync_channel::<TerminalProbeRequest>(1);
+        let (results, readings) = mpsc::channel();
+        // 터미널 호스트가 조회를 붙잡아도 알림 처리와 화면 갱신은 계속 돌아야 한다.
+        let _ = std::thread::Builder::new().name("dvz-terminal-probe".to_owned()).spawn(move || {
+            while let Ok(request) = work.recv() {
+                let size = terminal_size().ok();
+                let cursor = request.screen_revision.and_then(|_| cursor_position().ok());
+                if results.send(TerminalReading { request, size, cursor }).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { requests, readings, pending: false }
+    }
+
+    fn poll(&mut self, request: TerminalProbeRequest) -> Option<TerminalReading> {
+        let reading = self.readings.try_recv().ok();
+        if reading.is_some() {
+            self.pending = false;
+        }
+        if !self.pending {
+            self.pending = self.requests.try_send(request).is_ok();
+        }
+        reading
+    }
+}
+
 pub struct Renderer {
     out: BufWriter<ScreenLog>,
     mode: RenderMode,
+    terminal_size: (u16, u16),
+    resize_revision: u64,
+    terminal_probe: Option<TerminalProbe>,
     previous_lines: Vec<PaintLine>,
     cursor_line: usize,
     cursor_col: usize,
@@ -1765,6 +1821,9 @@ impl Renderer {
         Self {
             out: BufWriter::with_capacity(FRAME_BUFFER_BYTES, ScreenLog::new()),
             mode,
+            terminal_size: terminal_size().unwrap_or((100, 30)),
+            resize_revision: 0,
+            terminal_probe: None,
             previous_lines: Vec::new(),
             cursor_line: 0,
             cursor_col: 0,
@@ -1843,11 +1902,38 @@ impl Renderer {
         self.mode
     }
 
-    /// Invalidate a stale frame cache after an unexpected console write.
-    /// The next normal draw repaints the full screen from known state.
-    #[cfg(windows)]
-    pub fn recover_external_screen_write(&mut self) -> bool {
-        if self.mode != RenderMode::Fullscreen || self.painted_frame.is_none() {
+    pub fn terminal_size(&self) -> (u16, u16) {
+        self.terminal_size
+    }
+
+    pub fn set_terminal_size(&mut self, size: (u16, u16)) {
+        self.terminal_size = size;
+        self.resize_revision = self.resize_revision.wrapping_add(1);
+    }
+
+    pub fn poll_terminal(&mut self) -> bool {
+        let request = TerminalProbeRequest {
+            resize_revision: self.resize_revision,
+            screen_revision: (cfg!(windows)
+                && self.mode == RenderMode::Fullscreen
+                && self.painted_frame.is_some())
+            .then(|| self.out.get_ref().write_revision),
+        };
+        self.terminal_probe
+            .get_or_insert_with(TerminalProbe::new)
+            .poll(request)
+            .is_some_and(|reading| self.apply_terminal_reading(reading))
+    }
+
+    fn apply_terminal_reading(&mut self, reading: TerminalReading) -> bool {
+        if reading.request.resize_revision != self.resize_revision {
+            return false;
+        }
+        if let Some(size) = reading.size {
+            self.terminal_size = size;
+        }
+        // 조회 중 그린 프레임을 이전 커서 위치로 지우지 않는다.
+        if reading.request.screen_revision != Some(self.out.get_ref().write_revision) {
             return false;
         }
 
@@ -1861,18 +1947,13 @@ impl Renderer {
             self.mode,
             self.painted_frame.is_some(),
             expected,
-            cursor_position().ok(),
+            reading.cursor,
         ) {
             return false;
         }
 
         self.painted_frame = None;
         true
-    }
-
-    #[cfg(not(windows))]
-    pub fn recover_external_screen_write(&mut self) -> bool {
-        false
     }
 
     /// Provider runtimes cannot resume each other's native session IDs. This
@@ -3052,7 +3133,7 @@ impl Renderer {
             return Ok(());
         }
         self.reset_screen()?;
-        let width = terminal_size().unwrap_or((100, 30)).0.max(20);
+        let width = self.terminal_size.0.max(20);
         // Moved out so the blocks can be printed without cloning the transcript;
         // put back whether or not a write fails partway.
         let history = std::mem::take(&mut self.history);
@@ -3329,7 +3410,7 @@ impl Renderer {
         {
             self.relayout()?;
         }
-        let (total_width, height) = terminal_size().unwrap_or((100, 30));
+        let (total_width, height) = self.terminal_size;
         let total_width = total_width.max(20);
         if total_width != self.last_total_width || height != self.last_height {
             self.history_view_rows_anchor = None;
@@ -3609,7 +3690,7 @@ impl Renderer {
         btw_view: View<'_>,
         focus: SplitFocus,
     ) -> Result<()> {
-        let (width, height) = terminal_size().unwrap_or((100, 30));
+        let (width, height) = self.terminal_size;
         let width = width.max(20);
         let height = height.max(8) as usize;
         if !self.split_active {
@@ -6732,13 +6813,11 @@ fn activity_lines_with_progress(
 ) -> Vec<PaintLine> {
     let tone = activity_model.and_then(chrome_model_tone).unwrap_or(Tone::Plain);
     if activity.starts_with(SUBAGENT_ACTIVITY_PREFIX) {
-        let single_line = activity.replace(['\r', '\n', '\t'], " ");
-        let text = without_control_characters(&single_line);
         return vec![PaintLine {
             prefix: " ".to_owned(),
             prefix_tone: tone,
             tone,
-            ..PaintLine::plain(compact_right(&text, usize::from(width.saturating_sub(2))))
+            ..PaintLine::plain(compact_right(activity, usize::from(width.saturating_sub(2))))
         }];
     }
     if UnicodeWidthStr::width(activity) > width.saturating_sub(2) as usize {
@@ -15314,7 +15393,6 @@ fn rgb_color(color: Rgb) -> Color {
     }
 }
 
-#[cfg(any(windows, test))]
 fn screen_write_recovery_needed(
     mode: RenderMode,
     has_painted_frame: bool,
@@ -15898,6 +15976,47 @@ mod tests {
             expected,
             Some((0, 25)),
         ));
+    }
+
+    #[test]
+    fn a_slow_terminal_probe_does_not_wait_or_queue_more_requests() {
+        let (requests, work) = mpsc::sync_channel(1);
+        let (results, readings) = mpsc::channel();
+        let mut probe = TerminalProbe { requests, readings, pending: false };
+        let request = TerminalProbeRequest { resize_revision: 1, screen_revision: None };
+        assert!(probe.poll(request).is_none());
+        let measured = work.try_recv().expect("one request");
+        assert!(probe.poll(request).is_none());
+        assert!(matches!(work.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        results.send(TerminalReading { request: measured, size: Some((80, 24)), cursor: None }).unwrap();
+        assert_eq!(probe.poll(request).unwrap().size, Some((80, 24)));
+        assert!(work.try_recv().is_ok());
+    }
+
+    #[test]
+    fn a_terminal_probe_cannot_restore_old_geometry_or_invalidate_a_new_frame() {
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.painted_frame = Some(CellFrame::new(80, 24));
+        let earlier = TerminalProbeRequest {
+            resize_revision: renderer.resize_revision,
+            screen_revision: Some(renderer.out.get_ref().write_revision),
+        };
+        renderer.set_terminal_size((80, 24));
+        let stale_size = TerminalReading { request: earlier, size: Some((112, 30)), cursor: Some((4, 4)) };
+        assert!(!renderer.apply_terminal_reading(stale_size));
+        assert_eq!(renderer.terminal_size(), (80, 24));
+
+        let mut request = TerminalProbeRequest { resize_revision: renderer.resize_revision, ..earlier };
+        renderer.out.get_mut().write_revision = 1;
+        let stale_cursor = TerminalReading { request, size: None, cursor: Some((5, 5)) };
+        assert!(!renderer.apply_terminal_reading(stale_cursor));
+        assert!(renderer.painted_frame.is_some());
+
+        request.screen_revision = Some(1);
+        let displaced = TerminalReading { request, size: None, cursor: Some((5, 5)) };
+        assert!(renderer.apply_terminal_reading(displaced));
+        assert!(renderer.painted_frame.is_none());
     }
 
     /// The panel takes a fixed slice of the right edge, leaves a gap in front of
@@ -20433,19 +20552,16 @@ mod tests {
     }
 
     #[test]
-    fn subagent_activity_stays_on_one_safe_row() {
-        let activity = format!(
-            "{SUBAGENT_ACTIVITY_PREFIX}2 Running (8m 58s) · [Read] 결과\n검증\u{1b}[31m 진행"
-        );
+    fn subagent_activity_stays_on_one_row_at_different_widths() {
+        let activity = format!("{SUBAGENT_ACTIVITY_PREFIX}2 Running (6m 20s)");
         let wide = activity_lines(&activity, Some("claude:sonnet"), 0.5, 100);
         assert_eq!(wide.len(), 1);
-        assert!(painted_line_text(&wide[0]).contains("[Read] 결과 검증"));
-        assert!(!painted_line_text(&wide[0]).chars().any(char::is_control));
+        assert_eq!(painted_line_text(&wide[0]).trim_start(), activity);
 
-        let narrow = activity_lines(&activity, Some("claude:sonnet"), 0.5, 38);
+        let narrow = activity_lines(&activity, Some("claude:sonnet"), 0.5, 24);
         assert_eq!(narrow.len(), 1);
-        assert!(painted_line_text(&narrow[0]).contains("Subagents 2 Running (8m 58s)"));
-        assert!(painted_line_width(&narrow[0]) < 38);
+        assert!(painted_line_text(&narrow[0]).starts_with(" • Subagents 2 Running"));
+        assert!(painted_line_width(&narrow[0]) < 24);
     }
 
     /// A row too narrow for the whole line wraps plainly rather than shimmering

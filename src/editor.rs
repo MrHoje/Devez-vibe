@@ -132,6 +132,12 @@ impl Editor {
             })
     }
 
+    /// 불러온 기록 앞에 첨부 자리를 둔다. 기록 탐색은 이어진다.
+    pub fn prepend_attachments(&mut self, count: usize) {
+        self.buffer.splice(0..0, std::iter::repeat_n(ATTACHMENT_PLACEHOLDER, count));
+        self.cursor += count;
+    }
+
     pub fn insert_str(&mut self, text: &str) {
         self.move_to_collapsed_paste_end();
         self.leave_history();

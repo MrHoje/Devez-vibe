@@ -23,14 +23,18 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "관리자 권한으로 실행할 때 Codex가 시작 직후 `app-server 연결이 종료되었습니다`로 끊기던 오류를 고쳤습니다.",
-    "Claude 스킬 폴더가 Codex 스킬 폴더에 연결된 PC에서 `dvz update`가 스킬 설치 중 권한 오류로 실패하던 문제를 고쳤습니다.",
+    "응답을 `Esc`로 중단하거나 이전 요청을 불러오거나 안전장치 차단 뒤 재전송·수정할 때, 프롬프트와 첨부 이미지가 함께 복원됩니다.",
+    "서브에이전트 진행 줄에는 실행 수와 경과 시간만 표시합니다. 부모 응답을 중단해도 계속 실행 중인 작업이 표시됩니다.",
+    "Codex 서브에이전트가 하나씩 끝날 때마다 실행 수를 갱신합니다.",
+    "터미널 크기나 커서 확인이 느릴 때 서브에이전트 완료 표시가 밀리던 문제를 고쳤습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Fixed Codex disconnecting with \"app-server connection closed\" right after starting when run as administrator.",
-    "Fixed `dvz update` failing with a permission error during skill installation on PCs where the Claude skills folder links to the Codex skills folder.",
+    "Prompts and attached images are restored when you interrupt a response with `Esc`, recall a previous request, or retry or edit a request after a safeguard block.",
+    "The subagent progress line shows the running count and elapsed time. Subagents that keep running remain visible after the parent response is interrupted.",
+    "The running count updates as each Codex subagent finishes.",
+    "Subagent completion updates stay responsive while terminal size or cursor checks are slow.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");
