@@ -12,6 +12,8 @@
 - 재개한 세션이 마지막에 쓴 모델이 아니라 방을 만들 때 고른 모델로 열림: 「DevezCode 재개 인자와 기억된 모델」.
 - 데스크톱에서는 Computer Use가 되지만 Vibe에서는 `native pipe` 연결이 실패함: 「Computer Use의 데스크톱 연결 수명」.
 - 순정 Codex CLI에서는 커서 추적이 되지만 Vibe에서는 다름: 「순정 CLI와 실행 경로 비교」.
+- 관리자 권한에서만 Codex가 `batch file arguments are invalid`로 시작 실패·시작 직후 연결 종료: 「배치 실행기의 인자 한계」.
+- `dvz update`가 스킬 설치 중 `EPERM`으로 실패: 「스킬 폴더 링크」.
 - Claude Computer Use가 터미널에 입력함·사용자 화면 노출 없이 검증해야 함: 「Claude Computer Use(`devez-computer`)」.
 - dvz 화면 동작을 사용자 창 없이 시험해야 함·디버그 빌드가 시작 직후 스택 넘침으로 죽음: 「ConPTY로 실제 화면 시험」.
 - DevezCode에서 dvz 세션을 삭제할 때 화면이 잠시 멈춤: 「DevezCode 세션 삭제 시 화면 멈춤」.
@@ -50,6 +52,19 @@
 - 순정 CLI에서 파란 커서 추적이 정상이라면 상류 이슈와 증상이 같다는 이유만으로 네이티브 헬퍼 자체의 문제로 결론 내리지 않는다. [Codex 0.163.0 TUI](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/tui/src/app_server_connection.rs)도 app-server를 사용하며 Windows에서는 기존 로컬 daemon에 연결할 수 있다. 프런트엔드의 `codex --version`뿐 아니라 실제 요청을 받는 app-server·MCP·헬퍼의 실행 파일과 환경을 비교한다.
 - Vibe는 Windows의 `.cmd`·`.bat`를 발견하면 인접 `codex.js` 또는 추정한 vendored `codex.exe`로 바꿔 실행했었다. [공식 npm 실행기](https://github.com/openai/codex/blob/rust-v0.163.0/codex-cli/bin/codex.js)는 `require.resolve`로 선택한 플랫폼 패키지를 사용하고 관리 설치 환경값을 준비한다. 선택된 패키지의 실행 파일이 없는데 오래된 legacy 파일만 남은 경우와, package.json 없는 중첩 실행 파일 옆에 정상 hoisted 패키지가 있는 경우에 두 구현의 선택이 달라지는 것을 격리 fixture로 재현했다. 이 차이는 확인된 실행 계약 결함이지만 해당 환경값이 커서 추적을 직접 바꾼다는 증거는 아니다.
 - 이제 선택한 실행기를 그대로 실행해 공식 패키지 선택과 사용자 shim의 환경 설정을 보존한다. 명시한 `.exe`도 바꾸지 않는다. Windows 배치 인자 처리는 Rust 표준 라이브러리의 배치 전용 escaping을 사용하고, 뒤에 추가하는 `-c`와 공백·따옴표가 있는 인자도 같은 경로로 보낸다.
+
+### 배치 실행기의 인자 한계
+
+- Rust는 `.cmd`·`.bat` 인자에 줄바꿈이 있으면 실행 전에 `batch file arguments are invalid`로 거부한다. `toml::Value`의 Display는 줄바꿈이 든 문자열을 여러 줄 문자열로 쓰므로 `-c` 값에 쓰지 않는다. JSON 문자열 escape는 TOML 기본 문자열과 호환되어 `inline_toml`이 한 줄로 만든다(1.11.24).
+- `cmd.exe`는 명령줄 전체가 8,191자를 넘으면 `The command line is too long`으로 끝나며, dvz에는 `app-server 연결이 종료되었습니다`로만 보인다. 관리자 권한 덮어쓰기의 `cua_repl` 전체 복사가 번들 env `NODE_REPL_TOOL_OVERRIDES` 때문에 약 10,400자였다.
+- 덮어쓰기가 한도를 넘을 때만, 실행기가 공식 npm 셈이면 셈이 하던 `node codex.js`를 직접 실행한다. 셈 본문에 `"%dp0%\node_modules\@openai\codex\bin\codex.js" %*`가 있고 그 파일이 있어야 한다. 사용자 정의 배치 실행기는 그대로 두고 덮어쓰기를 모두 생략한다(1.11.25). 위 「선택한 실행기 유지」 원칙의 유일한 예외다.
+- 긴 `-c` 값을 손으로 검증할 때 PowerShell 5.1은 네이티브 인자 속 따옴표를 깨뜨려 엉뚱한 하위 명령 오류를 낸다. node `child_process.spawn`처럼 인자 배열을 그대로 넘기는 도구로 확인한다.
+- 관리자 권한에서만 붙는 덮어쓰기는 일반 권한 검사로 드러나지 않는다. Codex 시작 오류를 볼 때는 권한 여부와 실제 넘긴 인자 길이·줄바꿈을 먼저 확인한다.
+
+### 스킬 폴더 링크
+
+- 사용자 PC에서 `~/.claude/skills/luna-loop`가 `~/.codex/skills/luna-loop`를 가리키는 정션일 수 있다. `npm/install-skills.mjs`가 두 곳에 차례로 설치하면 같은 표식 파일을 연달아 써서 `EPERM`이 날 수 있었다. 수정 전 스크립트로 다시 돌리면 성공해 일시 잠김으로 보며, 잠근 프로세스는 확인하지 않았다.
+- 이제 실제 경로(`realpathSync.native`)가 이미 설치한 폴더와 같으면 건너뛴다(1.11.25). 스킬 폴더 문제를 볼 때는 `Get-Item`의 `LinkType`으로 링크 여부부터 확인한다.
 - DevezCode 등 이미 실행 중인 GUI 호스트와 별도 터미널은 시작 시점의 `PATH`, `CODEX_HOME`, MCP별 `CODEX_CLI_PATH`, `SKY_CUA_NATIVE_PIPE*`가 다를 수 있다. 같은 머신이라는 사실만으로 같은 런타임이라고 취급하지 않는다. 비교 시 선택된 실행기, 실제 자식 실행 파일, plugin·`cua_node`·Sky 버전, direct-helper/native-pipe 모드, 대상 창 권한과 포커스를 구분한다. 콘솔 분리·작업 개체만으로 물리 마우스 훅이 차단된다고 단정하거나 권한을 넓혀 우회하지 않는다.
 
 ### 컴퓨터 조작 속도 비교와 오류 해석
