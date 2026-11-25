@@ -6736,7 +6736,34 @@ const WORKING_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
 /// Activity labels that carry the loader glyph and the shimmer sweep.
 const SPINNING_ACTIVITY_LABELS: [&str; 2] = ["Working..", "Compacting.."];
 
-pub(crate) const SUBAGENT_ACTIVITY_PREFIX: &str = "• Subagents ";
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RunningTaskKind {
+    Subagents,
+    Workflows,
+    Shells,
+    Monitors,
+    Other,
+}
+
+impl RunningTaskKind {
+    const ALL: [Self; 5] = [
+        Self::Subagents,
+        Self::Workflows,
+        Self::Shells,
+        Self::Monitors,
+        Self::Other,
+    ];
+
+    pub(crate) fn prefix(self) -> &'static str {
+        match self {
+            Self::Subagents => "• Subagents ",
+            Self::Workflows => "• Workflows ",
+            Self::Shells => "• Shells ",
+            Self::Monitors => "• Monitors ",
+            Self::Other => "• Background tasks ",
+        }
+    }
+}
 
 /// Glyphs that head an activity row which is already over. A shimmer on these
 /// reads as work still running, so they paint flat.
@@ -6812,7 +6839,10 @@ fn activity_lines_with_progress(
     width: u16,
 ) -> Vec<PaintLine> {
     let tone = activity_model.and_then(chrome_model_tone).unwrap_or(Tone::Plain);
-    if activity.starts_with(SUBAGENT_ACTIVITY_PREFIX) {
+    if RunningTaskKind::ALL
+        .iter()
+        .any(|kind| activity.starts_with(kind.prefix()))
+    {
         return vec![PaintLine {
             prefix: " ".to_owned(),
             prefix_tone: tone,
@@ -20552,16 +20582,18 @@ mod tests {
     }
 
     #[test]
-    fn subagent_activity_stays_on_one_row_at_different_widths() {
-        let activity = format!("{SUBAGENT_ACTIVITY_PREFIX}2 Running (6m 20s)");
-        let wide = activity_lines(&activity, Some("claude:sonnet"), 0.5, 100);
-        assert_eq!(wide.len(), 1);
-        assert_eq!(painted_line_text(&wide[0]).trim_start(), activity);
+    fn running_task_activity_stays_on_one_row_at_different_widths() {
+        for kind in RunningTaskKind::ALL {
+            let activity = format!("{}2 Running (6m 20s)", kind.prefix());
+            let wide = activity_lines(&activity, Some("claude:sonnet"), 0.5, 100);
+            assert_eq!(wide.len(), 1);
+            assert_eq!(painted_line_text(&wide[0]).trim_start(), activity);
 
-        let narrow = activity_lines(&activity, Some("claude:sonnet"), 0.5, 24);
-        assert_eq!(narrow.len(), 1);
-        assert!(painted_line_text(&narrow[0]).starts_with(" • Subagents 2 Running"));
-        assert!(painted_line_width(&narrow[0]) < 24);
+            let narrow = activity_lines(&activity, Some("claude:sonnet"), 0.5, 24);
+            assert_eq!(narrow.len(), 1);
+            assert!(painted_line_text(&narrow[0]).trim_start().starts_with(kind.prefix()));
+            assert!(painted_line_width(&narrow[0]) < 24);
+        }
     }
 
     /// A row too narrow for the whole line wraps plainly rather than shimmering

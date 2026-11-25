@@ -23,12 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Codex 요청이 안전 시스템에 차단되면 그 요청을 대화 기록에서 자동으로 빼서, Esc 없이 다음 메시지를 바로 이어 보낼 수 있습니다.",
+    "응답이 끝난 뒤 셸만 실행 중이어도 입력창 위에 실행 수와 경과 시간을 표시합니다. 여러 종류의 작업이 남으면 우선순위가 가장 높은 종류를 한 줄로 보여줍니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "When OpenAI's safety system blocks a Codex request, it is removed from the conversation history automatically, so you can send the next message right away without Esc.",
+    "After a response ends, the area above the prompt shows the count and elapsed time even when only shells are running. If several kinds of work remain, it shows the highest-priority kind on one line.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

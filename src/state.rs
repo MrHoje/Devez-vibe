@@ -33,10 +33,9 @@ use crate::{
         AnimationView, ArtifactView, AssistantPhase, Block, BlockKind, ComposerMode, EffortSlider,
         HIDDEN_STATUS_LINE, IntegrationItemState, IntegrationItemView, LiveBlockView, ModeAccent,
         OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS, PanelFileDiff, PlanStep, PlanStepStatus,
-        PlanSummary,
-        ProviderHandoffBlock, ProviderIntegrationView, SUBAGENT_ACTIVITY_PREFIX, StatusLineView,
-        SteeredPromptView, SubagentTranscript, SubagentView, SuggestionView, VibeTone, View, WelcomeView,
-        WorkflowRun,
+        PlanSummary, ProviderHandoffBlock, ProviderIntegrationView, RunningTaskKind, StatusLineView,
+        SteeredPromptView, SubagentTranscript, SubagentView, SuggestionView, VibeTone, View,
+        WelcomeView, WorkflowRun,
         format_clock_time, format_elapsed, visible_window,
     },
     rollout::{PlanSnapshot, Rollout, RolloutEvent, RolloutKind},
@@ -4125,6 +4124,9 @@ pub struct AppState {
     /// Child threads observed through Codex collaboration events. Unlike the
     /// visible rows, terminal entries stay here until the session changes.
     codex_subagents: HashMap<String, CodexSubagent>,
+    // 실행 항목 ID별 소유 스레드와 시작 시각.
+    codex_shells: HashMap<String, (String, Instant)>,
+    last_running_task_activity: Option<(RunningTaskKind, usize, u64)>,
     /// 턴이 끝났는데 하위 에이전트 행이 남아 있으면 그 시각. 유예가 지나도록
     /// 갱신이 없으면 종료 알림을 놓친 것으로 보고 행을 거둔다.
     subagents_settled_at: Option<Instant>,
@@ -4479,6 +4481,8 @@ impl AppState {
             artifacts: Vec::new(),
             dismissed_artifacts: read_dismissed_artifacts(),
             codex_subagents: HashMap::new(),
+            codex_shells: HashMap::new(),
+            last_running_task_activity: None,
             subagents_settled_at: None,
             runtime_children: false,
             command_selection: 0,
@@ -5239,6 +5243,7 @@ impl AppState {
     }
 
     pub fn fallback_from_codex(&mut self, message: impl Into<String>) -> bool {
+        self.codex_shells.clear();
         let selected_codex = self.selected_provider() == ModelProvider::Codex;
         let running_codex = self.busy
             && ModelProvider::from_model(self.active_cost_model()) == ModelProvider::Codex;
@@ -5427,7 +5432,7 @@ impl AppState {
     /// A background child can outlive the turn that started it. The host tab
     /// keeps spinning while those rows live so work in flight never looks done.
     pub fn host_children_busy(&self) -> bool {
-        !self.subagents.is_empty()
+        !self.subagents.is_empty() || !self.codex_shells.is_empty()
     }
 
     /// 순정처럼 응답 중에 들어온 대화 전환 명령은 줄에 세웠다가 턴이 끝나면 실행한다.
@@ -5527,7 +5532,10 @@ impl AppState {
     ) {
         // The activity belonged to the session this one replaces, whose own
         // end may never reach a screen that already moved on.
-        self.runtime_children &= self.thread_id == thread_id;
+        if self.thread_id != thread_id {
+            self.runtime_children = false;
+            self.codex_shells.clear();
+        }
         self.thread_id = thread_id;
         self.resume_id = String::new();
         let cwd = plain_folder(cwd);
@@ -7828,6 +7836,8 @@ impl AppState {
         self.subagents.clear();
         self.artifacts.clear();
         self.codex_subagents.clear();
+        self.codex_shells.clear();
+        self.last_running_task_activity = None;
         self.codex_subagent_items.clear();
         self.viewing_subagent = None;
         self.finished_subagents.clear();
@@ -8097,12 +8107,15 @@ impl AppState {
                 .chain(
                     self.finished_subagents
                         .iter()
-                        // 순정 Claude Code처럼 끝난 줄은 보고 있을 때만 남긴다. 재실행 때
-                        // 경과를 이어 세도록 기록은 그대로 30초 둔다.
+                        // 순정 Claude Code처럼 끝난 줄은 보고 있을 때만 남긴다. 다른 제공자도
+                        // 턴이 끝나 도는 에이전트가 없으면 바로 감춘다. 재실행 때 경과를
+                        // 이어 세도록 기록은 그대로 30초 둔다.
                         .filter(|(row, _)| {
                             !self.subagents.iter().any(|running| running.id == row.id)
-                                && (self.selected_provider() != ModelProvider::Claude
-                                    || self.viewing_subagent.as_deref() == Some(row.id.as_str()))
+                                && (self.viewing_subagent.as_deref() == Some(row.id.as_str())
+                                    || (self.selected_provider() != ModelProvider::Claude
+                                        && (self.busy
+                                            || self.subagents.iter().any(listed_subagent))))
                         })
                         .map(|(row, _)| SubagentView {
                             selected: self.viewing_subagent.as_deref() == Some(row.id.as_str()),
@@ -8324,15 +8337,21 @@ impl AppState {
             || self.compacting()
             || self.host_loading
             || self.viewed_subagent_started_at().is_some();
-        // A background Claude agent outlives its parent turn. Its elapsed label
-        // changes once a second, so only that boundary asks for a full frame.
-        // 목록에서 숨긴 백그라운드 명령은 작업 창이 열려 있을 때만 경과 초가 보이므로,
-        // 그 밖에는 쉬는 동안 화면 전체를 다시 그리지 않는다.
+        // 상단에 보이는 작업이나 하단 목록·작업 창의 경과 초가 바뀔 때 전체를 다시 그린다.
+        let task_activity = if !animating
+            && self.viewing_subagent.is_none()
+            && self.live_activity_notice().is_none()
+        {
+            self.running_task_activity()
+        } else {
+            None
+        };
+        let mut subagent_elapsed_changed = self.last_running_task_activity != task_activity;
+        self.last_running_task_activity = task_activity;
         let tasks_open = matches!(
             self.pending,
             Some(PendingInteraction::BackgroundTasks { .. } | PendingInteraction::WorkflowDetail(_))
         );
-        let mut subagent_elapsed_changed = false;
         for running in &mut self.subagents {
             let elapsed = running.started_at.elapsed().as_secs();
             if running.painted_elapsed_secs != elapsed {
@@ -10431,7 +10450,51 @@ impl AppState {
         }
     }
 
+    fn observe_codex_shell_notification(&mut self, method: &str, params: &Value) {
+        if !matches!(method, "item/started" | "item/completed" | "thread/closed") {
+            return;
+        }
+        let Some(thread_id) = crate::event_thread_id(params) else {
+            return;
+        };
+        if method == "thread/closed" {
+            self.codex_shells.retain(|_, (owner, _)| owner != thread_id);
+            return;
+        }
+        let Some(item) = params.get("item") else {
+            return;
+        };
+        if item.get("type").and_then(Value::as_str) != Some("commandExecution") {
+            return;
+        }
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        if method == "item/started"
+            && self.codex_subagent_source_is_known(thread_id)
+            && item.get("source").and_then(Value::as_str) == Some("unifiedExecStartup")
+            && item.get("status").and_then(Value::as_str) == Some("inProgress")
+        {
+            self.codex_shells
+                .entry(id.to_owned())
+                .or_insert_with(|| (thread_id.to_owned(), Instant::now()));
+        } else if method == "item/completed"
+            && self
+                .codex_shells
+                .get(id)
+                .is_some_and(|(owner, _)| owner == thread_id)
+        {
+            self.codex_shells.remove(id);
+        }
+    }
+
     pub fn handle_notification(&mut self, method: &str, params: &Value) {
+        // 셸 수명은 본문을 천천히 표시하는 대기열과 별개로 수신 시점에 한 번 반영한다.
+        self.observe_codex_shell_notification(method, params);
+        self.handle_ordered_notification(method, params);
+    }
+
+    fn handle_ordered_notification(&mut self, method: &str, params: &Value) {
         // Codex emits child-thread events on the shared app-server stream. Read
         // them before the ordinary current-thread filter discards them.
         self.observe_codex_subagent_notification(method, params);
@@ -10540,7 +10603,7 @@ impl AppState {
         for (method, params) in std::mem::take(&mut self.held_notifications) {
             // Later queued deltas can create a new pending stream. Its own
             // completion must wait too instead of flushing that stream whole.
-            self.handle_notification(&method, &params);
+            self.handle_ordered_notification(&method, &params);
         }
         (false, true)
     }
@@ -15582,8 +15645,12 @@ impl AppState {
                 .unwrap_or(0);
             return Some(format!("Working.. ({})", format_elapsed(elapsed)));
         }
-        if let Some(activity) = self.subagent_activity() {
-            return Some(activity);
+        if let Some((kind, count, elapsed)) = self.running_task_activity() {
+            return Some(format!(
+                "{}{count} Running ({})",
+                kind.prefix(),
+                format_elapsed(elapsed)
+            ));
         }
         if self.turn_interrupted && self.last_completed_duration.is_some() {
             return Some("X Interrupted".to_owned());
@@ -15597,12 +15664,29 @@ impl AppState {
         })
     }
 
-    fn subagent_activity(&self) -> Option<String> {
-        let agents = self.subagents.iter().filter(|agent| !agent.is_background_task);
-        let oldest = agents.clone().map(|agent| agent.started_at).min()?;
-        let elapsed = format_elapsed(oldest.elapsed().as_secs());
-        let count = agents.count();
-        Some(format!("{SUBAGENT_ACTIVITY_PREFIX}{count} Running ({elapsed})"))
+    fn running_task_activity(&self) -> Option<(RunningTaskKind, usize, u64)> {
+        let tasks = self
+            .subagents
+            .iter()
+            .map(|task| {
+                let kind = match (task.is_background_task, task.name.as_str()) {
+                    (false, _) => RunningTaskKind::Subagents,
+                    (true, "Workflow") => RunningTaskKind::Workflows,
+                    (true, "Bash") => RunningTaskKind::Shells,
+                    (true, "Monitor") => RunningTaskKind::Monitors,
+                    (true, _) => RunningTaskKind::Other,
+                };
+                (kind, task.started_at)
+            })
+            .chain(
+                self.codex_shells
+                    .values()
+                    .map(|(_, started)| (RunningTaskKind::Shells, *started)),
+            );
+        let priority = tasks.clone().map(|(kind, _)| kind).min()?;
+        let started = tasks.filter_map(|(kind, started)| (kind == priority).then_some(started));
+        let oldest = started.clone().min()?;
+        Some((priority, started.count(), oldest.elapsed().as_secs()))
     }
 
     /// `/compact` was accepted by the runtime: run the activity spinner until the
@@ -24737,8 +24821,35 @@ mod tests {
         assert!(state.view().activity.unwrap().starts_with("• Subagents 1 Running ("));
 
         state.handle_notification("turn/subagents/updated", &json!({ "subagents": [&shell] }));
-        assert!(state.view().activity.unwrap().starts_with("❖ Completed"));
+        assert!(state.view().activity.unwrap().starts_with("• Shells 1 Running ("));
         assert!(state.host_children_busy());
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
+        assert!(state.view().activity.unwrap().starts_with("❖ Completed"));
+    }
+
+    #[test]
+    fn background_activity_shows_the_highest_priority_running_group() {
+        let mut state = test_state();
+        let rows = [
+            json!({ "id": "workflow", "name": "Workflow", "backgroundTask": true }),
+            json!({ "id": "shell-1", "name": "Bash", "backgroundTask": true }),
+            json!({ "id": "shell-2", "name": "Bash", "backgroundTask": true }),
+            json!({ "id": "monitor", "name": "Monitor", "backgroundTask": true }),
+            json!({ "id": "other", "name": "other", "backgroundTask": true }),
+        ];
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": rows }));
+        state.subagents[2].started_at = Instant::now() - Duration::from_secs(125);
+        state.subagents[3].started_at = Instant::now() - Duration::from_secs(240);
+        assert!(state.activity().unwrap().starts_with("• Workflows 1 Running ("));
+
+        for (first, activity) in [
+            (1, "• Shells 2 Running (2m "),
+            (3, "• Monitors 1 Running (4m "),
+            (4, "• Background tasks 1 Running ("),
+        ] {
+            state.handle_notification("turn/subagents/updated", &json!({ "subagents": rows[first..] }));
+            assert!(state.activity().unwrap().starts_with(activity));
+        }
     }
 
     #[test]
@@ -24956,6 +25067,63 @@ mod tests {
                 "agentPath": "/root/auth-explorer"
             }
         })
+    }
+
+    #[test]
+    fn codex_shell_lifetime_outlives_the_parent_turn_but_not_command_completion() {
+        let mut state = test_state();
+        let command = |thread: &str, id: &str, source: &str, status: &str| {
+            json!({ "threadId": thread, "item": {
+                "type": "commandExecution", "id": id, "source": source, "status": status,
+            } })
+        };
+        state.set_turn_started("parent".to_owned());
+        for (thread, id, source) in [
+            ("thread", "wait", "unifiedExecInteraction"),
+            ("another-thread", "other", "unifiedExecStartup"),
+            ("thread", "shell", "unifiedExecStartup"),
+        ] {
+            state.handle_notification("item/started", &command(thread, id, source, "inProgress"));
+        }
+        assert!(state.activity().unwrap().starts_with("Working.. ("));
+        state.handle_notification("turn/completed", &json!({ "turn": { "id": "parent" } }));
+        assert!(state.activity().unwrap().starts_with("• Shells 1 Running ("));
+        assert!(state.host_busy());
+        assert!(state.render_tick().redraw);
+        state.codex_shells.get_mut("shell").unwrap().1 -= Duration::from_secs(2);
+        assert!(state.render_tick().redraw);
+        assert!(!state.render_tick().redraw);
+
+        state.hold_notification("turn/plan/updated", &json!({}));
+        state.handle_notification(
+            "item/completed",
+            &command("thread", "shell", "unifiedExecStartup", "failed"),
+        );
+        assert!(!state.host_busy());
+        assert!(state.activity().unwrap().starts_with("❖ Completed"));
+        state.release_held_notifications(false);
+        assert!(!state.host_busy());
+    }
+
+    #[test]
+    fn closing_a_codex_child_clears_its_shell_without_replaying_the_parent_shell_start() {
+        let mut state = test_state();
+        let child = "00000000-0000-0000-0000-000000000110";
+        spawn_codex_subagent(&mut state, child);
+        state.hold_notification("turn/plan/updated", &json!({}));
+        for thread in ["thread", child] {
+            state.handle_notification("item/started", &json!({ "threadId": thread, "item": {
+                "type": "commandExecution", "id": thread,
+                "source": "unifiedExecStartup", "status": "inProgress",
+            } }));
+        }
+        state.handle_notification("thread/closed", &json!({ "threadId": child }));
+        assert_eq!(state.codex_shells.len(), 1);
+        assert!(state.codex_shells.contains_key("thread"));
+
+        state.handle_notification("thread/closed", &json!({ "threadId": "thread" }));
+        state.release_held_notifications(false);
+        assert!(state.codex_shells.is_empty());
     }
 
     #[test]
@@ -25468,11 +25636,7 @@ mod tests {
         state.handle_key(KeyEvent::from(KeyCode::Esc));
         assert!(state.view().subagent_view.is_none());
         assert_eq!(state.take_subagent_watch_change(), Some(None));
-        // 보다가 나온 끝난 줄은 순정처럼 30초 더 남았다가 사라진다.
-        let rows = state.view().subagents;
-        assert!(rows.len() == 1 && rows[0].finished && !rows[0].selected);
-        state.finished_subagents[0].1 -= SUBAGENT_FINISHED_LINGER;
-        assert!(state.render_tick().redraw);
+        // 턴이 끝나 도는 에이전트가 없으면 보다가 나온 끝난 줄도 바로 사라진다.
         assert!(state.view().subagents.is_empty());
     }
 
@@ -25857,10 +26021,12 @@ mod tests {
         assert_eq!(tail.last().map(String::as_str), Some("19"));
     }
 
-    /// 보고 있는 끝난 줄은 보는 동안 남고, 나온 뒤 30초가 지나야 사라진다.
+    /// 턴 중에는 보고 있는 끝난 줄이 보는 동안 남고, 나온 뒤 30초가 지나야 사라진다.
+    /// 턴이 끝나 도는 에이전트가 없으면 보지 않는 끝난 줄은 바로 감춘다.
     #[test]
     fn a_viewed_finished_subagent_stays_until_thirty_seconds_after_leaving() {
         let mut state = state_with_a_running_subagent();
+        state.busy = true;
         state.view_subagent(Some("toolu_1".to_owned()));
         state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
         let rows = state.view().subagents;
@@ -25873,6 +26039,9 @@ mod tests {
         state.view_subagent(None);
         state.render_tick();
         assert_eq!(state.view().subagents.len(), 1, "the 30 seconds start on leaving");
+        state.busy = false;
+        assert!(state.view().subagents.is_empty(), "hidden once the turn is over");
+        state.busy = true;
 
         state.finished_subagents[0].1 -= SUBAGENT_FINISHED_LINGER;
         state.render_tick();
@@ -26000,6 +26169,7 @@ mod tests {
     #[test]
     fn a_placeholder_folded_into_its_agent_row_does_not_linger() {
         let mut state = test_state();
+        state.busy = true;
         let rows = |entries: Value| json!({ "subagents": entries });
         state.handle_notification(
             "turn/subagents/updated",
@@ -26064,22 +26234,25 @@ mod tests {
         assert!(!state.render_tick().redraw);
     }
 
-    /// 목록에서 숨긴 백그라운드 명령만 돌 때는 쉬는 동안 초마다 다시 그리지 않고,
-    /// 경과 시간을 보이는 작업 창이 열려 있을 때만 다시 그린다.
     #[test]
-    fn a_hidden_background_command_redraws_only_while_the_tasks_window_is_open() {
+    fn background_tasks_redraw_only_when_their_clock_is_visible() {
         let mut state = test_state();
         state.handle_notification(
             "turn/subagents/updated",
-            &json!({ "subagents": [{ "id": "task:b1", "name": "Bash", "backgroundTask": true }] }),
+            &json!({ "subagents": [
+                { "id": "task:b1", "name": "Bash", "backgroundTask": true },
+                { "id": "task:m1", "name": "Monitor", "backgroundTask": true },
+            ] }),
         );
         state.busy = false;
         state.subagents_settled_at = None;
         state.subagents[0].started_at = Instant::now() - Duration::from_secs(5);
+        assert!(state.render_tick().redraw);
+        state.subagents[1].started_at = Instant::now() - Duration::from_secs(7);
         assert!(!state.render_tick().redraw);
 
         state.open_background_tasks();
-        state.subagents[0].started_at = Instant::now() - Duration::from_secs(9);
+        state.subagents[1].started_at = Instant::now() - Duration::from_secs(9);
         assert!(state.render_tick().redraw);
     }
 
