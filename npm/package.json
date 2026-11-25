@@ -1,6 +1,6 @@
 {
   "name": "devez-vibe",
-  "version": "1.11.29",
+  "version": "1.11.30",
   "type": "module",
   "description": "Stable terminal UI for Codex and Claude Agent SDK",
   "keywords": [

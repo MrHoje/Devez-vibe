@@ -23,12 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "응답이 끝난 뒤 셸만 실행 중이어도 입력창 위에 실행 수와 경과 시간을 표시합니다. 여러 종류의 작업이 남으면 우선순위가 가장 높은 종류를 한 줄로 보여줍니다.",
+    "이미지를 붙여넣을 때 `[Image #N]` 대신 이미지 파일 경로가 글자로 들어가던 문제를 고쳤습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "After a response ends, the area above the prompt shows the count and elapsed time even when only shells are running. If several kinds of work remain, it shows the highest-priority kind on one line.",
+    "Fixed pasted images sometimes landing as a file path instead of `[Image #N]`.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

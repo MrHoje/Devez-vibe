@@ -7214,9 +7214,62 @@ fn apply_composer_text(state: &mut AppState, text: BufferedText) {
             state.handle_buffered_composer_text(&text.text, false);
         }
         BufferedTextTarget::Composer if !attach_pasted_local_image(state, &text.text) => {
+            let before = state.editor.chars().len();
             state.handle_buffered_composer_text(&text.text, true);
+            let inserted = state.editor.chars().len().saturating_sub(before);
+            if inserted > 0 {
+                let start = state.editor.display_cursor().saturating_sub(inserted);
+                attach_split_image_path(state, start);
+            }
         }
         BufferedTextTarget::Composer => {}
+    }
+}
+
+/// A paste can reach the composer in pieces: the first key typed over a
+/// selection is flushed alone, and a slow frame can split the burst. So a path
+/// that began before this piece is looked for across the pieces, not in one.
+fn attach_split_image_path(state: &mut AppState, piece_start: usize) {
+    let chars = state.editor.chars();
+    let cursor = state.editor.display_cursor();
+    let Some(end) = (piece_start..cursor)
+        .rev()
+        .find(|&index| !chars[index].is_whitespace())
+        .map(|index| index + 1)
+    else {
+        return;
+    };
+    let line_start = chars[..end]
+        .iter()
+        .rposition(|&ch| ch == '\n')
+        .map_or(0, |index| index + 1);
+    // The file lookup is synchronous and a stale network drive can stall it, so
+    // only a line that already ends in an image extension is looked up at all.
+    let line = chars[line_start..end]
+        .iter()
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if ![".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"]
+        .iter()
+        .any(|extension| line.ends_with(extension))
+    {
+        return;
+    }
+    let found = (line_start..piece_start).find_map(|start| {
+        let head = &chars[start..end];
+        let bounded = start == line_start || !chars[start - 1].is_alphanumeric();
+        let rooted = matches!(head, [drive, ':', '\\' | '/', next, ..]
+            if drive.is_ascii_alphabetic() && !matches!(next, '\\' | '/'))
+            || head.starts_with(&['\\', '\\']);
+        (bounded && rooted)
+            .then(|| local_image_path_from_paste(&head.iter().collect::<String>()))
+            .flatten()
+            .map(|path| (start, path))
+    });
+    if let Some((start, path)) = found
+        && state.delete_composer_selection(start..cursor)
+    {
+        state.attach_local_image(path.to_string_lossy().into_owned());
     }
 }
 
@@ -9653,6 +9706,52 @@ mod tests {
 
         assert!(state.editor.is_empty());
         assert_eq!(state.composer_image_count(), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_image_path_pasted_in_pieces_still_attaches() {
+        let path = std::env::temp_dir().join(format!(
+            "devez-split-paste-image-{}.png",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+        let text = path.to_string_lossy().into_owned();
+        let mut state = starting_state();
+        state.handle_buffered_composer_text("note ", false);
+        // Typed over a selection, the first key is flushed on its own; a slow
+        // frame then splits the rest of the burst once more.
+        let middle = text.char_indices().nth(text.chars().count() / 2).unwrap().0;
+        for (piece, pasted) in [
+            (&text[..1], false),
+            (&text[1..middle], true),
+            (&text[middle..], true),
+        ] {
+            apply_composer_text(
+                &mut state,
+                BufferedText {
+                    text: piece.to_owned(),
+                    pasted,
+                    target: BufferedTextTarget::Composer,
+                },
+            );
+        }
+
+        assert_eq!(state.editor.text(), "note ");
+        assert_eq!(state.composer_image_count(), 1);
+
+        // A path typed by hand stays text even when a pasted space follows it.
+        state.handle_buffered_composer_text(&text, false);
+        apply_composer_text(
+            &mut state,
+            BufferedText {
+                text: "  ".to_owned(),
+                pasted: true,
+                target: BufferedTextTarget::Composer,
+            },
+        );
+        assert_eq!(state.editor.text(), format!("note {text}  "));
         std::fs::remove_file(path).unwrap();
     }
 
