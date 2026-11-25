@@ -2447,6 +2447,11 @@ async fn event_loop(
                 btw.set_prompt_suggestions(*enabled);
             }
         }
+        // Before the action runs, so a queued prompt does not carry the blocked turn.
+        revert_blocked_turn(server, state).await;
+        if let Some(btw) = btw_state.as_mut() {
+            revert_blocked_turn(server, btw).await;
+        }
         let should_quit = match action {
             // Claimed ahead of the split routing: the highlight belongs to the
             // renderer, which paints whichever composer the key came from. It is
@@ -5297,6 +5302,26 @@ async fn apply_deferred_startup_actions(server: &BackendServer, state: &mut AppS
             } => persist_vibe_display_modes(server, state, vibe, response, shell, diff).await,
             _ => unreachable!("only startup-safe mode actions are deferred"),
         }
+    }
+}
+
+/// Drops a safety-blocked Codex turn from the thread history, as Codex's Esc
+/// backtrack does, so the next prompt is not blocked by the same history.
+async fn revert_blocked_turn(server: &BackendServer, state: &mut AppState) {
+    let Some(turn_id) = state.take_blocked_turn() else {
+        return;
+    };
+    let params = json!({ "threadId": state.thread_id, "beforeTurnId": turn_id });
+    match server.request("thread/revert", params).await {
+        Ok(_) => state.push_notice(
+            BlockKind::System,
+            "Blocked turn removed",
+            tr(
+                "차단된 요청을 대화 기록에서 뺐습니다. 다음 메시지를 바로 보낼 수 있습니다.",
+                "Removed the blocked request from the conversation history. You can send the next message.",
+            ),
+        ),
+        Err(error) => state.push_notice(BlockKind::Warning, "Blocked turn kept", error.to_string()),
     }
 }
 

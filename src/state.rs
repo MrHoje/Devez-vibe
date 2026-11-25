@@ -3771,6 +3771,18 @@ fn is_safeguard_block(message: &str) -> bool {
     message.contains("safeguards flagged") || message.contains("(refusal)")
 }
 
+/// Whether OpenAI's safety system blocked a Codex request. The blocked turn
+/// stays in the history and gets every later request blocked too.
+fn is_codex_safety_block(error: &Value) -> bool {
+    matches!(
+        error.get("codexErrorInfo").and_then(Value::as_str),
+        Some("cyberPolicy" | "bioPolicy" | "misalignmentPolicyViolation")
+    ) || error
+        .get("message")
+        .and_then(Value::as_str)
+        .is_some_and(|message| message.contains("blocked by our safety systems"))
+}
+
 fn submission_display(source: &str, image_count: usize) -> String {
     let mut display = String::new();
     let mut image_index = 0;
@@ -4173,6 +4185,9 @@ pub struct AppState {
     prompt_suggestion_seq: u64,
     /// The finished Codex turn waiting for the host to ask for its guess.
     prompt_suggestion_turn: Option<String>,
+    /// A Codex turn the safety system blocked, waiting for the host to drop it
+    /// from the thread history so the next prompt is not blocked by it again.
+    blocked_turn: Option<String>,
     side_parent: Option<SideParent>,
     /// BTW panes run the plan silently: steps still advance, but the panel and
     /// its transcript cards stay off the split view.
@@ -4492,6 +4507,7 @@ impl AppState {
             prompt_suggestion: None,
             prompt_suggestion_seq: 0,
             prompt_suggestion_turn: None,
+            blocked_turn: None,
             side_parent: None,
             plan_panel_hidden: false,
             last_assistant_markdown: None,
@@ -6524,6 +6540,11 @@ impl AppState {
             thread_id: self.thread_id.clone(),
             turn_id,
         })
+    }
+
+    /// The safety-blocked Codex turn the host drops with `thread/revert`.
+    pub fn take_blocked_turn(&mut self) -> Option<String> {
+        self.blocked_turn.take()
     }
 
     /// One-off events (skills reloaded, model rerouted, …) share the composer
@@ -10675,6 +10696,15 @@ impl AppState {
                     .and_then(Value::as_str);
                 if turn_error.is_some() || turn_status == Some("failed") {
                     self.resume_queue_after_interrupt = false;
+                }
+                if ModelProvider::from_model(self.active_cost_model()) == ModelProvider::Codex
+                    && turn_error.is_some_and(is_codex_safety_block)
+                {
+                    self.blocked_turn = params
+                        .pointer("/turn/id")
+                        .and_then(Value::as_str)
+                        .or(self.turn_id.as_deref())
+                        .map(ToOwned::to_owned);
                 }
                 let successful = !self.turn_interrupted
                     && turn_error.is_none()
@@ -29008,6 +29038,28 @@ mod tests {
         assert_eq!(placeholder_count(&state), 1);
         assert_eq!(state.selected_model_name(), "claude:opus");
         assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn only_a_codex_safety_block_queues_the_turn_for_revert() {
+        let blocked = |provider_state: &mut AppState, message: &str| {
+            provider_state.handle_notification(
+                "turn/completed",
+                &json!({ "turn": { "id": "turn-1", "status": "failed", "error": { "message": message } } }),
+            );
+            provider_state.take_blocked_turn()
+        };
+        let safety = "This request was blocked by our safety systems. Reason: Potentially unintended activity.";
+        assert_eq!(blocked(&mut test_state(), safety).as_deref(), Some("turn-1"));
+        assert_eq!(blocked(&mut test_state(), "HTTP 503"), None);
+        assert_eq!(blocked(&mut claude_test_state(), safety), None);
+        let mut state = test_state();
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "id": "turn-2", "status": "failed", "error": { "message": "x", "codexErrorInfo": "cyberPolicy" } } }),
+        );
+        assert_eq!(state.take_blocked_turn().as_deref(), Some("turn-2"));
+        assert_eq!(state.take_blocked_turn(), None);
     }
 
     #[test]

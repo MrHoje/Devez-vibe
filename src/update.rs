@@ -23,12 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "서브에이전트가 실행 중이어도 부모 응답이 진행되면 입력창 위 상태에 `Working..`을 표시합니다.",
+    "Codex 요청이 안전 시스템에 차단되면 그 요청을 대화 기록에서 자동으로 빼서, Esc 없이 다음 메시지를 바로 이어 보낼 수 있습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "The status line above the input shows `Working..` during a parent response, including while subagents are running.",
+    "When OpenAI's safety system blocks a Codex request, it is removed from the conversation history automatically, so you can send the next message right away without Esc.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");
