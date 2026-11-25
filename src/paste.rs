@@ -62,6 +62,11 @@ const MATCHED_PASTE_GAP: Duration = Duration::from_millis(250);
 /// typed the same prefix and then stopped still sees their characters appear.
 const VERIFIED_PASTE_GAP: Duration = Duration::from_millis(2_000);
 
+/// A pasted path is only turned into an attachment once it is whole, so a
+/// repaint or server event stalling the loop between its keys must not release
+/// the prefix on its own — that prefix would be painted as text first.
+const PATH_PASTE_GAP: Duration = Duration::from_millis(100);
+
 /// How many fast characters have to pile up before `Enter` stops meaning send.
 /// Typing scores zero, because the one 0ms gap an IME produces belongs to the
 /// Enter itself and never to a character. Two is therefore already decisive,
@@ -429,6 +434,8 @@ impl ComposerPasteBuffer {
             MATCHED_PASTE_GAP
         } else if self.shortcut_paste {
             SHORTCUT_PASTE_GAP
+        } else if self.pasted && self.text.contains([':', '\\', '/']) {
+            PATH_PASTE_GAP
         } else {
             COMPOSER_FAST_GAP
         }
@@ -680,9 +687,34 @@ mod tests {
         }
 
         assert_eq!(
-            buffer.flush_if_idle(at + Duration::from_millis(COMPOSER_FAST_GAP.as_millis() as u64)),
+            buffer.flush_if_idle(at + PATH_PASTE_GAP),
             Some(BufferedText {
                 text: r"C:\Temp\clipboard.png".to_owned(),
+                pasted: true,
+                target: BufferedTextTarget::Composer,
+            })
+        );
+    }
+
+    #[test]
+    fn a_stall_inside_a_pasted_path_keeps_it_in_one_piece() {
+        let mut buffer = ComposerPasteBuffer::new();
+        let mut at = Instant::now();
+        for (index, ch) in r"C:\Temp\clip.png".chars().enumerate() {
+            // A repaint between two keys, far past the typing-safe gap.
+            let gap = if index == 6 { 30 } else { 1 };
+            at += Duration::from_millis(gap);
+            assert!(
+                buffer.flush_if_idle(at).is_none(),
+                "released at key {index}"
+            );
+            assert!(buffer.observe(press(KeyCode::Char(ch)), at).is_empty());
+        }
+
+        assert_eq!(
+            buffer.flush_if_idle(at + PATH_PASTE_GAP),
+            Some(BufferedText {
+                text: r"C:\Temp\clip.png".to_owned(),
                 pasted: true,
                 target: BufferedTextTarget::Composer,
             })
