@@ -575,11 +575,12 @@ async fn await_deferring_input<T>(
 /// The paint the activity row needs between a request and its answer.
 fn activity_frame(state: &mut AppState, renderer: &mut Renderer) -> Result<()> {
     let tick = state.render_tick();
-    if !tick.redraw {
+    if !tick.redraw && !tick.spinner_only {
         return Ok(());
     }
-    let animated = tick.animation_only && renderer.render_animation(state.animation_view())?;
-    if !animated {
+    let animated = (tick.animation_only || tick.spinner_only)
+        && renderer.render_animation(state.animation_view())?;
+    if tick.redraw && !animated {
         draw(state, renderer)?;
     }
     Ok(())
@@ -1943,6 +1944,7 @@ async fn event_loop(
         }
         let mut connection_closed = false;
         let mut animation_tick = false;
+        let mut spinner_tick = false;
         // Set when an edit took a selection. Paste batching holds the screen still
         // while keys arrive in a burst, but text vanishing from the prompt has to
         // be seen at once — otherwise the selection looks untouched until the next
@@ -2407,6 +2409,7 @@ async fn event_loop(
                     || main_tick.redraw
                     || btw_tick.as_ref().is_some_and(|tick| tick.redraw);
                 animation_tick = !notification_redraw && btw_state.is_none() && main_tick.animation_only;
+                spinner_tick = !redraw && btw_state.is_none() && main_tick.spinner_only;
                 if renderer.poll_terminal() {
                     redraw = true;
                     animation_tick = false;
@@ -2422,6 +2425,7 @@ async fn event_loop(
                 } else if resize.pending() {
                     // Nothing painted onto a grid that is still moving survives.
                     redraw = false;
+                    spinner_tick = false;
                 }
                 Action::Tick(redraw)
             }
@@ -2502,15 +2506,15 @@ async fn event_loop(
         if returning_from_side {
             side_exit_key_guard = Some(Instant::now() + SIDE_EXIT_KEY_SETTLE);
         }
-        if redraw {
+        if redraw || (spinner_tick && !composer_paste.is_buffering()) {
             let animation_started = Instant::now();
             let animated = btw_state.is_none()
-                && animation_tick
+                && (animation_tick || (spinner_tick && !redraw))
                 && renderer.render_animation(state.animation_view())?;
             if animated {
                 perf::record_animation(animation_started.elapsed());
             }
-            if !animated {
+            if redraw && !animated {
                 draw_conversations(state, &mut btw_state, split_focus, renderer)?;
                 notification_redraw = false;
             }

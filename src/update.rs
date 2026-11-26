@@ -23,12 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "붙여넣은 이미지·긴 글 표시 뒤에 한 칸을 미리 띄워, 이어서 입력할 때 글자가 밀리지 않도록 했습니다.",
+    "서브에이전트·셸 등 백그라운드 작업에 스피너를 표시하고, 시머는 `Working..` 상태에만 표시합니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Pasted image and long-text labels now keep a space after them, so typing right after them no longer shifts the text.",
+    "Background tasks such as subagents and shells now show a spinner. The shimmer appears only on the Working.. status.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

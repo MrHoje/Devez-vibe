@@ -3812,6 +3812,8 @@ fn submission_display(source: &str, image_count: usize) -> String {
 pub struct TickResult {
     pub redraw: bool,
     pub animation_only: bool,
+    /// Optional patch of the background activity row between ordinary frames.
+    pub spinner_only: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4137,6 +4139,7 @@ pub struct AppState {
     /// Idle rows spin between full frames only where dvz draws the IME preedit
     /// itself (DevezCode). An external terminal paints its own preedit and loses
     /// it whenever the cursor hides, so there idle rows wait for the next second.
+    idle_row_spinner: bool,
     command_selection: usize,
     spinner_frame: usize,
     turn_started_at: Option<Instant>,
@@ -4485,6 +4488,7 @@ impl AppState {
             last_running_task_activity: None,
             subagents_settled_at: None,
             runtime_children: false,
+            idle_row_spinner: crate::devezcode::room_id().is_some(),
             command_selection: 0,
             spinner_frame: 0,
             compacting_started_at: None,
@@ -8343,6 +8347,7 @@ impl AppState {
             && self.live_activity_notice().is_none()
         {
             self.running_task_activity()
+                .map(|(kind, count, started)| (kind, count, started.elapsed().as_secs()))
         } else {
             None
         };
@@ -8474,15 +8479,16 @@ impl AppState {
         if !self.quit_armed() {
             self.quit_armed_at = None;
         }
+        let redraw = !inline_answer_active
+            && (animating
+                || subagent_elapsed_changed
+                || plan_shimmer_active
+                || response_collapse_active
+                || ultracode_shimmer
+                || ultracode_shimmer_ended
+                || full_redraw);
         TickResult {
-            redraw: !inline_answer_active
-                && (animating
-                    || subagent_elapsed_changed
-                    || plan_shimmer_active
-                    || response_collapse_active
-                    || ultracode_shimmer
-                    || ultracode_shimmer_ended
-                    || full_redraw),
+            redraw,
             animation_only: !inline_answer_active
                 && (animating || plan_shimmer_active)
                 && !response_collapse_active
@@ -8490,6 +8496,10 @@ impl AppState {
                 && !ultracode_shimmer_ended
                 && !subagent_elapsed_changed
                 && !full_redraw,
+            spinner_only: !redraw
+                && !inline_answer_active
+                && self.idle_row_spinner
+                && task_activity.is_some(),
         }
     }
 
@@ -15645,11 +15655,11 @@ impl AppState {
                 .unwrap_or(0);
             return Some(format!("Working.. ({})", format_elapsed(elapsed)));
         }
-        if let Some((kind, count, elapsed)) = self.running_task_activity() {
+        if let Some((kind, count, started)) = self.running_task_activity() {
             return Some(format!(
                 "{}{count} Running ({})",
                 kind.prefix(),
-                format_elapsed(elapsed)
+                format_elapsed(started.elapsed().as_secs())
             ));
         }
         if self.turn_interrupted && self.last_completed_duration.is_some() {
@@ -15664,7 +15674,7 @@ impl AppState {
         })
     }
 
-    fn running_task_activity(&self) -> Option<(RunningTaskKind, usize, u64)> {
+    fn running_task_activity(&self) -> Option<(RunningTaskKind, usize, Instant)> {
         let tasks = self
             .subagents
             .iter()
@@ -15686,7 +15696,7 @@ impl AppState {
         let priority = tasks.clone().map(|(kind, _)| kind).min()?;
         let started = tasks.filter_map(|(kind, started)| (kind == priority).then_some(started));
         let oldest = started.clone().min()?;
-        Some((priority, started.count(), oldest.elapsed().as_secs()))
+        Some((priority, started.count(), oldest))
     }
 
     /// `/compact` was accepted by the runtime: run the activity spinner until the
@@ -15741,6 +15751,7 @@ impl AppState {
             .viewed_subagent_started_at()
             .or(self.compacting_started_at)
             .or(self.turn_started_at)
+            .or_else(|| self.running_task_activity().map(|(_, _, started)| started))
         else {
             return 0.0;
         };
@@ -26252,17 +26263,28 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_background_subagent_keeps_its_elapsed_row_redrawing() {
+    fn an_idle_background_subagent_spins_between_frames_only_in_the_host() {
         let mut state = state_with_a_running_subagent();
         state.busy = false;
+        state.idle_row_spinner = false;
         state.subagents[0].started_at = Instant::now() - Duration::from_secs(1);
 
         let tick = state.render_tick();
 
         assert!(tick.redraw);
         assert!(!tick.animation_only);
-        // The row's dot is static, so it waits for the next elapsed second.
-        assert!(!state.render_tick().redraw);
+        assert!(!tick.spinner_only);
+        assert!(!state.render_tick().spinner_only);
+
+        state.idle_row_spinner = true;
+        let tick = state.render_tick();
+        assert!(!tick.redraw);
+        assert!(tick.spinner_only);
+
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
+        let tick = state.render_tick();
+        assert!(tick.redraw);
+        assert!(!tick.spinner_only);
     }
 
     #[test]

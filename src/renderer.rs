@@ -6733,7 +6733,7 @@ fn shimmer_spans_with_band(label: &str, phase: f32, base: Rgb, band: f32) -> Vec
 /// Gajae-Code's Unicode activity loader frames.
 const WORKING_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Activity labels that carry the loader glyph and the shimmer sweep.
+/// Foreground activity labels that carry the loader glyph.
 const SPINNING_ACTIVITY_LABELS: [&str; 2] = ["Working..", "Compacting.."];
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -6764,10 +6764,6 @@ impl RunningTaskKind {
         }
     }
 }
-
-/// Glyphs that head an activity row which is already over. A shimmer on these
-/// reads as work still running, so they paint flat.
-const SETTLED_ACTIVITY_GLYPHS: [&str; 2] = ["✓", "X"];
 
 /// The loader glyph plus the space after it.
 const WORKING_SPINNER_COLUMNS: usize = 2;
@@ -6839,15 +6835,18 @@ fn activity_lines_with_progress(
     width: u16,
 ) -> Vec<PaintLine> {
     let tone = activity_model.and_then(chrome_model_tone).unwrap_or(Tone::Plain);
+    let spinner =
+        WORKING_SPINNER[(phase.clamp(0.0, 0.999) * WORKING_SPINNER.len() as f32) as usize];
     if RunningTaskKind::ALL
         .iter()
         .any(|kind| activity.starts_with(kind.prefix()))
     {
+        let activity = format!("{spinner} {}", activity.trim_start_matches("• "));
         return vec![PaintLine {
             prefix: " ".to_owned(),
             prefix_tone: tone,
             tone,
-            ..PaintLine::plain(compact_right(activity, usize::from(width.saturating_sub(2))))
+            ..PaintLine::plain(compact_right(&activity, usize::from(width.saturating_sub(2))))
         }];
     }
     if UnicodeWidthStr::width(activity) > width.saturating_sub(2) as usize {
@@ -6860,24 +6859,17 @@ fn activity_lines_with_progress(
             .strip_prefix(label)
             .map(|trailer| (*label, trailer))
     }) {
-        let shimmer_base = tone_rgb(tone).unwrap_or(theme::palette().foreground);
         let mut tail = vec![PaintSpan {
-            text: format!(
-                "{} ",
-                WORKING_SPINNER[(phase.clamp(0.0, 0.999) * WORKING_SPINNER.len() as f32) as usize]
-            ),
+            text: format!("{spinner} "),
             tone,
             bold: false,
         }];
-        // Working keeps its elapsed reading in the same sweep, so the active
-        // state does not visually stop before the time at the right.
-        let shimmer_text = if label == COMPACTING_LABEL {
-            label.to_owned()
-        } else {
-            format!("{label}{trailer}")
-        };
-        tail.extend(shimmer_spans(&shimmer_text, phase, shimmer_base));
         if label == COMPACTING_LABEL {
+            tail.push(PaintSpan {
+                text: label.to_owned(),
+                tone,
+                bold: false,
+            });
             let spent = 1
                 + WORKING_SPINNER_COLUMNS
                 + UnicodeWidthStr::width(label)
@@ -6899,6 +6891,9 @@ fn activity_lines_with_progress(
                 tone,
                 bold: false,
             });
+        } else {
+            let shimmer_base = tone_rgb(tone).unwrap_or(theme::palette().foreground);
+            tail.extend(shimmer_spans(&format!("{label}{trailer}"), phase, shimmer_base));
         }
         return vec![PaintLine {
             prefix: " ".to_owned(),
@@ -6911,58 +6906,11 @@ fn activity_lines_with_progress(
             tail,
         }];
     }
-    if activity.starts_with("❖ Completed (") {
-        return vec![PaintLine {
-            prefix: " ".to_owned(),
-            prefix_tone: tone,
-            text: activity.to_owned(),
-            tone,
-            bold: false,
-            tool_heading: None,
-            pick: None,
-            tail: Vec::new(),
-        }];
-    }
-    let shimmer_base = tone_rgb(tone).unwrap_or(theme::palette().foreground);
-    let (glyph, rest) = activity.split_once(' ').unwrap_or((activity, ""));
-    let (label, trailer) = match rest.find('(') {
-        // The space before the bracket belongs to the tail: a shimmer that sweeps
-        // through it would stall for a beat on nothing.
-        Some(index) => {
-            let label = rest[..index].trim_end();
-            (label, &rest[label.len()..])
-        }
-        None => (rest, ""),
-    };
-    let mut tail = if SETTLED_ACTIVITY_GLYPHS.contains(&glyph) {
-        vec![PaintSpan {
-            text: label.to_owned(),
-            tone,
-            bold: false,
-        }]
-    } else {
-        shimmer_spans(label, phase, shimmer_base)
-    };
-    if !trailer.is_empty() {
-        tail.push(PaintSpan {
-            text: trailer.to_owned(),
-            tone,
-            bold: false,
-        });
-    }
     vec![PaintLine {
         prefix: " ".to_owned(),
         prefix_tone: tone,
-        text: if rest.is_empty() {
-            glyph.to_owned()
-        } else {
-            format!("{glyph} ")
-        },
         tone,
-        bold: false,
-        tool_heading: None,
-        pick: None,
-        tail,
+        ..PaintLine::plain(activity.to_owned())
     }]
 }
 
@@ -20690,59 +20638,39 @@ mod tests {
     }
 
     #[test]
-    fn settled_activity_labels_never_shimmer() {
-        for (label, expected_prefix, expected_text, expected_tone) in [
-            (
-                "❖ Completed (2m 12s)",
-                Some(" "),
-                None,
-                Some(Tone::ModelTerra),
-            ),
-            ("X Interrupted", None, Some("X "), None),
+    fn notices_and_settled_activity_labels_are_plain() {
+        for label in [
+            "❖ Completed (2m 12s)",
+            "X Interrupted",
+            "• Copied to clipboard",
+            "Loading session...",
         ] {
             let line = activity_lines(label, Some("gpt-5.6-terra"), 0.5, 80)
                 .pop()
-                .expect("settled activity row");
-
-            if let Some(expected_prefix) = expected_prefix {
-                assert_eq!(line.prefix, expected_prefix);
-            }
-            if let Some(expected_text) = expected_text {
-                assert_eq!(line.text, expected_text);
-            }
-            if let Some(expected_tone) = expected_tone {
-                assert_eq!(line.tone, expected_tone);
-            }
-            assert!(
-                line.tail
-                    .iter()
-                    .all(|span| !matches!(span.tone, Tone::Shimmer(_, _))),
-                "a settled turn must not look like it is still working"
-            );
+                .expect("activity row");
+            assert_eq!(painted_line_text(&line), format!(" {label}"));
+            assert_eq!(line.tone, Tone::ModelTerra);
+            assert!(line.tail.is_empty());
         }
     }
 
     #[test]
-    fn copy_notice_activity_uses_plain_text() {
-        let line = activity_lines("• Copied to clipboard", None, 0.5, 80)
-            .pop()
-            .expect("copy notice row");
-
-        assert_eq!(line.tone, Tone::Plain);
-        assert_eq!(line.text, "• ");
-    }
-
-    #[test]
-    fn running_task_activity_stays_on_one_row_at_different_widths() {
+    fn running_tasks_spin_without_shimmer_and_stay_on_one_row() {
         for kind in RunningTaskKind::ALL {
             let activity = format!("{}2 Running (6m 20s)", kind.prefix());
+            let label = activity.trim_start_matches("• ");
+            let first = activity_lines(&activity, Some("claude:sonnet"), 0.0, 100);
             let wide = activity_lines(&activity, Some("claude:sonnet"), 0.5, 100);
+            assert_eq!(first.len(), 1);
             assert_eq!(wide.len(), 1);
-            assert_eq!(painted_line_text(&wide[0]).trim_start(), activity);
+            assert_eq!(painted_line_text(&first[0]), format!(" ⠋ {label}"));
+            assert_eq!(painted_line_text(&wide[0]), format!(" ⠴ {label}"));
+            assert!(wide[0].tail.is_empty());
 
             let narrow = activity_lines(&activity, Some("claude:sonnet"), 0.5, 24);
             assert_eq!(narrow.len(), 1);
-            assert!(painted_line_text(&narrow[0]).trim_start().starts_with(kind.prefix()));
+            let prefix = format!(" ⠴ {}", kind.prefix().trim_start_matches("• "));
+            assert!(painted_line_text(&narrow[0]).starts_with(&prefix));
             assert!(painted_line_width(&narrow[0]) < 24);
         }
     }
@@ -26260,7 +26188,7 @@ mod tests {
     }
 
     #[test]
-    fn the_compacting_label_shimmers_independently_from_its_progress_block() {
+    fn the_compacting_spinner_and_bar_move_without_text_shimmer() {
         let line = activity_lines_with_progress("Compacting.. (4s)", None, 0.0, 0.5, 80);
 
         assert_eq!(
@@ -26268,6 +26196,12 @@ mod tests {
             " ⠋ Compacting.. ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬ (4s)"
         );
         assert_eq!(lit_track_offset(&line[0]), Some(8));
+        assert!(
+            line[0]
+                .tail
+                .iter()
+                .all(|span| !matches!(span.tone, Tone::Shimmer(_, _)))
+        );
     }
 
     /// The reading belongs to compaction alone: an ordinary turn keeps its plain
@@ -27779,7 +27713,7 @@ mod tests {
     fn an_open_question_panel_stops_the_animation_fast_path() {
         fn animation_view() -> AnimationView<'static> {
             AnimationView {
-                activity: Some("Thinking".to_owned()),
+                activity: Some("• Shells 1 Running (3s)".to_owned()),
                 activity_model: None,
                 activity_phase: 0.0,
                 waiting_for_response: false,
