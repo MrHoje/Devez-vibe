@@ -40,8 +40,8 @@ use crate::{
     },
     syntax::{self, SyntaxKind},
     terminal_width::{
-        UnicodeWidthChar, UnicodeWidthStr, console_width, width_may_differ_on_host,
-        wrap_ascii_space,
+        UnicodeWidthChar, UnicodeWidthStr, circled_decimal, console_width, display_char_width,
+        use_devezcode_paw_width, width_may_differ_on_host, wrap_ascii_space,
     },
     theme::{self, Rgb, ThemeKind},
 };
@@ -1207,7 +1207,7 @@ const TAB_STOP: usize = 8;
 /// 커서만 다음 탭 정지까지 건너뛴다. 그 구간은 배경이 칠해지지 않아 검은 띠로
 /// 남고 뒤따르는 셀이 통째로 밀려 선택 하이라이트까지 어긋나므로, 폭을 재기
 /// 전에 공백으로 펼쳐 둔다.
-fn expand_tabs(text: &str) -> Cow<'_, str> {
+fn expand_tabs(text: &str, expand_circled: bool) -> Cow<'_, str> {
     if !text.contains('\t') {
         return Cow::Borrowed(text);
     }
@@ -1220,7 +1220,7 @@ fn expand_tabs(text: &str) -> Cow<'_, str> {
             column += advance;
         } else {
             expanded.push(ch);
-            column += UnicodeWidthChar::width(ch).unwrap_or(0);
+            column += display_char_width(ch, expand_circled);
         }
     }
     Cow::Owned(expanded)
@@ -2829,7 +2829,7 @@ impl Renderer {
 
     #[cfg(test)]
     pub(crate) fn set_markdown_screen_for_test(&mut self, source: &str, width: u16) {
-        self.previous_lines = markdown_line("  ", Tone::Plain, source, Tone::Plain, false, width, false);
+        self.previous_lines = markdown_line("  ", Tone::Plain, source, Tone::Plain, false, width, false, false);
     }
 
     #[cfg(test)]
@@ -9235,6 +9235,7 @@ fn overlay_frame_with_expansion(
                         tone,
                         selected && !model_picker,
                         (panel_width.saturating_sub(2)).min(u16::MAX as usize) as u16,
+                        false,
                     );
                     lines.extend(wrapped.into_iter().map(|line| {
                         let mut line = split_panel_border(line, marker_tone);
@@ -9275,6 +9276,7 @@ fn overlay_frame_with_expansion(
                             Tone::Muted,
                             false,
                             (panel_width.saturating_sub(1)).min(u16::MAX as usize) as u16,
+                            false,
                         )
                         .into_iter()
                         .map(|line| close_panel_row(line, panel_width)),
@@ -9388,6 +9390,7 @@ fn overlay_frame_with_expansion(
                         tone,
                         selected,
                         (panel_width.saturating_sub(1)).min(u16::MAX as usize) as u16,
+                        false,
                     );
                     lines.extend(wrapped.into_iter().map(|line| {
                         let marker_tone = if selected { Tone::Accent } else { Tone::Muted };
@@ -9447,6 +9450,7 @@ fn overlay_frame_with_expansion(
                             if is_prompt { Tone::Plain } else { Tone::Muted },
                             true,
                             wrap_width,
+                            false,
                         )
                         .into_iter()
                         .map(|mut line| {
@@ -9506,6 +9510,7 @@ fn overlay_frame_with_expansion(
                                 Tone::Plain,
                                 false,
                                 wrap_width,
+                                false,
                             )
                             .into_iter()
                             .map(|line| {
@@ -9550,6 +9555,7 @@ fn overlay_frame_with_expansion(
                             tone,
                             part_index == 0 && !row.muted,
                             wrap_width,
+                            false,
                         )
                         .into_iter()
                         .map(|line| {
@@ -9602,6 +9608,7 @@ fn overlay_frame_with_expansion(
                             },
                             false,
                             wrap_width,
+                            false,
                         )
                         .into_iter()
                         .map(|line| {
@@ -10487,6 +10494,7 @@ fn file_change_lines(block: &Block, width: u16, rows_shown: usize) -> Vec<PaintL
             Tone::Muted,
             false,
             width,
+            false,
         ));
     }
     lines.extend(file_change_patch_lines(&rows.collect::<Vec<_>>(), width, rows_shown));
@@ -10557,7 +10565,7 @@ fn file_change_patch_lines(rows: &[&str], width: u16, rows_shown: usize) -> Vec<
                 // An unmarked row is context, so only its number dims.
                 let gutter_tone = if marker == ' ' { Tone::Muted } else { tone };
                 match word_spans[index].clone() {
-                    Some(spans) => styled_lines(&gutter, gutter_tone, spans, tone, false, width),
+                    Some(spans) => styled_lines(&gutter, gutter_tone, spans, tone, false, width, false),
                     None => wrapped_line(&gutter, gutter_tone, content, tone, false, width),
                 }
             }
@@ -12205,6 +12213,7 @@ fn block_lines_with_mode_at(
     };
 
     let conversational = matches!(block.kind, BlockKind::Assistant);
+    let expand_circled = conversational && use_devezcode_paw_width();
     let chat_layout = conversational && chat_layout();
     let marker = if chat_layout { "  " } else { marker };
     let conversational_width = if chat_layout {
@@ -12307,6 +12316,7 @@ fn block_lines_with_mode_at(
                 Tone::Code,
                 false,
                 conversational_width,
+                expand_circled && code_language == "text" && allows_decimal_expansion(raw_line),
             ));
         } else if let Some(separator) = raw_lines.get(line_index + 1)
             && let Some(header) = markdown_table_cells(raw_line)
@@ -12335,6 +12345,7 @@ fn block_lines_with_mode_at(
                 &alignments,
                 content_tone,
                 conversational_width,
+                expand_circled,
             ) {
                 // One extra row on each side so a table stands apart from the surrounding text.
                 if !table_first {
@@ -12357,6 +12368,7 @@ fn block_lines_with_mode_at(
                 false,
                 conversational_width,
                 streaming_line,
+                expand_circled,
             ));
             line_index = table_start;
         } else if trimmed.starts_with('#') {
@@ -12370,6 +12382,7 @@ fn block_lines_with_mode_at(
                 true,
                 conversational_width,
                 streaming_line,
+                expand_circled,
             ));
         } else if let Some(item) = trimmed
             .strip_prefix("- ")
@@ -12391,17 +12404,20 @@ fn block_lines_with_mode_at(
                 false,
                 conversational_width,
                 streaming_line,
+                expand_circled,
             ));
         } else if let Some(quote) = trimmed.strip_prefix("> ") {
             let (prefix, prefix_tone) =
                 body_prefix(&mut first_content, marker, tone, "  │ ", Tone::Muted);
-            lines.extend(wrapped_line(
+            lines.extend(wrapped_line_with_continuation(
                 &prefix,
+                &" ".repeat(UnicodeWidthStr::width(prefix.as_str())),
                 prefix_tone,
                 quote,
                 Tone::Muted,
                 false,
                 conversational_width,
+                expand_circled,
             ));
         } else {
             let (prefix, prefix_tone) =
@@ -12414,6 +12430,7 @@ fn block_lines_with_mode_at(
                 false,
                 conversational_width,
                 streaming_line,
+                expand_circled,
             ));
         }
         line_index += 1;
@@ -12474,6 +12491,7 @@ fn markdown_table_lines(
     alignments: &[TableAlignment],
     tone: Tone,
     width: u16,
+    expand_circled: bool,
 ) -> Option<Vec<PaintLine>> {
     let columns = rows.first()?.len();
     if alignments.len() != columns {
@@ -12490,7 +12508,17 @@ fn markdown_table_lines(
     let mut widths = (0..columns)
         .map(|column| {
             rows.iter()
-                .map(|row| UnicodeWidthStr::width(row[column].as_str()))
+                .map(|row| {
+                    let cell = row[column].as_str();
+                    let extra = if expand_circled && allows_decimal_expansion(cell) {
+                        cell.chars()
+                            .filter(|&ch| circled_decimal(ch, true).is_some())
+                            .count()
+                    } else {
+                        0
+                    };
+                    UnicodeWidthStr::width(cell) + extra
+                })
                 .max()
                 .unwrap_or(0)
                 .max(MIN_CELL_WIDTH)
@@ -12512,7 +12540,7 @@ fn markdown_table_lines(
         let cell_lines = row
             .iter()
             .zip(&widths)
-            .map(|(cell, width)| table_cell_lines(cell, *width))
+            .map(|(cell, width)| table_cell_lines(cell, *width, expand_circled))
             .collect::<Vec<_>>();
         let height = cell_lines.iter().map(Vec::len).max().unwrap_or(1);
         for cell_line in 0..height {
@@ -12604,11 +12632,11 @@ fn table_rule_line(
     table_content_line(prefix, prefix_tone, &cells, Tone::Muted, false, column_gap)
 }
 
-fn table_cell_lines(cell: &str, width: usize) -> Vec<String> {
-    wrap_ascii_space(cell, width)
-    .into_iter()
-    .map(|line| line.into_owned())
-    .collect::<Vec<_>>()
+fn table_cell_lines(cell: &str, width: usize, expand_circled: bool) -> Vec<String> {
+    wrap_ascii_space(cell, width, expand_circled && allows_decimal_expansion(cell))
+        .into_iter()
+        .map(|line| line.into_owned())
+        .collect()
 }
 
 fn align_table_cell(cell: &str, width: usize, alignment: TableAlignment) -> String {
@@ -12703,6 +12731,7 @@ fn user_prompt_lines_with_history(
                     Tone::UserPrompt,
                     false,
                     width.saturating_sub(1),
+                    false,
                 )
             })
             .collect::<Vec<_>>();
@@ -13036,10 +13065,20 @@ fn markdown_line(
     bold: bool,
     width: u16,
     streaming: bool,
+    mut expand_circled: bool,
 ) -> Vec<PaintLine> {
     if !text.contains('`') && !text.contains("**") && !text.contains('[') && !text.contains("http")
     {
-        return wrapped_line(prefix, prefix_tone, text, tone, bold, width);
+        return wrapped_line_with_continuation(
+            prefix,
+            &" ".repeat(UnicodeWidthStr::width(prefix)),
+            prefix_tone,
+            text,
+            tone,
+            bold,
+            width,
+            expand_circled,
+        );
     }
 
     let mut spans = Vec::new();
@@ -13061,6 +13100,7 @@ fn markdown_line(
             }
             // 닫히지 않은 코드도 원문을 유지하며 안쪽의 링크를 활성화하지 않는다.
             push_highlight_span(&mut spans, rest, tone, strong);
+            expand_circled = false;
             break;
         }
         if let Some((label, target, consumed)) = inline_link(rest, streaming) {
@@ -13102,7 +13142,7 @@ fn markdown_line(
         index += take;
     }
 
-    let mut lines = styled_lines(prefix, prefix_tone, spans, tone, bold, width);
+    let mut lines = styled_lines(prefix, prefix_tone, spans, tone, bold, width, expand_circled);
     attach_markdown_link_picks(&mut lines, &links);
     lines
 }
@@ -13358,9 +13398,13 @@ fn styled_lines(
     fallback_tone: Tone,
     fallback_bold: bool,
     width: u16,
+    expand_circled: bool,
 ) -> Vec<PaintLine> {
     let prefix_width = UnicodeWidthStr::width(prefix);
     let available = (width as usize).saturating_sub(prefix_width + 1).max(1);
+    let show_decimal = |tone| {
+        expand_circled && available >= 2 && !matches!(tone, Tone::InlineCode | Tone::MarkdownLink)
+    };
     let mut rows: Vec<Vec<PaintSpan>> = vec![Vec::new()];
     let mut used = 0;
     let mut tokens: Vec<(bool, Vec<PaintSpan>, usize)> = Vec::new();
@@ -13368,7 +13412,7 @@ fn styled_lines(
     for span in spans {
         for ch in span.text.chars() {
             let whitespace = ch.is_whitespace();
-            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            let char_width = display_char_width(ch, show_decimal(span.tone));
             if let Some((last_whitespace, parts, token_width)) = tokens.last_mut()
                 && *last_whitespace == whitespace
             {
@@ -13411,14 +13455,19 @@ fn styled_lines(
 
         for span in parts {
             for ch in span.text.chars() {
-                let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                let char_width = display_char_width(ch, show_decimal(span.tone));
                 if used + char_width > available && used > 0 {
                     rows.push(Vec::new());
                     used = 0;
                 }
+                let mut encoded = [0; 4];
+                let text = match circled_decimal(ch, show_decimal(span.tone)) {
+                    Some(digits) => digits,
+                    None => ch.encode_utf8(&mut encoded),
+                };
                 push_highlight_span(
                     rows.last_mut().expect("at least one styled row"),
-                    &ch.to_string(),
+                    text,
                     span.tone,
                     span.bold,
                 );
@@ -13797,7 +13846,12 @@ fn wrapped_line(
     width: u16,
 ) -> Vec<PaintLine> {
     let continuation = " ".repeat(UnicodeWidthStr::width(prefix));
-    wrapped_line_with_continuation(prefix, &continuation, prefix_tone, text, tone, bold, width)
+    wrapped_line_with_continuation(prefix, &continuation, prefix_tone, text, tone, bold, width, false)
+}
+
+fn allows_decimal_expansion(text: &str) -> bool {
+    // Unformatted rows can contain literal code and URLs that the terminal links directly.
+    !text.contains('`') && !text.contains("://")
 }
 
 /// Like [`wrapped_line`], but the caller chooses what folded rows are prefixed
@@ -13810,16 +13864,18 @@ fn wrapped_line_with_continuation(
     tone: Tone,
     bold: bool,
     width: u16,
+    expand_circled: bool,
 ) -> Vec<PaintLine> {
     let width = width as usize;
     let prefix_width = UnicodeWidthStr::width(prefix).max(UnicodeWidthStr::width(continuation));
     // `CellFrame` leaves the physical final column blank to avoid terminal
     // autowrap, so text wrapping must reserve that same column as well.
     let available = width.saturating_sub(prefix_width + 1).max(4);
+    let expand_circled = expand_circled && allows_decimal_expansion(text);
     // ASCII-space wrapping keeps links and paths intact so they fold to the next
     // row as one word; long words still break using the active terminal width.
-    let expanded = expand_tabs(text);
-    let wrapped = wrap_ascii_space(expanded.as_ref(), available);
+    let expanded = expand_tabs(text, expand_circled);
+    let wrapped = wrap_ascii_space(expanded.as_ref(), available, expand_circled);
     if wrapped.is_empty() {
         return vec![PaintLine {
             prefix: prefix.to_owned(),
@@ -18699,6 +18755,77 @@ mod tests {
     }
 
     #[test]
+    fn embedded_assistant_copies_displayed_circled_decimals() {
+        set_chat_layout(false);
+        let body = "⑩로 ⑳로 `⑪` [⑫](https://example.test)\n> https://example.test/⑬";
+        let block = Block::new(BlockKind::Assistant, "Claude", body);
+        let completed = || {
+            block_lines_with_mode(
+                &block,
+                80,
+                ShellDisplayMode::default(),
+                DiffDisplayMode::default(),
+                false,
+            )
+        };
+        let standalone = painted_line_text(&completed()[0]);
+        assert!(standalone.contains("⑩로 ⑳로"), "{standalone:?}");
+        with_devezcode_xterm_widths(|| {
+            let lines = completed();
+            let shown = painted_line_text(&lines[0]);
+            assert!(shown.contains("10로 20로 ⑪ ⑫"), "{shown:?}");
+            assert!(painted_line_text(&lines[1]).contains("https://example.test/⑬"));
+            let (live, _) = render_streamed_transcript_lines(
+                &[LiveBlockView { block: &block, revision: 0 }],
+                80,
+                &HashSet::new(),
+                ShellDisplayMode::default(),
+                DiffDisplayMode::default(),
+            );
+            assert_eq!(painted_line_text(&live[0]), painted_line_text(&lines[0]));
+
+            let start = UnicodeWidthStr::width(lines[0].prefix.as_str()) as u16;
+            let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Inline);
+            renderer.previous_lines = lines;
+            let copied = extract_text(
+                &renderer.copy_lines(),
+                CellRange {
+                    start: CellPosition { row: 0, column: start },
+                    end: CellPosition { row: 0, column: start + 3 },
+                },
+            );
+            assert_eq!(copied, "10로");
+        });
+        assert_eq!(block.body, body);
+    }
+
+    #[test]
+    fn styled_and_table_circled_decimals_stay_together_at_the_margin() {
+        let lines = markdown_line(
+            "", Tone::Plain, "abc**⑩**로", Tone::Plain, false, 5, false, true,
+        );
+        assert_eq!(
+            lines.iter().map(painted_line_text).collect::<Vec<_>>(),
+            ["abc", "10로"],
+        );
+        assert!(lines[1].bold);
+
+        let rows = vec![vec!["abc⑩".to_owned(), "항목".to_owned()]];
+        let table = markdown_table_lines(
+            "",
+            Tone::Plain,
+            &rows,
+            &[TableAlignment::Left, TableAlignment::Left],
+            Tone::Plain,
+            11,
+            true,
+        )
+        .expect("table fits two columns");
+        assert_eq!(table[0].text.trim_end(), "abc");
+        assert_eq!(table[1].text.trim_end(), "10");
+    }
+
+    #[test]
     fn wrapped_lines_reserve_the_final_column_from_autowrap() {
         let lines = wrapped_line("● ", Tone::Accent, "abcdef", Tone::Plain, false, 8);
 
@@ -18884,6 +19011,7 @@ mod tests {
             false,
             100,
             false,
+            false,
         );
         let line = &lines[0];
         let url = "https://claude.ai/code/g/abc123";
@@ -18914,6 +19042,7 @@ mod tests {
             Tone::Plain,
             false,
             22,
+            false,
             false,
         );
 
@@ -19004,7 +19133,7 @@ mod tests {
         ];
         let alignments = vec![TableAlignment::Left, TableAlignment::Center];
 
-        let lines = markdown_table_lines("  ", Tone::Muted, &rows, &alignments, Tone::Plain, 80)
+        let lines = markdown_table_lines("  ", Tone::Muted, &rows, &alignments, Tone::Plain, 80, false)
             .expect("table fits the available width");
 
         assert_eq!(lines[0].prefix, "  ");
@@ -19056,7 +19185,7 @@ mod tests {
         ];
         let alignments = vec![TableAlignment::Left, TableAlignment::Right];
 
-        let lines = markdown_table_lines("", Tone::Plain, &rows, &alignments, Tone::Plain, 30)
+        let lines = markdown_table_lines("", Tone::Plain, &rows, &alignments, Tone::Plain, 30, false)
             .expect("table fits the available width");
 
         assert!(lines.len() > 3);
@@ -19119,6 +19248,7 @@ mod tests {
             false,
             100,
             false,
+            false,
         );
         let line = &lines[0];
         let rendered = std::iter::once(line.text.as_str())
@@ -19147,6 +19277,7 @@ mod tests {
             Tone::MarkdownHeading,
             true,
             100,
+            false,
             false,
         );
         let line = &lines[0];
@@ -19465,6 +19596,7 @@ mod tests {
             false,
             200,
             false,
+            false,
         );
         let line = &lines[0];
         let rendered = std::iter::once(line.text.as_str())
@@ -19583,7 +19715,7 @@ mod tests {
             ("![그림](https://example.com", "그림"),
             ("[](https://example.com", ""),
         ] {
-            let lines = markdown_line("", Tone::Plain, source, Tone::Plain, false, 80, true);
+            let lines = markdown_line("", Tone::Plain, source, Tone::Plain, false, 80, true, false);
             assert_eq!(lines.iter().map(painted).collect::<String>(), expected);
             assert!(lines.iter().all(|line| line.pick.is_none()));
         }
@@ -19711,7 +19843,7 @@ mod tests {
                     );
                     let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
                     renderer.previous_lines =
-                        markdown_line("  ", Tone::Plain, &source, Tone::Plain, false, width, true);
+                        markdown_line("  ", Tone::Plain, &source, Tone::Plain, false, width, true, false);
                     for (row, line) in renderer.previous_lines.iter().enumerate() {
                         let mut column = 0;
                         for ch in painted(line).chars() {
@@ -19768,6 +19900,7 @@ mod tests {
                             false,
                             120,
                             streaming,
+                            false,
                         );
                         assert!(
                             lines.iter().map(painted).collect::<String>().contains(code),
@@ -19977,6 +20110,7 @@ mod tests {
             false,
             80,
             false,
+            false,
         );
         let line = &lines[0];
         let start = UnicodeWidthStr::width("  열기: ");
@@ -20000,6 +20134,7 @@ mod tests {
             Tone::Plain,
             false,
             100,
+            false,
             false,
         );
         let line = &lines[0];
@@ -20072,6 +20207,7 @@ mod tests {
             Tone::Plain,
             false,
             80,
+            false,
             false,
         );
         assert_eq!(lines[0].text, "[Enter] Continue when done");
@@ -21061,6 +21197,7 @@ mod tests {
                 Tone::Code,
                 false,
                 width,
+                false,
             );
             assert_eq!(
                 lines.iter().map(painted).collect::<String>(),
@@ -21072,6 +21209,7 @@ mod tests {
         }
         let lines = markdown_line(
             "", Tone::Plain, "alpha beta gamma", Tone::Plain, false, 11, false,
+            false,
         );
         assert_eq!(
             lines.iter().map(painted).collect::<Vec<_>>(),

@@ -23,14 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "이미지를 붙여넣을 때 파일 경로가 입력창에 잠깐 보이던 현상을 줄였습니다.",
-    "세션을 다시 열면 이미지 첨부 표시가 복원되고, Claude에서 이미지만 보낸 요청도 보이도록 수정했습니다.",
+    "내장 Vibe 응답에서 ⑩~⑳을 10~20으로 표시하고, 줄 끝에서 두 자리를 함께 넘기며 화면에 보이는 숫자가 복사되도록 수정했습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Reduced the brief flash of a file path in the composer when pasting an image.",
-    "Restored image attachment placeholders when resuming a session and made image-only Claude prompts visible again.",
+    "In embedded Vibe responses, ⑩–⑳ now appear as 10–20, stay together at line breaks, and are copied as displayed.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

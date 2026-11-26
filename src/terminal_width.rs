@@ -422,12 +422,12 @@ fn use_devezcode_xterm_widths() -> bool {
 }
 
 #[cfg(not(test))]
-fn use_devezcode_paw_width() -> bool {
+pub(crate) fn use_devezcode_paw_width() -> bool {
     env::var("DEVEZCODE_TERM_WIDTH_PROFILE").as_deref() == Ok("xterm6-unicode6-paw2")
 }
 
 #[cfg(test)]
-fn use_devezcode_paw_width() -> bool {
+pub(crate) fn use_devezcode_paw_width() -> bool {
     TEST_DEVEZCODE_PAW_WIDTH.get()
 }
 
@@ -471,23 +471,40 @@ impl Fragment for TerminalFragment<'_> {
     }
 }
 
+pub(crate) fn circled_decimal(ch: char, expand: bool) -> Option<&'static str> {
+    const DECIMALS: [&str; 11] = ["10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20"];
+    (expand && ('⑩'..='⑳').contains(&ch)).then(|| DECIMALS[ch as usize - '⑩' as usize])
+}
+
+pub(crate) fn display_char_width(ch: char, expand_circled: bool) -> usize {
+    match circled_decimal(ch, expand_circled) {
+        Some(digits) => digits.len(),
+        None => UnicodeWidthChar::width(ch).unwrap_or(0),
+    }
+}
+
 /// `textwrap` hardcodes the modern `unicode-width` crate. Build the same
 /// ASCII-space/first-fit wrapping with fragments whose widths come from the
 /// active terminal profile, including break-words behavior for long paths.
-pub(crate) fn wrap_ascii_space(text: &str, line_width: usize) -> Vec<Cow<'_, str>> {
+pub(crate) fn wrap_ascii_space(
+    text: &str,
+    line_width: usize,
+    expand_circled: bool,
+) -> Vec<Cow<'_, str>> {
     let line_width = line_width.max(1);
+    let expand_circled = expand_circled && line_width >= 2;
     let mut fragments = Vec::new();
     let mut start = 0;
     let mut in_whitespace = false;
     for (index, ch) in text.char_indices() {
         if in_whitespace && ch != ' ' {
-            push_fragment_parts(&mut fragments, &text[start..index], line_width);
+            push_fragment_parts(&mut fragments, &text[start..index], line_width, expand_circled);
             start = index;
         }
         in_whitespace = ch == ' ';
     }
     if start < text.len() {
-        push_fragment_parts(&mut fragments, &text[start..], line_width);
+        push_fragment_parts(&mut fragments, &text[start..], line_width, expand_circled);
     }
     if fragments.is_empty() {
         return Vec::new();
@@ -501,7 +518,17 @@ pub(crate) fn wrap_ascii_space(text: &str, line_width: usize) -> Vec<Cow<'_, str
         .map(|line| {
             let mut output = String::new();
             for (index, fragment) in line.iter().enumerate() {
-                output.push_str(fragment.word);
+                if expand_circled {
+                    for ch in fragment.word.chars() {
+                        if let Some(digits) = circled_decimal(ch, true) {
+                            output.push_str(digits);
+                        } else {
+                            output.push(ch);
+                        }
+                    }
+                } else {
+                    output.push_str(fragment.word);
+                }
                 if index + 1 < line.len() {
                     output.push_str(fragment.whitespace);
                 }
@@ -515,6 +542,7 @@ fn push_fragment_parts<'a>(
     output: &mut Vec<TerminalFragment<'a>>,
     fragment: &'a str,
     line_width: usize,
+    expand_circled: bool,
 ) {
     let word = fragment.trim_end_matches(' ');
     let whitespace = &fragment[word.len()..];
@@ -530,7 +558,7 @@ fn push_fragment_parts<'a>(
     let mut start = 0;
     let mut width = 0;
     for (index, ch) in word.char_indices() {
-        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        let char_width = display_char_width(ch, expand_circled);
         if width > 0 && width + char_width > line_width {
             output.push(TerminalFragment {
                 word: &word[start..index],
@@ -588,7 +616,7 @@ mod tests {
     #[test]
     fn paw_prints_lay_out_two_cells_each_like_the_devezcode_provider() {
         with_devezcode_xterm_widths(|| {
-            assert_eq!(wrap_ascii_space("🐾🐾🐾🐾🐾", 5), ["🐾🐾", "🐾🐾", "🐾"]);
+            assert_eq!(wrap_ascii_space("🐾🐾🐾🐾🐾", 5, false), ["🐾🐾", "🐾🐾", "🐾"]);
             assert_eq!(console_width("🐾🐾🐾🐾🐾"), 10);
         });
     }
@@ -625,11 +653,21 @@ mod tests {
             .into_iter()
             .map(Cow::into_owned)
             .collect::<Vec<_>>();
-            let actual = wrap_ascii_space(text, width)
+            let actual = wrap_ascii_space(text, width, false)
                 .into_iter()
                 .map(Cow::into_owned)
                 .collect::<Vec<_>>();
             assert_eq!(actual, expected, "text={text:?}, width={width}");
         }
+    }
+
+    #[test]
+    fn circled_decimals_wrap_as_a_pair_before_emitting_digits() {
+        assert_eq!(wrap_ascii_space("abc⑩로", 4, true), ["abc", "10로"]);
+        assert_eq!(wrap_ascii_space("abc⑩로", 4, false), ["abc⑩", "로"]);
+        assert_eq!(wrap_ascii_space("⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳", 2, true), [
+            "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20",
+        ]);
+        assert_eq!(wrap_ascii_space("⑳", 1, true), ["⑳"]);
     }
 }
