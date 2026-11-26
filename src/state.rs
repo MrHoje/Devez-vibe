@@ -18962,8 +18962,25 @@ fn restored_async_answer(block: &Block, questions: &[String]) -> Option<Block> {
 
 fn completed_item_block(cwd: &str, item: &Value) -> Option<Block> {
     match item.get("type")?.as_str()? {
-        "userMessage" => user_message_text(item)
-            .map(|body| Block::new(BlockKind::User, UNKNOWN_PROMPT_MODEL, body)),
+        "userMessage" => {
+            let text = user_message_text(item).unwrap_or_default();
+            let images = item
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|content| {
+                    matches!(content.get("type").and_then(Value::as_str), Some("image" | "localImage"))
+                })
+                .count();
+            // 이미지는 글자와 따로 저장돼, 보낼 때처럼 앞에 [Image #n] 자리를 되살린다.
+            let mut body = (1..=images).map(|index| format!("[Image #{index}]")).collect::<Vec<_>>().join(" ");
+            if !body.is_empty() && text.starts_with(|ch: char| !ch.is_whitespace()) {
+                body.push(' ');
+            }
+            body.push_str(&text);
+            (!body.is_empty()).then(|| Block::new(BlockKind::User, UNKNOWN_PROMPT_MODEL, body))
+        }
         // 재개한 대화도 질문·답변을 라이브와 같은 카드로 보여 준다.
         "questionAnswers" => {
             let pairs = item
@@ -21259,6 +21276,20 @@ mod tests {
 
         assert!(state.busy);
         assert_eq!(state.turn_id.as_deref(), Some("turn-9"));
+    }
+
+    #[test]
+    fn a_resumed_prompt_shows_its_image_placeholders() {
+        let body = |content: Value| {
+            completed_item_block("cwd", &json!({ "type": "userMessage", "content": content })).map(|block| block.body)
+        };
+        let image = json!({ "type": "localImage", "path": "C:/a.png" });
+        let text = json!({ "type": "text", "text": "봐줘" });
+        assert_eq!(body(json!([text, image, { "type": "image" }])).as_deref(), Some("[Image #1] [Image #2] 봐줘"));
+        assert_eq!(body(json!([{ "type": "text", "text": "" }, image])).as_deref(), Some("[Image #1]"));
+        assert_eq!(body(json!([text])).as_deref(), Some("봐줘"));
+        // 이미지 뒤 줄바꿈으로 시작한 글은 보낼 때처럼 띄어 쓰지 않는다.
+        assert_eq!(body(json!([{ "type": "text", "text": "\n\n봐줘" }, image])).as_deref(), Some("[Image #1]\n\n봐줘"));
     }
 
     #[test]

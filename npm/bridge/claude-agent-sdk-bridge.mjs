@@ -4425,13 +4425,15 @@ function historyState(messages) {
     const userText = message.type === "user"
       ? stripInternalTags(stripHandoff(blocks.filter((block) => block.type === "text").map((block) => block.text || "").join("\n")))
       : "";
-    if (userText
+    // Only the count matters to the transcript; the image data stays out of history.
+    const userImages = message.type === "user" ? blocks.filter((block) => block.type === "image").map(() => ({ type: "image" })) : [];
+    if ((userText || userImages.length)
       && !blocks.some((block) => block.type === "tool_result")
       && !isInternalHistoryText(message, userText)) {
       turn = {
         id: `claude-turn-${message.uuid}`,
         status: "completed",
-        items: [{ id: `claude-user-${message.uuid}`, type: "userMessage", content: [{ type: "text", text: userText }] }],
+        items: [{ id: `claude-user-${message.uuid}`, type: "userMessage", content: [{ type: "text", text: userText }, ...userImages] }],
       };
       const startedAt = messageTime(message);
       if (startedAt != null) turn.startedAt = Math.floor(startedAt / 1000);
@@ -4802,10 +4804,12 @@ function sameCwd(left, right) {
 }
 
 function transcriptPreview(messages) {
-  const prompt = historyTurns(messages)
+  return historyTurns(messages)
     .flatMap((turn) => turn.items || [])
-    .find((item) => item.type === "userMessage");
-  return prompt?.content?.find((item) => item.type === "text")?.text || "Untitled Claude session";
+    .filter((item) => item.type === "userMessage")
+    // An image-only prompt has no words to title the session with.
+    .map((item) => item.content?.find((content) => content.type === "text")?.text)
+    .find(Boolean) || "Untitled Claude session";
 }
 
 async function transcriptSessions(cwd) {
@@ -5702,6 +5706,16 @@ async function runSelfTest() {
     .flatMap((turn) => turn.items)
     .some((item) => item.type === "userMessage" && item.content?.[0]?.text === "subagent");
   if (!subagentPrompt) throw new Error("Claude subagent transcript self-test failed");
+  // 이미지 첨부는 재개 기록에 개수만 남고, 이미지만 보낸 프롬프트도 턴이 된다.
+  const imageMessages = [
+    { type: "user", uuid: "image-only", message: { role: "user", content: [{ type: "image", source: { type: "base64", data: "AAAA" } }] } },
+    { type: "user", uuid: "image-text", message: { role: "user", content: [{ type: "text", text: "봐줘" }, { type: "image", source: { type: "base64", data: "AAAA" } }] } },
+  ];
+  const imagePrompts = historyTurns(imageMessages).map((turn) => turn.items[0].content);
+  if (JSON.stringify(imagePrompts) !== JSON.stringify([[{ type: "text", text: "" }, { type: "image" }], [{ type: "text", text: "봐줘" }, { type: "image" }]])
+    || transcriptPreview(imageMessages) !== "봐줘") {
+    throw new Error(`Claude image history self-test failed: ${JSON.stringify(imagePrompts)}`);
+  }
   // 작업 창의 출력은 행 id가 아니라 SDK 작업 id로 읽는다. 작업 id를 모르면 출력 없이 답한다.
   const outputReads = [];
   const outputSession = {

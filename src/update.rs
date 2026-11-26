@@ -23,12 +23,14 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "이미지를 붙여넣을 때 `[Image #N]` 대신 이미지 파일 경로가 글자로 들어가던 문제를 고쳤습니다.",
+    "이미지를 붙여넣을 때 파일 경로가 입력창에 잠깐 보이던 현상을 줄였습니다.",
+    "세션을 다시 열면 이미지 첨부 표시가 복원되고, Claude에서 이미지만 보낸 요청도 보이도록 수정했습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Fixed pasted images sometimes landing as a file path instead of `[Image #N]`.",
+    "Reduced the brief flash of a file path in the composer when pasting an image.",
+    "Restored image attachment placeholders when resuming a session and made image-only Claude prompts visible again.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");
