@@ -5188,7 +5188,13 @@ async fn resume_into_state(
         .and_then(Value::as_str)
         .filter(|turn_id| !turn_id.is_empty())
     {
-        state.restore_running_turn(turn_id.to_owned());
+        state.restore_running_turn(
+            turn_id.to_owned(),
+            response
+                .get("activeTurnPeerResponse")
+                .and_then(Value::as_bool)
+                == Some(true),
+        );
     }
     state.set_host_loading(false);
     Ok(Switched::Done(queued))

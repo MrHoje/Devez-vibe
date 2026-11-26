@@ -813,6 +813,8 @@ function makeOptions(params, sessionId, resume, currentId = () => sessionId) {
   const options = {
     cwd: params.cwd || process.cwd(),
     includePartialMessages: true,
+    // Peer turns otherwise expose their origin only after text has streamed.
+    extraArgs: { "replay-user-messages": null },
     // Initialization performs no tool work. Verify auto before exposing the session.
     permissionMode: BOOTSTRAP_PERMISSION_MODE,
     enableFileCheckpointing: true,
@@ -3607,12 +3609,25 @@ function finishNotifiedSubagents(session, notifications) {
 }
 
 function processUser(session, message) {
-  // Resume replays are historical transcript frames, not fresh task results or
-  // prompts. Re-processing their notification XML would invent a new turn.
-  if (message.isReplay === true) return;
   // 자식 tool_result의 tool_use_id는 부모 세션의 것과 다른 공간이므로, 부모 흐름에
   // 섞이지 않게 버린다.
   if (message.parent_tool_use_id) return;
+  if (session.turn?.peerResponse && session.steerPending > 0 && message.origin?.kind === "human") {
+    // A steer can join the peer turn. Its echo arrives before the reply it gets.
+    session.turn.peerResponse = false;
+    notify("claude/peerResponse/ended", { threadId: session.id, turnId: session.turn.id });
+    return;
+  }
+  // The CLI labels the live prompt echo as a replay too. Only an active
+  // automatic run can use it to open a peer turn.
+  if (!session.turn && !session.initializing
+    && (session.automaticTurnsPending > 0 || session.runtimeActive)
+    && isPeerSessionOrigin(message.origin)) {
+    if (session.automaticTurnsPending > 0) session.automaticTurnsPending -= 1;
+    beginTurn(session, undefined, true);
+    return;
+  }
+  if (message.isReplay === true) return;
   const notifications = taskNotifications(message);
   if (notifications.length) {
     if (!session.turn) {
@@ -4324,7 +4339,7 @@ async function runPrompt(session, params) {
 
 // A background task notification is an internal user message that starts its
 // own Claude response even though the host did not submit a new prompt.
-function beginTurn(session, input) {
+function beginTurn(session, input, peerResponse = false) {
   const turnId = `claude-turn-${session.turnSequence++}-${randomUUID()}`;
   const koreanRequest = input === undefined
     ? Boolean(session.lastKoreanRequest)
@@ -4335,11 +4350,12 @@ function beginTurn(session, input) {
     sawStreamText: false,
     sawVisibleText: false,
     koreanRequest,
+    peerResponse,
     rateLimitInfo: input === undefined ? session.pendingRateLimitInfo : undefined,
   };
   session.pendingRateLimitInfo = null;
   session.lastContextUsage = null;
-  notify("turn/started", { threadId: session.id, turn: { id: turnId } });
+  notify("turn/started", { threadId: session.id, turn: { id: turnId, ...(peerResponse ? { peerResponse } : {}) } });
   return turnId;
 }
 
@@ -4415,25 +4431,34 @@ function questionAnswerPairs(input, result) {
     .filter((pair) => pair.question && pair.answer);
 }
 
+function isPeerSessionOrigin(origin) {
+  return origin?.kind === "peer" && !origin.senderTaskId;
+}
+
 function historyState(messages) {
   const turns = [];
   let turn = null;
   const tools = new Map();
   const tasks = new Map();
   for (const message of messages) {
-    const blocks = contentBlocks(message.message);
-    const userText = message.type === "user"
+    const humanSteer = turn?.peerResponse && message.type === "attachment"
+      && message.attachment?.type === "queued_command" && message.attachment.origin?.kind === "human";
+    const userMessage = message.type === "user" || humanSteer;
+    const blocks = contentBlocks(humanSteer ? { content: message.attachment.prompt } : message.message);
+    const userText = userMessage
       ? stripInternalTags(stripHandoff(blocks.filter((block) => block.type === "text").map((block) => block.text || "").join("\n")))
       : "";
     // Only the count matters to the transcript; the image data stays out of history.
-    const userImages = message.type === "user" ? blocks.filter((block) => block.type === "image").map(() => ({ type: "image" })) : [];
-    if ((userText || userImages.length)
+    const userImages = userMessage ? blocks.filter((block) => block.type === "image").map(() => ({ type: "image" })) : [];
+    const peerResponse = message.type === "user" && isPeerSessionOrigin(message.origin);
+    if (peerResponse || ((userText || userImages.length)
       && !blocks.some((block) => block.type === "tool_result")
-      && !isInternalHistoryText(message, userText)) {
+      && !isInternalHistoryText(message, userText))) {
       turn = {
         id: `claude-turn-${message.uuid}`,
         status: "completed",
-        items: [{ id: `claude-user-${message.uuid}`, type: "userMessage", content: [{ type: "text", text: userText }, ...userImages] }],
+        ...(peerResponse ? { peerResponse } : {}),
+        items: peerResponse ? [] : [{ id: `claude-user-${message.uuid}`, type: "userMessage", content: [{ type: "text", text: userText }, ...userImages] }],
       };
       const startedAt = messageTime(message);
       if (startedAt != null) turn.startedAt = Math.floor(startedAt / 1000);
@@ -4675,7 +4700,9 @@ function transcriptEntries(raw, sidechain = false) {
       continue;
     }
     if (!entry || typeof entry !== "object" || (!sidechain && entry.isSidechain)) continue;
-    if (entry.type !== "user" && entry.type !== "assistant" && entry.type !== "system") continue;
+    if (entry.type !== "user" && entry.type !== "assistant" && entry.type !== "system"
+      && !(entry.type === "attachment" && entry.attachment?.type === "queued_command"
+        && entry.attachment.origin?.kind === "human")) continue;
     if (typeof entry.uuid === "string" && entry.uuid) {
       if (seen.has(entry.uuid)) continue;
       seen.add(entry.uuid);
@@ -5053,6 +5080,7 @@ async function dispatch(method, params = {}) {
           initialTurnsPage: { data: [], nextCursor: null },
           // Returning to a session mid-turn: the host restores its busy state from this.
           activeTurnId: existing.turn?.id ?? null,
+          activeTurnPeerResponse: existing.turn?.peerResponse === true,
           cwd: existing.cwd,
           model: existing.model,
           reasoningEffort: existing.effort,
@@ -6257,6 +6285,22 @@ async function runSelfTest() {
       || prompt.model !== expected[index][1])) {
     throw new Error(`Claude history self-test failed: ${JSON.stringify(turns)}`);
   }
+  const peer = { ...user("peer", "peer input"), isMeta: true, isReplay: true, origin: { kind: "peer" } };
+  const peerHistory = historyTurns([
+    user("direct", "direct input"), assistant("direct-answer", "claude-opus-5", "direct answer"),
+    peer, assistant("peer-answer", "claude-opus-5", "peer answer"),
+    ...transcriptEntries(JSON.stringify({
+      type: "attachment", uuid: "steer",
+      attachment: { type: "queued_command", origin: { kind: "human" }, prompt: "direct steer" },
+    })),
+    assistant("steer-answer", "claude-opus-5", "steer answer"),
+  ]);
+  if (peerHistory.length !== 3 || peerHistory[0].peerResponse
+    || !peerHistory[1].peerResponse || peerHistory[1].items.length !== 1
+    || peerHistory[1].items[0].text !== "peer answer"
+    || peerHistory[2].peerResponse || peerHistory[2].items.at(-1).text !== "steer answer") {
+    throw new Error("Claude history did not separate peer and human responses");
+  }
   const interrupted = historyTurns([user("cancelled", "취소한 요청")]);
   if (interrupted.length !== 1 || interrupted[0].status !== "interrupted") {
     throw new Error(`Claude interrupted prompt history self-test failed: ${JSON.stringify(interrupted)}`);
@@ -7106,6 +7150,16 @@ async function runSelfTest() {
     if (automaticTurnSession.turn !== null) {
       throw new Error("Claude stale top-level response incorrectly opened a host turn");
     }
+    await consumeMessage(automaticTurnSession, peer);
+    if (automaticTurnSession.turn) throw new Error("Claude replayed peer prompt opened a live turn");
+    const peerSession = { ...automaticTurnSession, id: "peer-turn-self-test", automaticTurnsPending: 1 };
+    await consumeMessage(peerSession, peer);
+    if (!peerSession.turn?.peerResponse || peerSession.automaticTurnsPending !== 0) {
+      throw new Error("Claude live peer echo did not classify the turn before streaming");
+    }
+    peerSession.steerPending = 1;
+    await consumeMessage(peerSession, { ...user("steer", "direct steer"), isReplay: true });
+    if (peerSession.turn.peerResponse) throw new Error("Claude peer turn still classified a direct steer as peer");
     await consumeMessage(automaticTurnSession, {
       type: "user",
       isReplay: true,

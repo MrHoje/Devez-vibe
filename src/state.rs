@@ -4143,6 +4143,7 @@ pub struct AppState {
     command_selection: usize,
     spinner_frame: usize,
     turn_started_at: Option<Instant>,
+    peer_response_mode: Option<VibeMode>,
     /// Whether the active turn has received any assistant text yet.
     turn_response_started: bool,
     /// Whether a frame has actually shown assistant text for the active turn.
@@ -4493,6 +4494,7 @@ impl AppState {
             spinner_frame: 0,
             compacting_started_at: None,
             turn_started_at: None,
+            peer_response_mode: None,
             turn_response_started: false,
             turn_response_visible: false,
             stream_fade_tail: 0.0,
@@ -6859,11 +6861,26 @@ impl AppState {
             let Some(items) = turn.get("items").and_then(Value::as_array) else {
                 continue;
             };
+            let peer_response = turn.get("peerResponse").and_then(Value::as_bool) == Some(true);
             let mut blocks = if unanswered_cancelled_turn(turn) {
                 Vec::new()
             } else {
                 merged_turn_blocks(&self.cwd, turn, items, rollout)
             };
+            if peer_response
+                && self.vibe_mode != VibeMode::Normal
+                && let Some(first) = blocks
+                    .iter()
+                    .position(|block| matches!(block.kind, BlockKind::Assistant))
+            {
+                let responses = blocks
+                    .extract_if(.., |block| matches!(block.kind, BlockKind::Assistant))
+                    .filter(|block| !block.body.trim().is_empty())
+                    .collect::<Vec<_>>();
+                if self.vibe_mode == VibeMode::Vibe && !responses.is_empty() {
+                    blocks.insert(first, Block::peer_response_group(responses));
+                }
+            }
             for block in &mut blocks {
                 if matches!(block.kind, BlockKind::User)
                     && let Some(restored) = restored_async_answer(block, &async_questions)
@@ -6899,7 +6916,9 @@ impl AppState {
             // Read straight off the server's own item order, not the
             // merged/sorted block order: a rollout event dated oddly must
             // never make an earlier message look like the last one shown.
-            if let Some(text) = last_agent_message_text(items) {
+            if (!peer_response || self.vibe_mode == VibeMode::Normal)
+                && let Some(text) = last_agent_message_text(items)
+            {
                 self.last_assistant_markdown = Some(text);
             }
         }
@@ -6913,7 +6932,10 @@ impl AppState {
             .filter(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))
             && let Some(id) = turn.get("id").and_then(Value::as_str)
         {
-            self.restore_running_turn(id.to_owned());
+            self.restore_running_turn(
+                id.to_owned(),
+                turn.get("peerResponse").and_then(Value::as_bool) == Some(true),
+            );
             self.plan_turn_id = self.plan_summary.as_ref().map(|_| id.to_owned());
         }
     }
@@ -6949,10 +6971,11 @@ impl AppState {
 
     /// A resumed session whose turn kept running while the screen was elsewhere:
     /// show it as working again, with the turn id Esc needs to stop it.
-    pub fn restore_running_turn(&mut self, turn_id: String) {
+    pub fn restore_running_turn(&mut self, turn_id: String, peer_response: bool) {
         self.active_turn_model = Some(self.selected_model_name().to_owned());
         self.active_turn_effort = Some(self.selected_effort.clone());
         self.set_turn_started(turn_id);
+        self.peer_response_mode = peer_response.then_some(self.vibe_mode);
     }
 
     pub fn set_turn_started(&mut self, turn_id: String) {
@@ -7046,6 +7069,7 @@ impl AppState {
     }
 
     fn reset_turn_item_tracking(&mut self) {
+        self.peer_response_mode = None;
         self.last_non_retry_error = None;
         self.unsent_prompt.clear();
         self.unsent_provisional = false;
@@ -7157,6 +7181,9 @@ impl AppState {
     }
 
     fn collapse_completed_response(&mut self) {
+        if self.peer_response_mode.is_some() {
+            return;
+        }
         let assistant_indices = self
             .turn_response_blocks
             .iter()
@@ -7201,7 +7228,8 @@ impl AppState {
     }
 
     fn collapse_progress_before_next_answer(&mut self) {
-        if self.vibe_mode != VibeMode::SuperVibe
+        if self.peer_response_mode.is_some()
+            || self.vibe_mode != VibeMode::SuperVibe
             || self.response_display_mode != ResponseDisplayMode::Completed
         {
             return;
@@ -8057,6 +8085,8 @@ impl AppState {
             // stable discriminator, and keeps Hide from flashing it.
             .filter_map(|item| {
                 if item.shell_batch.is_some()
+                    || (matches!(item.block.kind, BlockKind::Assistant)
+                        && self.peer_response_mode.is_some_and(|mode| mode != VibeMode::Normal))
                     || (self.shell_display_mode == ShellDisplayMode::Hide
                         && is_shell_hidden_block(&item.block))
                     || ((self.vibe_mode == VibeMode::SuperVibe || self.plan_panel_hidden)
@@ -10671,6 +10701,15 @@ impl AppState {
             "claude/session/state" => {
                 self.runtime_children &= params.get("active") == Some(&json!(true));
             }
+            "claude/peerResponse/ended" => {
+                if self.peer_response_mode.is_some()
+                    && params.get("turnId").and_then(Value::as_str) == self.turn_id.as_deref()
+                {
+                    self.peer_response_mode = None;
+                    self.turn_response_blocks
+                        .retain(|block| !matches!(block.kind, BlockKind::Assistant));
+                }
+            }
             "claude/bridge/closed" => {
                 self.end_turn_after_bridge_exit(
                     params.get("message").and_then(Value::as_str).unwrap_or_default(),
@@ -10720,6 +10759,9 @@ impl AppState {
                         .or_else(|| self.active_turn_effort.take())
                         .or_else(|| Some(self.selected_effort.clone()));
                     self.set_turn_started(turn_id.to_owned());
+                    if params.pointer("/turn/peerResponse").and_then(Value::as_bool) == Some(true) {
+                        self.peer_response_mode.get_or_insert(self.vibe_mode);
+                    }
                 }
             }
             "devez/permissions/updated" => {
@@ -10821,6 +10863,7 @@ impl AppState {
                 if successful {
                     self.collapse_completed_response();
                 }
+                self.peer_response_mode = None;
                 // A steer the turn never answered with text still has to appear:
                 // it slots in after everything this turn produced, ahead of the
                 // follow-up cycle the runtime may open for it.
@@ -17678,6 +17721,10 @@ impl AppState {
             }
             if matches!(block.kind, BlockKind::Assistant) {
                 self.turn_response_started |= !block.body.is_empty();
+                if self.commit_peer_response(&block) {
+                    self.flush_pending_steer_prompts();
+                    return;
+                }
                 self.last_assistant_markdown = Some(block.body.clone());
                 self.turn_response_blocks.push(block.clone());
             }
@@ -17726,8 +17773,34 @@ impl AppState {
         if matches!(kind, BlockKind::Assistant) && !delta.is_empty() {
             self.turn_response_started = true;
         }
+        let peer_response = matches!(kind, BlockKind::Assistant)
+            && self.peer_response_mode.is_some_and(|mode| mode != VibeMode::Normal);
         let active = self.ensure_active(item_id, kind, title);
-        active.pace.push(delta);
+        if peer_response {
+            append_capped(&mut active.block.body, delta);
+        } else {
+            active.pace.push(delta);
+        }
+    }
+
+    fn commit_peer_response(&mut self, block: &Block) -> bool {
+        match self.peer_response_mode {
+            Some(VibeMode::Vibe) => {
+                if !block.body.trim().is_empty() {
+                    self.turn_response_blocks.push(block.clone());
+                    let responses = self
+                        .turn_response_blocks
+                        .iter()
+                        .filter(|block| matches!(block.kind, BlockKind::Assistant))
+                        .cloned()
+                        .collect();
+                    self.commit_replacing(Block::peer_response_group(responses));
+                }
+                true
+            }
+            Some(VibeMode::SuperVibe) => true,
+            _ => false,
+        }
     }
 
     /// Reveal the share of held text that `elapsed` has earned, for every stream
@@ -18060,6 +18133,9 @@ impl AppState {
             if let Some(item) = self.active.remove(&id) {
                 if matches!(item.block.kind, BlockKind::Assistant) {
                     self.turn_response_started |= !item.block.body.is_empty();
+                    if self.commit_peer_response(&item.block) {
+                        continue;
+                    }
                     self.last_assistant_markdown = Some(item.block.body.clone());
                     self.turn_response_blocks.push(item.block.clone());
                 }
@@ -19193,7 +19269,7 @@ fn merged_turn_blocks(
         .and_then(Value::as_str)
         .is_none_or(|status| status == "completed")
         && turn.get("error").is_none_or(Value::is_null);
-    if successful {
+    if successful && turn.get("peerResponse").and_then(Value::as_bool) != Some(true) {
         group_turn_response(blocks)
     } else {
         blocks
@@ -21283,10 +21359,81 @@ mod tests {
         state.prepare_resume();
         assert!(!state.busy);
 
-        state.restore_running_turn("turn-9".to_owned());
+        state.restore_running_turn("turn-9".to_owned(), false);
 
         assert!(state.busy);
         assert_eq!(state.turn_id.as_deref(), Some("turn-9"));
+    }
+
+    #[test]
+    fn claude_peer_response_uses_vibe_mode_live_and_on_resume() {
+        let response_blocks = |state: &mut AppState| {
+            state
+                .drain_committed()
+                .into_iter()
+                .filter(|block| matches!(block.kind, BlockKind::Assistant | BlockKind::PeerResponse))
+                .collect::<Vec<_>>()
+        };
+        let texts = |blocks: &[Block]| {
+            blocks.iter().map(|block| block.body.clone()).collect::<Vec<_>>()
+        };
+        let item = |id: &str, text: &str| {
+            json!({"id": id, "type": "agentMessage", "provider": "Claude", "text": text})
+        };
+        for mode in [VibeMode::Normal, VibeMode::Vibe, VibeMode::SuperVibe] {
+            let check = |blocks: &[Block]| match mode {
+                VibeMode::Normal => {
+                    assert_eq!(texts(blocks), ["peer progress", "peer answer"]);
+                }
+                VibeMode::Vibe => {
+                    assert_eq!(blocks.len(), 1);
+                    assert!(matches!(blocks[0].kind, BlockKind::PeerResponse));
+                    assert_eq!(texts(blocks[0].children()), ["peer progress", "peer answer"]);
+                }
+                VibeMode::SuperVibe => assert!(blocks.is_empty()),
+            };
+            let mut state = claude_bridge_state();
+            state.apply_vibe_mode(mode);
+            state.handle_notification(
+                "turn/started",
+                &json!({"turn":{"id":"peer", "peerResponse":true}}),
+            );
+            for (id, body) in [("progress", "peer progress"), ("answer", "peer answer")] {
+                state.handle_notification("item/started", &json!({"item":item(id, "")}));
+                state.handle_notification(
+                    "item/agentMessage/delta",
+                    &json!({"itemId":id, "provider":"Claude", "delta":body}),
+                );
+                state.flush_stream_text();
+                assert_eq!(
+                    state.view().live_blocks.iter().any(|live| matches!(live.block.kind, BlockKind::Assistant)),
+                    mode == VibeMode::Normal,
+                );
+                state.handle_notification("item/completed", &json!({"item":item(id, body)}));
+            }
+            state.handle_notification("claude/peerResponse/ended", &json!({"turnId":"peer"}));
+            check(&response_blocks(&mut state));
+            state.handle_notification("item/completed", &json!({"item":item("steer", "direct steer")}));
+            assert_eq!(response_blocks(&mut state)[0].body, "direct steer");
+            state.handle_notification(
+                "turn/completed",
+                &json!({"turn":{"id":"peer", "status":"completed"}}),
+            );
+            state.handle_notification("turn/started", &json!({"turn":{"id":"human"}}));
+            state.handle_notification("item/completed", &json!({"item":item("direct", "direct answer")}));
+            assert_eq!(response_blocks(&mut state)[0].body, "direct answer");
+
+            let mut resumed = claude_bridge_state();
+            resumed.apply_vibe_mode(mode);
+            resumed.load_history(
+                &json!({"turns":[{
+                    "id":"peer", "status":"completed", "peerResponse":true,
+                    "items":[item("progress", "peer progress"), item("answer", "peer answer")],
+                }]}),
+                None,
+            );
+            check(&response_blocks(&mut resumed));
+        }
     }
 
     #[test]

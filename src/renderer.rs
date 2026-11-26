@@ -118,6 +118,7 @@ pub enum BlockKind {
     /// Earlier assistant updates from one completed turn, folded behind a
     /// disclosure row while the final answer stays visible below it.
     ProgressGroup,
+    PeerResponse,
     Reasoning,
     /// A `turn/plan/updated` snapshot. Its body is the encoded plan: `└ ` rows
     /// are the explanation, `✔ `/`▸ `/`□ ` rows are done/in-progress/pending
@@ -173,6 +174,7 @@ impl ProviderHandoffBlock {
             BlockKind::Welcome
             | BlockKind::Update
             | BlockKind::ProgressGroup
+            | BlockKind::PeerResponse
             | BlockKind::ModelChange
             | BlockKind::Warning
             | BlockKind::Error
@@ -329,6 +331,15 @@ impl Block {
         );
         if let Some(child_id) = child_id {
             block.id = child_id;
+        }
+        block.children = children;
+        block
+    }
+
+    pub fn peer_response_group(children: Vec<Block>) -> Self {
+        let mut block = Self::new(BlockKind::PeerResponse, "Session message response", "");
+        if let Some(first) = children.first() {
+            block.adopt_id(first);
         }
         block.children = children;
         block
@@ -1963,7 +1974,7 @@ impl Renderer {
         self.handoff_history
             .iter()
             .flat_map(|block| {
-                if matches!(block.kind, BlockKind::ProgressGroup) {
+                if matches!(block.kind, BlockKind::ProgressGroup | BlockKind::PeerResponse) {
                     block
                         .children()
                         .iter()
@@ -12081,7 +12092,7 @@ fn block_lines_with_mode_at(
     if matches!(block.kind, BlockKind::User) {
         return user_prompt_lines(block, width);
     }
-    if matches!(block.kind, BlockKind::ProgressGroup) {
+    if matches!(block.kind, BlockKind::ProgressGroup | BlockKind::PeerResponse) {
         return progress_group_lines(block, width, expanded, response_reveal);
     }
     if matches!(block.kind, BlockKind::Reasoning) {
@@ -12149,6 +12160,7 @@ fn block_lines_with_mode_at(
         }
         BlockKind::User => unreachable!("user blocks are rendered separately"),
         BlockKind::ProgressGroup
+        | BlockKind::PeerResponse
         | BlockKind::Reasoning
         | BlockKind::Plan
         | BlockKind::Tool
@@ -30260,6 +30272,20 @@ mod tests {
                 .map(|columns| columns.len()),
             Some(13)
         );
+    }
+
+    #[test]
+    fn peer_response_group_expands_its_text() {
+        let block = Block::peer_response_group(vec![Block::new(
+            BlockKind::Assistant,
+            "Claude",
+            "Peer reply",
+        )]);
+        let closed = block_lines_with_expansion(&block, 80, false);
+        let open = block_lines_with_expansion(&block, 80, true);
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].tool_heading, Some(block.id()));
+        assert!(open.iter().any(|line| line.text == "Peer reply"));
     }
 
     #[test]
