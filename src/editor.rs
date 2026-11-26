@@ -212,8 +212,10 @@ impl Editor {
         let start = self.collapsed_paste_start.unwrap_or(0);
         let end = self.collapsed_paste_end.unwrap_or(self.buffer.len());
         let prefix = self.buffer[..start].iter().collect::<String>();
-        let summary = format!("[Pasted text · {lines} lines]");
         let tail = self.buffer[end..].iter().collect::<String>();
+        // 요약 뒤 한 칸을 미리 띄워 둬야 이어 치는 글자가 요약에 붙지 않는다.
+        let pad = if tail.starts_with(char::is_whitespace) { "" } else { " " };
+        let summary = format!("[Pasted text · {lines} lines]{pad}");
         let cursor = if self.cursor <= start {
             self.cursor
         } else {

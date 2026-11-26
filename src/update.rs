@@ -23,12 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "내장 Vibe 응답에서 ⑩~⑳을 10~20으로 표시하고, 줄 끝에서 두 자리를 함께 넘기며 화면에 보이는 숫자가 복사되도록 수정했습니다.",
+    "붙여넣은 이미지·긴 글 표시 뒤에 한 칸을 미리 띄워, 이어서 입력할 때 글자가 밀리지 않도록 했습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "In embedded Vibe responses, ⑩–⑳ now appear as 10–20, stay together at line breaks, and are copied as displayed.",
+    "Pasted image and long-text labels now keep a space after them, so typing right after them no longer shifts the text.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

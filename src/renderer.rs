@@ -11150,7 +11150,7 @@ fn fixed_plan_summary_lines(
     lines.insert(1, PaintLine::blank());
     if completion_displayed {
         let elapsed = summary.steps.iter().filter_map(|step| step.elapsed).sum();
-        let total = format!("⏱  {}", format_plan_elapsed(elapsed));
+        let total = format_plan_elapsed(elapsed);
         lines.push(PaintLine::plain(format!(
             "{}{}  ",
             " ".repeat(line_width.saturating_sub(UnicodeWidthStr::width(total.as_str()) + 2)),
@@ -13970,9 +13970,10 @@ fn composer_display_with_spans(
         }
         display.push_str(label);
         spans.extend(label.chars().map(|_| span.clone()));
+        // 끝에 있어도 한 칸 띄워 둬야 첫 글자를 칠 때 커서가 밀리지 않는다.
         if chars
             .get(index + 1)
-            .is_some_and(|&next| next != ATTACHMENT_PLACEHOLDER && !next.is_whitespace())
+            .is_none_or(|&next| next != ATTACHMENT_PLACEHOLDER && !next.is_whitespace())
         {
             display.push(' ');
             spans.push(span.end..span.end);
@@ -14003,7 +14004,7 @@ fn composer_display_with_spans(
         // Attachments with no placeholder of their own: nothing in the composer
         // stands behind these labels, so nothing can be deleted through them.
         let end = editor.chars().len();
-        if !display.is_empty() {
+        if display.chars().last().is_some_and(|ch| !ch.is_whitespace()) {
             display.push(' ');
             spans.push(end..end);
         }
@@ -14032,9 +14033,14 @@ fn composer_source_spans(editor: &Editor) -> (String, usize, Vec<Range<usize>>) 
     let source_len = source.chars().count();
     let tail_len = buffer_len.saturating_sub(paste.end);
     let summary_len = source_len.saturating_sub(paste.start + tail_len);
+    // 요약 뒤 띄움 칸은 붙여넣은 글을 대신하지 않는다.
+    let pad = source.chars().nth(paste.start + summary_len - 1) == Some(' ');
     let mut spans = Vec::with_capacity(source_len);
     spans.extend((0..paste.start).map(|index| index..index + 1));
-    spans.extend((0..summary_len).map(|_| paste.clone()));
+    spans.extend((0..summary_len - usize::from(pad)).map(|_| paste.clone()));
+    if pad {
+        spans.push(paste.end..paste.end);
+    }
     spans.extend((paste.end..paste.end + tail_len).map(|index| index..index + 1));
     (source, cursor, spans)
 }
@@ -17322,12 +17328,12 @@ mod tests {
         editor.move_right();
 
         let (_, display_cursor) = composer_display(&editor, &[]);
-        assert_eq!(display_cursor, 24);
+        assert_eq!(display_cursor, 25);
 
         let (_, cursor_row, cursor_col, _) =
             input_lines(&editor, &[], 18, "", "placeholder", None, None);
 
-        assert_eq!((cursor_row, cursor_col), (3, 6));
+        assert_eq!((cursor_row, cursor_col), (3, 7));
     }
 
     #[test]
@@ -18521,8 +18527,14 @@ mod tests {
 
         let (display, cursor) = composer_display(&editor, &images);
 
-        assert_eq!(display, r"inspect C:\tmp\ordinary.png [Image #1]");
+        assert_eq!(display, r"inspect C:\tmp\ordinary.png [Image #1] ");
         assert_eq!(cursor, display.chars().count());
+
+        // 이어 치는 글자는 미리 띄운 칸 뒤에 놓여 커서가 밀리지 않는다.
+        editor.insert('a');
+        let (typed, typed_cursor) = composer_display(&editor, &images);
+        assert_eq!(typed, format!("{display}a"));
+        assert_eq!(typed_cursor, cursor + 1);
     }
 
     #[test]
@@ -18536,7 +18548,7 @@ mod tests {
 
         assert!(painted(&rows[1]).contains("❯ [Image #1]"));
         assert_eq!(cursor_row, 1);
-        assert_eq!(cursor_col, UnicodeWidthStr::width("❯ [Image #1]"));
+        assert_eq!(cursor_col, UnicodeWidthStr::width("❯ [Image #1] "));
     }
 
     #[test]
@@ -18563,9 +18575,12 @@ mod tests {
 
         let (display, cursor) = composer_display(&editor, &[]);
 
-        assert_eq!(display, "[Pasted text · 6 lines]");
+        assert_eq!(display, "[Pasted text · 6 lines] ");
         assert_eq!(cursor, display.chars().count());
         assert_eq!(editor.text(), "one\ntwo\nthree\nfour\nfive\nsix");
+
+        editor.insert('a');
+        assert_eq!(composer_display(&editor, &[]), (format!("{display}a"), cursor + 1));
     }
 
     #[test]
@@ -18589,7 +18604,7 @@ mod tests {
 
         assert_eq!(
             composer_display(&editor, &[]).0,
-            "before [Pasted text · 6 lines]"
+            "before [Pasted text · 6 lines] "
         );
     }
 
@@ -31159,7 +31174,7 @@ mod tests {
         let bottom_border = painted(&lines[4]);
 
         assert!(painted(&lines[2]).contains("Done (1m 34s)"));
-        assert!(elapsed_line.contains("⏱  1m 34s"));
+        assert!(elapsed_line.ends_with("1m 34s  ") && !elapsed_line.contains('⏱'));
         assert_eq!(format_plan_elapsed(Duration::from_secs(7_685)), "2h 8m 5s");
         assert_eq!(
             UnicodeWidthStr::width(elapsed_line.as_str()),
