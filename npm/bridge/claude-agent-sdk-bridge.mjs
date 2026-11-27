@@ -4026,7 +4026,11 @@ async function consumeMessage(session, message) {
   // 이벤트는 통지가 없다. 첫 턴 전(재개 재생)의 init은 예약하지 않는다.
   if (message.type === "system" && message.subtype === "init" && !session.turn && !session.initializing
     && session.turnSequence > 1 && !session.automaticTurnsPending && !session.steerPending) {
-    session.automaticTurnsPending = 1;
+    // Esc makes the CLI queue its own notice (artifact auto-replies paused), and that run answers the
+    // stopped prompt; the SDK names its origin only on the result. shortcut: any run starting within
+    // 2s of Esc is stopped, so a background completion landing then is read on the next turn instead.
+    if (Date.now() < (session.stopRunsUntil || 0)) withSessionQuery(session, (query) => query.interrupt()).catch(() => {});
+    else session.automaticTurnsPending = 1;
   }
   adoptSessionId(session, message.session_id);
   beginUntrackedTurn(session, message);
@@ -5169,6 +5173,7 @@ async function dispatch(method, params = {}) {
       const turn = session.turn;
       const query = session.query;
       turn.interruptRequested = true;
+      session.stopRunsUntil = Date.now() + 2000;
       // A plain interrupt keeps steers the CLI has queued, and they then ran as
       // a new turn after the stop (measured on 0.3.309). `cancelQueued` drops
       // them; the runtime has it (capability `interrupt_cancel_queued_v1`)
@@ -7305,6 +7310,21 @@ async function runSelfTest() {
     });
     if (automaticTurnSession.turn !== null || automaticTurnSession.automaticTurnsPending !== 0) {
       throw new Error("Claude turnless run left an automatic turn booking");
+    }
+    // 실측 순서: Esc 뒤 중단 result, 곧바로 init(아티팩트 자동 응답 중지 통지 실행), 응답.
+    let stoppedRuns = 0;
+    const escSession = {
+      ...automaticTurnSession,
+      id: "esc-notice-self-test",
+      streamBlocks: new Map(),
+      query: { ...automaticTurnSession.query, async interrupt() { stoppedRuns += 1; } },
+      stopRunsUntil: Date.now() + 2000,
+    };
+    await consumeMessage(escSession, { type: "system", subtype: "init" });
+    await consumeMessage(escSession, reply);
+    await consumeMessage(escSession, { type: "result", is_error: false, modelUsage: {}, permission_denials: [], duration_ms: 1 });
+    if (stoppedRuns !== 1 || escSession.turn !== null || escSession.automaticTurnsPending !== 0) {
+      throw new Error("Claude run started right after Esc answered the stopped prompt");
     }
 
     processUser(lifecycleSession, {

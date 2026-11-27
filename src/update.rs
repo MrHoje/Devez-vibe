@@ -23,12 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude의 다른 세션 메시지로 시작한 응답은 Vibe Off에서 그대로 표시하고, Vibe On에서 한 줄로 접으며, Super Vibe에서 숨깁니다.",
+    "Claude에서 아티팩트를 게시한 세션에서 Esc로 중단하면 중단한 요청에 대한 답이 다시 출력되던 문제를 고쳤습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Replies triggered by messages from another Claude session are shown in full with Vibe Off, collapsed into one row with Vibe On, and hidden in Super Vibe.",
+    "Fixed Claude sessions with a published artifact printing an answer to the request you had just stopped with Esc.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");
